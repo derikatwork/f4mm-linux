@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "beth-mod-manager"
+version = "0.1.0"
+description = "BETH Mod Manager: a mod manager for Bethesda games installed through Lutris/Wine on Linux"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["PyYAML>=5.4"]
+
+[project.optional-dependencies]
+gui = ["PySide6>=6.5"]
+dev = ["pytest>=7"]
+
+[project.scripts]
+bethmm = "bethmm.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["bethmm*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-p no:cacheprovider"
