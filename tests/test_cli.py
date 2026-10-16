@@ -187,3 +187,116 @@ def test_new_folders_follow_game_naming_and_are_labelled(home, tmp_path, capsys)
     assert "Scripts/a.pex  ->  Data/scripts/a.pex   [new folder spelled like the game's folders]" in out
     assert "Textures/b.dds  ->  Data/textures/b.dds   [case matched to existing folder]" in out
     assert "m.esp  ->  Data/m.esp\n" in out
+
+
+# --- final review additions --------------------------------------------------
+
+
+def test_unknown_layout_shows_tree_and_root_target_preview(home, tmp_path, capsys):
+    gog_game(home, "fallout-4", "Fallout 4", "Fallout4.exe", ["Data/Fallout4.esm", "Data/Meshes/"])
+    folder = make_tree(tmp_path / "m", {
+        "Option A/Stuff/a.nif": b"x",
+        "Option B/Stuff/b.nif": b"x",
+        "Option A/settings.ini": b"x",
+        "readme.txt": b"x",
+    })
+    assert main(["analyze", str(folder)]) == 0
+    out = capsys.readouterr().out
+    assert "Files in the mod (3):" in out
+    assert "  Option A/\n      settings.ini\n      Stuff/\n          a.nif" in out
+    assert "--root 'Option A'" in out or "--root Option" in out
+
+    assert main(["analyze", str(folder), "--game", "fallout4", "--root", "Option A/Stuff", "--target", "data"]) == 0
+    out = capsys.readouterr().out
+    assert "Option A/Stuff/a.nif  ->  Data/a.nif" in out
+    assert "into the Data folder - high confidence (your choice)" in out
+
+    assert main(["analyze", str(folder), "--root", "Option A"]) == 1
+    assert "add --target data or --target game" in capsys.readouterr().err
+
+
+def test_target_override_keeps_detected_root(home, tmp_path, capsys):
+    folder = make_tree(tmp_path / "Wrap", {"Inner/textures/a.dds": b"x"})
+    assert main(["analyze", str(folder), "--target", "game"]) == 0
+    assert "Inner/textures/a.dds  ->  textures/a.dds" in capsys.readouterr().out
+
+
+def test_unidentified_game_suggests_game_flag(home, tmp_path, capsys):
+    gog_game(home, "fallout-4", "Fallout 4", "Fallout4.exe", ["Data/"])
+    gog_game(home, "skyrim", "Skyrim", "SkyrimSE.exe", ["Data/"])
+    folder = make_tree(tmp_path / "tex", {"Textures/a.dds": b"x"})
+    assert main(["analyze", str(folder)]) == 0
+    out = capsys.readouterr().out
+    assert "re-run with --game fallout4|skyrimse" in out
+    assert "no game chosen" in out
+
+
+def test_case_duplicates_and_planned_folders_are_labelled_truthfully(home, tmp_path, capsys):
+    gog_game(home, "fallout-4", "Fallout 4", "Fallout4.exe", ["Data/Fallout4.esm", "Data/Textures/", "Data/textures/"])
+    folder = make_tree(tmp_path / "mod", {
+        "m.esp": make_plugin(["Fallout4.esm"]),
+        "textures/a.dds": b"x",
+        "F4SE/Plugins/x.dll": b"x",
+        "F4SE/Plugins/x.ini": b"x",
+    })
+    assert main(["analyze", str(folder)]) == 0
+    out = capsys.readouterr().out
+    assert "! 'Data' has entries differing only in case" in out
+    assert "F4SE/Plugins/x.ini  ->  Data/F4SE/Plugins/x.ini\n" in out, "a folder planned by this mod is not 'existing'"
+
+
+def test_games_cached_note_only_when_cache_was_used(home, capsys):
+    gog_game(home, "fallout-4", "Fallout 4", "Fallout4.exe", ["Data/"])
+    assert main(["games"]) == 0
+    assert "cached results" not in capsys.readouterr().out
+    assert main(["games"]) == 0
+    assert "cached results" in capsys.readouterr().out
+
+
+@needs_7z
+def test_every_file_operation_is_logged(home, tmp_path, capsys):
+    gog_game(home, "fallout-4", "Fallout 4", "Fallout4.exe", ["Data/"])
+    mod = zip_mod(tmp_path / "m.zip", {"m.esp": b"x"})
+    assert main(["config", "--scan-depth", "5"]) == 0
+    assert main(["games", "--rescan"]) == 0
+    assert main(["analyze", str(mod)]) == 0
+    text = paths.log_path().read_text()
+    assert f"WRITE {paths.settings_path()}" in text
+    assert f"WRITE {paths.games_cache_path()}" in text
+    assert "MKDIR" in text and "EXTRACT" in text and "EXTRACTED 1 files" in text and "DELETE" in text
+
+
+def test_os_errors_are_reported_without_traceback(home, tmp_path, capsys, monkeypatch):
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("x")
+    monkeypatch.setattr(paths, "tmp_dir", lambda: blocker / "tmp")
+    mod = zip_mod(tmp_path / "m.zip", {"m.esp": b"x"})
+    assert main(["analyze", str(mod)]) == 1
+    err = capsys.readouterr().err
+    assert err.startswith("error: ") and "Traceback" not in err
+
+
+def test_stale_extractions_are_cleaned(home, tmp_path):
+    from bethmm import cli
+
+    tmp = paths.tmp_dir()
+    old = make_tree(tmp / "analyze-old", ["x/a.dds"])
+    new = make_tree(tmp / "analyze-new", ["x/a.dds"])
+    other = make_tree(tmp / "keep-me", ["a"])
+    os.utime(old, (1_000_000, 1_000_000))
+    cli._remove_stale_extractions(tmp)
+    assert not old.exists() and new.exists() and other.exists()
+
+
+def test_non_utf8_file_names_do_not_crash_output(home, tmp_path):
+    import subprocess
+    import sys
+
+    folder = tmp_path / "mod"
+    folder.mkdir()
+    (folder / os.fsdecode(b"caf\xe9.esp")).write_bytes(make_plugin(["Fallout4.esm"]))
+    env = dict(os.environ, PYTHONIOENCODING="utf-8:strict")
+    proc = subprocess.run([sys.executable, "-m", "bethmm", "analyze", str(folder)],
+                          capture_output=True, env=env, cwd=Path(__file__).resolve().parent.parent)
+    assert proc.returncode == 0, proc.stderr.decode(errors="replace")
+    assert b"caf\\udce9.esp" in proc.stdout

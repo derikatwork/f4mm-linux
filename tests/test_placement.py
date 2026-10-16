@@ -1138,3 +1138,48 @@ def test_fomod_offers_core_files_next_to_fomod_folder():
         "Main - Main.ba2": "Data/Main - Main.ba2",
         "Optional/Patch.esp": "Data/Patch.esp",
     }
+
+
+# --- final review additions --------------------------------------------------
+
+
+def test_enb_textures_at_game_root_are_installed():
+    files = [
+        "Rudy ENB/enbseries.ini",
+        "Rudy ENB/d3d11.dll",
+        "Rudy ENB/enbsunsprite.bmp",
+        "Rudy ENB/enblensmask.png",
+        "Rudy ENB/enbunderwaternoise.bmp",
+        "Rudy ENB/screenshot.jpg",
+    ]
+    plan = analyze_files(files)
+    assert plan.target is Target.GAME_ROOT
+    assert set(dests(plan).values()) == {
+        "enbseries.ini", "d3d11.dll", "enbsunsprite.bmp", "enblensmask.png", "enbunderwaternoise.bmp",
+    }
+    assert plan.skipped == ["Rudy ENB/screenshot.jpg"]
+
+
+def test_enb_named_images_in_data_mods_are_still_skipped():
+    plan = analyze_files(["mod.esp", "enb_preview.png"])
+    assert plan.skipped == ["enb_preview.png"]
+
+
+def test_images_folder_does_not_block_wrapper_descent():
+    files = ["Cool Mod/Cool Mod.esp", "Cool Mod/meshes/x.nif", "Images/shot1.png"]
+    plan = analyze_files(files)
+    assert plan.wrapper_dirs == ["Cool Mod"] and plan.target is Target.DATA
+    assert plan.skipped == ["Images/shot1.png"]
+
+
+def test_unknown_and_fomod_plans_list_unplaced_files():
+    files = ["Option A/Stuff/a.nif", "Option B/Stuff/b.nif", "Option A/settings.ini", "readme.txt"]
+    plan = analyze_files(files)
+    assert plan.target is Target.UNKNOWN
+    assert plan.unplaced == ["Option A/settings.ini", "Option A/Stuff/a.nif", "Option B/Stuff/b.nif"]
+    assert plan.skipped == ["readme.txt"]
+    assert plan.to_dict()["unplaced"] == plan.unplaced
+
+    fomod = analyze_files(["fomod/ModuleConfig.xml", "00 Core/a.esp", "01 Opt/b.esp"])
+    assert fomod.unplaced == ["00 Core/a.esp", "01 Opt/b.esp"]
+    assert analyze_files(["a.esp"]).unplaced == []

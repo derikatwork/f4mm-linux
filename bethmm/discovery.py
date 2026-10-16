@@ -490,6 +490,29 @@ def find_wine_user(prefix: Path, preferred: str | None = None) -> str | None:
     return users[0] if users else None
 
 
+def _user_with_plugins_txt(game_id: str, prefix: Path, store: str) -> str | None:
+    """The Wine user whose AppData already holds this game's plugins.txt.
+
+    A prefix can have both ``<you>`` and ``steamuser`` (umu/Proton-based Lutris
+    runners use steamuser); the one the game actually wrote to wins, the most
+    recently written if several did.
+    """
+    try:
+        with os.scandir(prefix / "drive_c" / "users") as it:
+            users = [e.name for e in it if _entry_is_dir(e) and e.name.lower() != "public"]
+    except (OSError, ValueError):
+        return None
+    found: list[tuple[float, str]] = []
+    for user in users:
+        plugins = _child(find_appdata_dir(game_id, prefix, user, store), "plugins.txt", want_dir=False)
+        if plugins is not None:
+            try:
+                found.append((plugins.stat().st_mtime, user))
+            except OSError:
+                continue
+    return max(found)[1] if found else None
+
+
 def detect_store(root: Path) -> str:
     try:
         with os.scandir(root) as it:
@@ -649,6 +672,8 @@ def _discover_raw(
         warnings.append("the games folder is set to /; not scanning the whole disk")
     elif not os.path.isdir(games_dir):
         warnings.append(f"games folder {games_dir} does not exist")
+    elif not os.access(games_dir, os.R_OK | os.X_OK):
+        warnings.append(f"cannot read the games folder {games_dir}: permission denied")
     else:
         scan_roots.append(games_dir)
     for game_path in lutris_game_paths(lutris, home=home):
@@ -669,7 +694,9 @@ def _discover_raw(
         by_game.setdefault(cand.game_id, []).append(cand)
     games: list[DiscoveredGame] = []
     for game_id, cands in by_game.items():
-        cands.sort(key=lambda c: (c.lutris is None, not c.direct, len(str(c.root)), str(c.root)))
+        cands.sort(key=lambda c: (
+            c.lutris is None, not c.direct, find_wine_prefix(c.root) is None, len(str(c.root)), str(c.root)
+        ))
         best = cands[0]
         game = _build_game(
             game_id,
@@ -729,20 +756,24 @@ def _build_game(
     else:
         prefix = next((p for p in prefix_hints if p is not None and _is_within(root, p)), None)
         prefix = prefix or find_wine_prefix(root)
+        # Lutris can run a game kept outside its prefix (e.g. on another disk).
+        prefix = prefix or next(
+            (p for p in prefix_hints if p is not None and os.path.isdir(p / "drive_c")), None
+        )
         if prefix is None:
             warnings.append(f"no Wine prefix found above {root}; plugins.txt location unknown")
 
+    store = detect_store(root)
     wine_user = user_override
     if prefix is not None:
         users_dir = prefix / "drive_c" / "users"
         if wine_user is None:
-            wine_user = find_wine_user(prefix)
+            wine_user = _user_with_plugins_txt(game_id, prefix, store) or find_wine_user(prefix)
             if wine_user is None:
                 warnings.append(f"no Wine user folder in {users_dir}")
         elif not os.path.isdir(users_dir / wine_user):
             warnings.append(f"Wine user folder {users_dir / wine_user} (manual) does not exist")
 
-    store = detect_store(root)
     appdata_dir = plugins_txt = None
     if prefix is not None and wine_user:
         appdata_dir = find_appdata_dir(game_id, prefix, wine_user, store)
@@ -843,6 +874,15 @@ def _scan_key(settings: Settings) -> dict:
     return {"games_dir": str(settings.games_dir), "scan_depth": settings.scan_depth}
 
 
+def cache_is_current(settings: Settings, cache_path: Path | None = None) -> bool:
+    """Whether ``get_games(settings)`` would answer from the cache."""
+    return _cache_matches(_read_cache(cache_path), settings)
+
+
+def _cache_matches(cached, settings: Settings) -> bool:
+    return cached is not None and (cached[2] is None or cached[2] == _scan_key(settings))
+
+
 def load_cached_games(path: Path | None = None) -> list[DiscoveredGame] | None:
     """``None`` when there is no (readable) cache."""
     cached = _read_cache(path)
@@ -905,7 +945,7 @@ def get_games(
     home = home or Path.home()
     scan_key = _scan_key(settings)
     cached = None if rescan else _read_cache(cache_path)
-    if cached is not None and cached[2] is not None and cached[2] != scan_key:
+    if not _cache_matches(cached, settings):
         cached = None
     if cached is None:
         games, warnings = _discover_raw(settings, home, lutris)

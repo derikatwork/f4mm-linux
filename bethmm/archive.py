@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass, field
@@ -74,21 +75,76 @@ def _decode(data: bytes) -> str:
     return data.decode("utf-8", errors="surrogateescape")
 
 
-def _failure(archive: Path, proc: subprocess.CompletedProcess, sevenzip: str) -> ArchiveError:
-    output = (_decode(proc.stderr) + "\n" + _decode(proc.stdout)).strip()
-    lines = [ln.strip() for ln in output.splitlines() if ln.strip()]
-    errors = [ln for ln in lines if "error" in ln.lower() or "can not" in ln.lower() or "cannot" in ln.lower()]
-    detail = "; ".join(errors[-3:]) or (lines[-1] if lines else f"exit code {proc.returncode}")
+#: 7z's summary counters ("Sub items Errors: 1"), which say nothing about the cause.
+_COUNTER = re.compile(r"^(sub items errors|archives with errors|errors|warnings)\s*:\s*\d+$", re.IGNORECASE)
+
+
+def _error_lines(output: str, archive: Path | None = None) -> list[str]:
+    """The lines of 7z output that name what went wrong, without the counters.
+
+    The archive's full path is shortened to its name; an "ERROR: <path> : <path>"
+    line that says nothing else is dropped.
+    """
+    lines = [ln.strip() for ln in output.splitlines()]
+    if archive is not None:
+        full = str(archive)
+        lines = [ln.replace(full, archive.name) if full in ln else ln for ln in lines]
+    found: list[str] = []
+    in_block = False
+    for i, line in enumerate(lines):
+        low = line.lower()
+        if not line:
+            in_block = False
+            continue
+        if _COUNTER.match(line):
+            continue
+        if low in ("errors:", "warnings:"):
+            # A header followed by one cause per line ("Unexpected end of archive").
+            in_block = low == "errors:"
+            continue
+        if in_block:
+            found.append(line)
+        elif low.startswith("system error"):
+            # The cause ("errno=28 : No space left on device") is on the next line.
+            following = next((ln for ln in lines[i + 1:] if ln), "")
+            found.append(following or line)
+        elif low.startswith("error:"):
+            detail = line[len("error:"):].strip()
+            if archive is None or {p.strip() for p in detail.split(" : ")} != {archive.name}:
+                found.append(detail)
+        elif "can not open" in low or "cannot open" in low or low.startswith("e_fail"):
+            found.append(line)
+    return list(dict.fromkeys(e for e in found if e))
+
+
+def _failure(archive: Path, proc: subprocess.CompletedProcess, sevenzip: str, dest: Path | None = None) -> ArchiveError:
+    output = _decode(proc.stdout) + "\n" + _decode(proc.stderr)
+    errors = _error_lines(output, archive)
+    detail = "; ".join(errors[:3]) or f"7z exited with code {proc.returncode}"
+    text = " ".join(errors).lower()
     msg = f"7z could not read {archive.name}: {detail}"
-    lowered = output.lower()
-    if "wrong password" in lowered or "enter password" in lowered or "encrypted" in lowered:
+    if "wrong password" in text or "encrypted archive" in text or "encrypted file" in text:
         msg = f"{archive.name} is password-protected; that isn't supported."
     elif archive.suffix.lower() == ".rar" and (
-        "unsupported" in lowered or "can not open the file as archive" in lowered
-        or "cannot open the file as archive" in lowered or Path(sevenzip).name == "7za"
+        "unsupported method" in text or Path(sevenzip).name == "7za"
+        or ("can not open the file as archive" in text and not _looks_damaged(text))
     ):
-        msg += "\nThis 7z build can't open .rar files. Install RAR support:  sudo apt install 7zip-rar"
+        package = "p7zip-rar" if "p7zip" in output.lower() else "7zip-rar"
+        msg += f"\nThis 7z can't unpack this .rar file. Install RAR support:  sudo apt install {package}"
+    elif "no space left" in text or "errno=28" in text:
+        where = dest.parent if dest is not None else "the data folder"
+        msg = f"Not enough disk space to extract {archive.name} into {where}. Free some space and try again."
+    elif "permission denied" in text or "errno=13" in text:
+        msg += "\nCheck that you can write to " + (str(dest) if dest is not None else "the data folder") + "."
+    elif _looks_damaged(text):
+        msg += "\nThe file looks damaged or incomplete; download it again."
+    log.error("%s", msg.replace("\n", " "))
     return ArchiveError(msg)
+
+
+def _looks_damaged(text: str) -> bool:
+    return any(w in text for w in ("crc failed", "data error", "unexpected end", "headers error",
+                                   "is not archive", "there are data after the end"))
 
 
 def list_archive(archive: str | Path, sevenzip: str | None = None) -> list[ArchiveEntry]:
@@ -152,19 +208,19 @@ def extract_archive(archive: str | Path, dest: str | Path, sevenzip: str | None 
     dest.mkdir(parents=True, exist_ok=True)
 
     exe = find_sevenzip(sevenzip)
-    log.info("EXTRACT %s -> %s", archive, dest)
+    log.info("EXTRACT %s -> %s", archive.resolve(), dest)
     proc = _run([exe, "x", "-y", "-bd", "-p", f"-o{dest}", "--", str(archive)])
     warnings: list[str] = []
     if proc.returncode != 0:
-        output = _decode(proc.stdout) + "\n" + _decode(proc.stderr)
-        errors = [ln.strip() for ln in output.splitlines() if ln.strip().startswith("ERROR:")]
+        errors = _error_lines(_decode(proc.stdout) + "\n" + _decode(proc.stderr))
         # 7z refuses links pointing outside the archive and exits with 2; that
         # alone is not a reason to fail the whole mod.
         if errors and all("Dangerous link path was ignored" in e for e in errors):
             for e in errors:
-                warnings.append(f"7z skipped a link that points outside the mod: {e.split(':', 2)[-1].strip()}")
+                warnings.append(f"7z skipped a link that points outside the mod: {e.split(':', 1)[-1].strip()}")
         else:
-            raise _failure(archive, proc, exe)
+            raise _failure(archive, proc, exe, dest)
+    _split_backslash_names(dest, warnings)
 
     files: list[str] = []
     real_dest = os.path.realpath(dest)
@@ -183,4 +239,49 @@ def extract_archive(archive: str | Path, dest: str | Path, sevenzip: str | None 
                     raise ArchiveError(f"{archive.name} extracted a file outside the target folder: {rel}")
                 files.append(rel)
     files.sort()
+    log.info("EXTRACTED %d files from %s", len(files), archive.name)
+    for warning in warnings:
+        log.warning("%s: %s", archive.name, warning)
     return ExtractResult(files, warnings)
+
+
+def _split_backslash_names(dest: Path, warnings: list[str]) -> None:
+    """Turn files named like ``Data\\x.esp`` into ``Data/x.esp``.
+
+    Zips made on Windows sometimes store backslash separators, and 7z on Linux
+    then creates one flat file with backslashes in its name. Folders are
+    merged with existing ones case-insensitively.
+    """
+    pending: list[tuple[Path, str]] = []
+    for dirpath, _dirnames, filenames in os.walk(dest):
+        pending.extend((Path(dirpath), name) for name in filenames if "\\" in name)
+    for folder, name in pending:
+        source = folder / name
+        if source.is_symlink():
+            continue
+        parts = [p for p in name.split("\\") if p not in ("", ".")]
+        if not parts or ".." in parts:
+            source.unlink()
+            warnings.append(f"removed {name!r}: unsafe path")
+            continue
+        target = folder
+        for part in parts[:-1]:
+            target = _child_ci(target, part)
+        target = target / parts[-1]
+        if os.path.lexists(target):
+            source.unlink()
+            warnings.append(f"removed {name!r}: {target.relative_to(dest).as_posix()} already exists")
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        os.rename(source, target)
+
+
+def _child_ci(folder: Path, name: str) -> Path:
+    """*folder*/*name*, reusing an existing sub-folder that differs only in case."""
+    try:
+        for entry in os.scandir(folder):
+            if entry.is_dir(follow_symlinks=False) and entry.name.lower() == name.lower():
+                return folder / entry.name
+    except FileNotFoundError:
+        pass
+    return folder / name

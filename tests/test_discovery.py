@@ -838,3 +838,60 @@ def test_discovery_never_writes_to_home_or_games(home, tmp_path):
 
     assert [g.game_id for g in games] == ["fallout4"]
     assert snapshot(tmp_path) == before
+
+
+# ---------------------------------------------------------------- final review additions
+
+
+def test_game_kept_outside_its_lutris_prefix_uses_that_prefix(home, tmp_path):
+    prefix = make_prefix(home / "Games" / "fallout-3")
+    make_tree(appdata(prefix) / "Fallout3", ["plugins.txt"])
+    root = make_tree(tmp_path / "mnt" / "games" / "Fallout 3 GOTY", ["Fallout3.exe", "Data/"])
+    cfg = home / LUTRIS_CONFIG_DIRS[1]
+    write_yml(cfg / "fallout-3-1700000000.yml", lutris_yml(root / "Fallout3.exe", prefix))
+
+    (game,), _ = discover_games(Settings(), home=home)
+    assert game.root == root and game.source == "lutris"
+    assert game.prefix == prefix and game.wine_user == USER
+    assert game.plugins_txt == appdata(prefix) / "Fallout3" / "plugins.txt"
+    assert not any("no Wine prefix" in w for w in game.warnings)
+
+
+def test_wine_user_follows_existing_plugins_txt(home):
+    prefix = make_prefix(home / "Games" / "fnv")
+    make_tree(prefix / "drive_c" / "users" / "steamuser" / "AppData" / "Local" / "FalloutNV", ["plugins.txt"])
+    make_gog_game(prefix, "Fallout New Vegas", "FalloutNV.exe")
+
+    (game,), _ = discover_games(Settings(), home=home)
+    assert game.wine_user == "steamuser"
+    assert game.plugins_txt == prefix / "drive_c" / "users" / "steamuser" / "AppData" / "Local" / "FalloutNV" / "plugins.txt"
+
+
+def test_wine_user_with_newest_plugins_txt_wins(home):
+    prefix = make_prefix(home / "Games" / "fnv")
+    mine = make_tree(appdata(prefix) / "FalloutNV", ["plugins.txt"]) / "plugins.txt"
+    theirs = make_tree(prefix / "drive_c" / "users" / "steamuser" / "AppData" / "Local" / "FalloutNV",
+                       ["plugins.txt"]) / "plugins.txt"
+    os.utime(theirs, (1_000_000, 1_000_000))
+    os.utime(mine, (2_000_000, 2_000_000))
+    make_gog_game(prefix, "Fallout New Vegas", "FalloutNV.exe")
+    (game,), _ = discover_games(Settings(), home=home)
+    assert game.wine_user == USER
+
+
+def test_scan_prefers_install_inside_a_wine_prefix_over_a_shorter_backup(home):
+    real = make_gog_game(make_prefix(home / "Games" / "fallout-4"), "Fallout 4 GOTY", "Fallout4.exe")
+    backup = make_tree(home / "Games" / "bk" / "FO4", ["Fallout4.exe", "Data/"])
+    assert len(str(backup)) < len(str(real))
+    (game,), _ = discover_games(Settings(), home=home)
+    assert game.root == real and game.alternatives == [str(backup)]
+
+
+def test_cache_is_current(home, tmp_path):
+    from bethmm.discovery import cache_is_current
+
+    cache = tmp_path / "c.json"
+    assert not cache_is_current(Settings(), cache)
+    get_games(Settings(), cache_path=cache, home=home)
+    assert cache_is_current(Settings(), cache)
+    assert not cache_is_current(Settings(games_dir="/elsewhere"), cache)

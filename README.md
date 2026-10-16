@@ -117,6 +117,19 @@ This extracts the archive to a temporary folder inside
 
 The temporary extraction is deleted afterwards.
 
+When the layout isn't recognised (or the archive is a FOMOD installer), the mod's
+files are shown as a tree together with the folders that look installable. Preview
+your own choice of root folder and target — still without changing anything:
+
+```bash
+bethmm analyze SomeMod.7z --root "00 Core" --root "01 Optional" --target data
+bethmm analyze SomeMod.7z --target game     # detected root, but into the game folder
+```
+
+`--root` can be given several times (later ones win where files overlap);
+`--target` is `data` (the Data folder) or `game` (next to the game's `.exe`).
+Without `--target`, each root's place is detected on its own.
+
 ### Look inside a plugin
 
 ```bash
@@ -131,7 +144,7 @@ Prints the plugin's masters, header version and the game it was made for.
 |---|---|
 | Settings | `~/.config/beth-mod-manager/settings.json` |
 | Game discovery cache | `~/.local/share/beth-mod-manager/games.json` |
-| Log of every file operation | `~/.local/share/beth-mod-manager/logs/bethmm.log` |
+| Log of every file operation (settings/cache writes, extractions, temp folders) | `~/.local/share/beth-mod-manager/logs/bethmm.log` |
 | Staged mods (phase 2) | `~/.local/share/beth-mod-manager/mods/<game>/<mod>/` |
 | Backups of replaced vanilla files (phase 2) | `~/.local/share/beth-mod-manager/backups/<game>/` |
 
@@ -159,8 +172,8 @@ The rules live in `bethmm/placement.py` and are applied in order:
    goes into `Data/`.
 5. **Game-root content** — `.exe`/`.dll` files, ENB/ReShade files and folders mean the
    root goes next to the game's `.exe`.
-6. **Unknown** — you choose; the app suggests folders inside the archive that look
-   installable.
+6. **Unknown** — you choose (`--root`/`--target`); the app shows the file tree and
+   suggests folders inside the archive that look installable.
 
 If a root has both Data content and game-root-only files, rule 4 wins but the
 confidence is marked low and the odd files are listed so you can correct it.

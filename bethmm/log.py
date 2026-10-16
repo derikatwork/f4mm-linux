@@ -31,7 +31,7 @@ def setup_logging(level: int = logging.INFO, log_file: Path | None = None) -> Pa
         _handler.close()
     log_file.parent.mkdir(parents=True, exist_ok=True)
     _handler = logging.handlers.RotatingFileHandler(
-        log_file, maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8"
+        log_file, maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8", errors="backslashreplace"
     )
     _handler.setFormatter(logging.Formatter(FORMAT, DATE_FORMAT))
     logger.addHandler(_handler)

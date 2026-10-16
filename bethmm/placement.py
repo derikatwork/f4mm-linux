@@ -45,10 +45,11 @@ Not deployed (listed in ``skipped`` with nothing else happening to them):
 * the ``fomod/`` folder;
 * loose docs and images directly in the chosen root (``DOC_EXTS``,
   ``IMAGE_EXTS``, extension-less ``DOC_NAMES`` such as ``README``) and doc
-  folders directly in the root (``DOC_DIRS``). Exception: for ``GAME_ROOT``
-  targets a ``.txt`` file is only skipped when its name looks like
-  documentation (``DOC_TXT_WORDS``), because game-folder mods ship config
-  ``.txt`` files there (ENB's ``effect.txt``, Engine Fixes' preload list);
+  folders directly in the root (``DOC_DIRS``). Exceptions for ``GAME_ROOT``
+  targets, because game-folder mods ship such files next to the exe: a
+  ``.txt`` file is only skipped when its name looks like documentation
+  (``DOC_TXT_WORDS``; ENB's ``effect.txt`` and Engine Fixes' preload list are
+  kept), and images whose name starts with ``enb`` (ENB textures) are kept;
 * for ``GAME_ROOT`` targets when a script-extender loader is present: a
   top-level ``src/`` folder (script extender source code).
 
@@ -122,7 +123,9 @@ GAME_ROOT_EXTS = frozenset({".exe", ".dll", ".asi"})
 
 DOC_EXTS = frozenset({".txt", ".md", ".pdf", ".url", ".htm", ".html", ".rtf", ".doc", ".docx", ".odt", ".nfo"})
 IMAGE_EXTS = frozenset({".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"})
-DOC_DIRS = frozenset({"docs", "documentation", "readme", "readmes", "screenshots"})
+DOC_DIRS = frozenset({
+    "docs", "documentation", "readme", "readmes", "screenshots", "screens", "images", "previews", "pictures", "pics",
+})
 #: Extension-less documentation files.
 DOC_NAMES = frozenset({"readme", "license", "licence", "changelog", "changes", "credits", "authors", "copying"})
 #: Words that mark a .txt file in a game-folder mod as documentation.
@@ -216,6 +219,9 @@ class PlacementPlan:
     skipped: list[str] = field(default_factory=list)
     #: Wrapper folders descended through, outermost first.
     wrapper_dirs: list[str] = field(default_factory=list)
+    #: For FOMOD/unknown plans: files under the root still waiting for the
+    #: user's choice (neither mapped nor skipped).
+    unplaced: list[str] = field(default_factory=list)
     #: Source path of fomod/ModuleConfig.xml when the mod is a FOMOD installer.
     fomod_config: str | None = None
     candidate_roots: list[RootCandidate] = field(default_factory=list)
@@ -238,6 +244,7 @@ class PlacementPlan:
             "mappings": [{"source": m.source, "dest": m.dest} for m in self.mappings],
             "skipped": list(self.skipped),
             "wrapper_dirs": list(self.wrapper_dirs),
+            "unplaced": list(self.unplaced),
             "fomod_config": self.fomod_config,
             "is_fomod": self.is_fomod,
             "candidate_roots": [
@@ -312,8 +319,13 @@ def _is_doc_file(name: str, target: Target | None = None) -> bool:
     if low in GAME_ROOT_FILES:
         return False
     ext = _ext(low)
-    if ext == ".txt" and target is Target.GAME_ROOT:
-        return any(word in low for word in DOC_TXT_WORDS)
+    if target is Target.GAME_ROOT:
+        if ext == ".txt":
+            return any(word in low for word in DOC_TXT_WORDS)
+        # ENB presets ship their textures (enbsunsprite.bmp, enblensmask.png ...)
+        # next to the exe.
+        if ext in IMAGE_EXTS and low.startswith("enb"):
+            return False
     return ext in _DOC_OR_IMAGE_EXTS or low in DOC_NAMES
 
 
@@ -714,6 +726,8 @@ def analyze_files(
         skip_set = set(paths) - {m.source for m in plan.mappings}
         evidence = plan.mappings
     plan.skipped = [p for p in paths if p in skip_set]
+    if plan.target is Target.UNKNOWN:
+        plan.unplaced = [p for p in paths if p not in skip_set]
 
     plan.game = identify_game(evidence, header_reader=header_reader, installed_games=installed_games)
     plan.nexus = parse_nexus_filename(archive_name) if archive_name else None
@@ -984,16 +998,14 @@ def identify_game(
 # Disk
 
 
-def analyze_directory(
-    path: str | Path,
-    *,
-    installed_games: Sequence[str] = (),
-    archive_name: str | None = None,
-) -> PlacementPlan:
-    """Walk an extracted mod folder (without following symlinks) and run
-    ``analyze_files`` with a header reader backed by
-    ``plugin_header.read_plugin_header`` (unreadable plugins -> None).
-    Symlinks inside the extraction are ignored and reported in warnings.
+def scan_directory(path: str | Path) -> tuple[list[str], HeaderReader, list[str]]:
+    """List an extracted mod folder for ``analyze_files`` / ``plan_for_roots``.
+
+    Returns ``(files, header_reader, warnings)``: relative POSIX paths of the
+    regular files (walked without following symlinks), a reader backed by
+    ``plugin_header.read_plugin_header`` (unreadable plugins -> None), and
+    warnings about symlinks, special files and unreadable entries, which are
+    left out.
     """
     base = Path(path)
     if not base.is_dir():
@@ -1035,6 +1047,20 @@ def analyze_directory(
         except PluginHeaderError:
             return None
 
+    return files, reader, warnings
+
+
+def analyze_directory(
+    path: str | Path,
+    *,
+    installed_games: Sequence[str] = (),
+    archive_name: str | None = None,
+) -> PlacementPlan:
+    """Walk an extracted mod folder (see ``scan_directory``) and run
+    ``analyze_files`` on it. Symlinks inside the extraction are ignored and
+    reported in warnings.
+    """
+    files, reader, warnings = scan_directory(path)
     plan = analyze_files(files, header_reader=reader, installed_games=installed_games, archive_name=archive_name)
     plan.warnings[:0] = warnings
     return plan

@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import tempfile
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from bethmm import paths
+
+log = logging.getLogger(__name__)
 
 LINK_MODES = ("symlink", "hardlink")
 
@@ -108,6 +111,7 @@ def write_json_atomic(path: Path, data) -> None:
             json.dump(data, fh, indent=2, sort_keys=True)
             fh.write("\n")
         os.replace(tmp, path)
+        log.info("WRITE %s", path)
     except BaseException:
         try:
             os.unlink(tmp)

@@ -4,7 +4,7 @@ Phase 1 commands only read: they never create, change or delete anything in a
 game folder.
 
     bethmm games [--rescan] [--json]
-    bethmm analyze <archive-or-folder> [--game ID] [--json]
+    bethmm analyze <archive-or-folder> [--game ID] [--root DIR]... [--target data|game] [--json]
     bethmm plugin-info <plugin>...
     bethmm config [--games-dir PATH] [--scan-depth N] [--7z PATH]
     bethmm override <game> [--root PATH] [--prefix PATH] [--wine-user NAME]
@@ -18,21 +18,34 @@ import json
 import logging
 import os
 import shutil
+import signal
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 from bethmm import APP_NAME, __version__, paths
 from bethmm.archive import ArchiveError, extract_archive
-from bethmm.discovery import DiscoveredGame, get_games
+from bethmm.discovery import DiscoveredGame, cache_is_current, get_games
 from bethmm.games import GAMES
 from bethmm.log import setup_logging
 from bethmm.pathresolve import CaseResolver
-from bethmm.placement import Confidence, PlacementPlan, Rule, Target, analyze_directory
+from bethmm.placement import (
+    Confidence,
+    PlacementPlan,
+    Rule,
+    Target,
+    analyze_files,
+    plan_for_roots,
+    scan_directory,
+)
 from bethmm.plugin_header import PluginHeaderError, candidate_games, read_plugin_header
 from bethmm.settings import LINK_MODES, GameOverride, Settings, SettingsError, load_settings, save_settings
 
 log = logging.getLogger(__name__)
+
+#: Leftover analyze-* extraction folders older than this are removed.
+STALE_TMP_SECONDS = 6 * 3600
 
 
 class CliError(Exception):
@@ -40,6 +53,10 @@ class CliError(Exception):
 
 
 def main(argv: list[str] | None = None) -> int:
+    # File names from archives need not be valid UTF-8; never crash printing them.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="backslashreplace")
     parser = build_parser()
     args = parser.parse_args(argv)
     if not getattr(args, "func", None):
@@ -49,11 +66,28 @@ def main(argv: list[str] | None = None) -> int:
         setup_logging()
     except OSError as exc:
         print(f"warning: logging disabled: {exc}", file=sys.stderr)
+    previous = {sig: signal.signal(sig, _exit_on_signal) for sig in (signal.SIGTERM, signal.SIGHUP)}
     try:
         return args.func(args) or 0
     except (CliError, ArchiveError, SettingsError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+    except OSError as exc:
+        where = f" ({exc.filename})" if exc.filename else ""
+        log.error("%s%s", exc.strerror or exc, where)
+        print(f"error: {exc.strerror or exc}{where}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("interrupted", file=sys.stderr)
+        return 130
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+
+
+def _exit_on_signal(signum, _frame) -> None:
+    # Raising here unwinds through the finally blocks that remove temp folders.
+    raise SystemExit(128 + signum)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -69,6 +103,10 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("analyze", help="show where a mod archive's files would go (changes nothing)")
     p.add_argument("path", help="a .zip/.7z/.rar archive or an already-extracted folder")
     p.add_argument("--game", choices=sorted(GAMES), help="check against this game instead of the detected one")
+    p.add_argument("--root", action="append", metavar="DIR",
+                   help="install this folder of the archive instead of the detected one (repeatable)")
+    p.add_argument("--target", choices=("data", "game"),
+                   help="put the root into the Data folder or the game folder instead of the detected place")
     p.add_argument("--json", action="store_true", help="machine-readable output")
     p.set_defaults(func=cmd_analyze)
 
@@ -100,6 +138,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def cmd_games(args) -> int:
     settings = load_settings()
+    from_cache = not args.rescan and cache_is_current(settings)
     games, warnings = get_games(settings, rescan=args.rescan)
     if args.json:
         print(json.dumps({"games": [g.to_dict() for g in games], "warnings": warnings}, indent=2))
@@ -113,7 +152,7 @@ def cmd_games(args) -> int:
     for g in games:
         print(_describe_game(g))
         print()
-    if not args.rescan:
+    if from_cache:
         print("(cached results; run 'bethmm games --rescan' to search again)")
     return 0
 
@@ -151,9 +190,9 @@ def cmd_analyze(args) -> int:
     installed = [g.game_id for g in games]
     source = Path(args.path).expanduser()
     if source.is_dir():
-        plan = analyze_directory(source, installed_games=installed, archive_name=source.name)
+        plan = _plan(source, args, installed, source.name)
     elif source.is_file():
-        plan = _analyze_archive(source, settings, installed)
+        plan = _analyze_archive(source, args, settings, installed)
     else:
         raise CliError(f"{source} does not exist")
 
@@ -167,20 +206,66 @@ def cmd_analyze(args) -> int:
         data["resolved"] = resolved
         print(json.dumps(data, indent=2))
     else:
-        print(format_plan(plan, game_id, game, resolved))
+        print(format_plan(plan, game_id, game, resolved, installed=installed, source=str(args.path)))
     return 0
 
 
-def _analyze_archive(archive: Path, settings: Settings, installed: list[str]) -> PlacementPlan:
-    paths.tmp_dir().mkdir(parents=True, exist_ok=True)
-    workdir = Path(tempfile.mkdtemp(prefix="analyze-", dir=paths.tmp_dir()))
+def _plan(folder: Path, args, installed: list[str], archive_name: str) -> PlacementPlan:
+    """Automatic plan for an extracted mod, or the user's --root/--target choice."""
+    files, reader, warnings = scan_directory(folder)
+    common = dict(header_reader=reader, installed_games=installed, archive_name=archive_name)
+    plan = analyze_files(files, **common)
+    if args.root or args.target:
+        target = {"data": Target.DATA, "game": Target.GAME_ROOT, None: None}[args.target]
+        roots = args.root or [plan.root]
+        try:
+            plan = plan_for_roots(files, roots, target, **common)
+        except ValueError as exc:
+            hint = "" if args.target else " (add --target data or --target game)"
+            raise CliError(f"{exc}{hint}") from exc
+    plan.warnings[:0] = warnings
+    return plan
+
+
+def _analyze_archive(archive: Path, args, settings: Settings, installed: list[str]) -> PlacementPlan:
+    tmp = paths.tmp_dir()
+    tmp.mkdir(parents=True, exist_ok=True)
+    _remove_stale_extractions(tmp)
+    workdir = Path(tempfile.mkdtemp(prefix="analyze-", dir=tmp))
+    log.info("MKDIR %s (temporary extraction)", workdir)
     try:
         result = extract_archive(archive, workdir / "x", settings.sevenzip)
-        plan = analyze_directory(workdir / "x", installed_games=installed, archive_name=archive.name)
+        plan = _plan(workdir / "x", args, installed, archive.name)
         plan.warnings.extend(result.warnings)
         return plan
     finally:
-        shutil.rmtree(workdir, ignore_errors=True)
+        _remove_tree(workdir)
+
+
+def _remove_tree(folder: Path) -> None:
+    """Delete one of our own temporary folders, logging what happened."""
+    def on_error(_func, path, exc_info) -> None:
+        log.warning("could not delete %s: %s", path, exc_info[1])
+
+    shutil.rmtree(folder, onerror=on_error)
+    log.info("DELETE %s (temporary extraction)", folder)
+
+
+def _remove_stale_extractions(tmp: Path) -> None:
+    """Remove analyze-* folders left behind by a run that was killed."""
+    cutoff = time.time() - STALE_TMP_SECONDS
+    try:
+        entries = list(os.scandir(tmp))
+    except OSError:
+        return
+    for entry in entries:
+        try:
+            stale = entry.name.startswith("analyze-") and entry.is_dir(follow_symlinks=False) \
+                and entry.stat(follow_symlinks=False).st_mtime < cutoff
+        except OSError:
+            continue
+        if stale:
+            _remove_tree(Path(entry.path))
 
 
 def _resolve_against_game(plan: PlacementPlan, game: DiscoveredGame) -> list[dict]:
@@ -202,7 +287,7 @@ def _resolve_against_game(plan: PlacementPlan, game: DiscoveredGame) -> list[dic
         out.append({
             "source": m.source,
             "dest": str(r.rel),
-            "case_adjusted": _case_note(m.dest, r.rel, r.new_dirs),
+            "case_adjusted": _case_note(m.dest, r.rel, game.root),
             "status": status,
             "new_dirs": [str(d) for d in r.new_dirs],
             "notes": list(r.ambiguous),
@@ -210,15 +295,14 @@ def _resolve_against_game(plan: PlacementPlan, game: DiscoveredGame) -> list[dic
     return out
 
 
-def _case_note(wanted: str, rel, new_dirs) -> str | None:
+def _case_note(wanted: str, rel, root: Path) -> str | None:
     """Why the resolved path is spelled differently from the mod's, if it is."""
     wanted_parts = wanted.replace("\\", "/").split("/")
-    new = {str(d) for d in new_dirs}
     reasons = set()
     for i, (mine, actual) in enumerate(zip(wanted_parts, rel.parts)):
         if mine != actual:
-            prefix = "/".join(rel.parts[: i + 1])
-            reasons.add("new folder spelled like the game's folders" if prefix in new else "case matched to existing folder")
+            on_disk = os.path.lexists(root.joinpath(*rel.parts[: i + 1]))
+            reasons.add("case matched to existing folder" if on_disk else "new folder spelled like the game's folders")
     return "; ".join(sorted(reasons)) or None
 
 
@@ -238,7 +322,15 @@ _TARGET_TEXT = {
 }
 
 
-def format_plan(plan: PlacementPlan, game_id: str | None, game: DiscoveredGame | None, resolved: list[dict]) -> str:
+def format_plan(
+    plan: PlacementPlan,
+    game_id: str | None,
+    game: DiscoveredGame | None,
+    resolved: list[dict],
+    *,
+    installed: list[str] | None = None,
+    source: str = "<archive>",
+) -> str:
     out: list[str] = []
     if plan.nexus is not None:
         n = plan.nexus
@@ -254,7 +346,9 @@ def format_plan(plan: PlacementPlan, game_id: str | None, game: DiscoveredGame |
         name = GAMES[guess.game_id].name
         out.append(f"Game     : {name} ({_conf(guess.confidence)} confidence)")
     else:
-        out.append("Game     : could not tell - please choose")
+        out.append("Game     : could not tell")
+        if installed and not game_id:
+            out.append(f"           re-run with --game {'|'.join(installed)} to check it against a game folder")
     for reason in guess.reasons:
         out.append(f"           - {reason}")
     if game_id and game_id != guess.game_id:
@@ -275,7 +369,7 @@ def format_plan(plan: PlacementPlan, game_id: str | None, game: DiscoveredGame |
     if plan.is_fomod:
         out.append("")
         out.append(f"This is a FOMOD installer ({plan.fomod_config}). The guided installer arrives in a later")
-        out.append("phase; until then you will pick which sub-folders to install.")
+        out.append("phase; until then you pick which sub-folders to install.")
 
     if plan.candidate_roots:
         out.append("")
@@ -283,11 +377,22 @@ def format_plan(plan: PlacementPlan, game_id: str | None, game: DiscoveredGame |
         for c in plan.candidate_roots:
             out.append(f"  {c.path or '(top level)'}/  -> {_TARGET_TEXT[c.target]}")
 
+    if plan.unplaced:
+        out.append("")
+        out.append(f"Files in the mod ({len(plan.unplaced)}):")
+        out.extend(_tree(plan.unplaced))
+        example = next((c.path for c in plan.candidate_roots if c.path), None) or plan.unplaced[0].split("/")[0]
+        out.append("")
+        out.append("Preview a choice with:")
+        out.append(f"  bethmm analyze {_quote(source)} --root {_quote(example)} [--root ANOTHER] [--target data|game]")
+
     if plan.mappings:
         out.append("")
         where = f" in {game.root}" if game and resolved else ""
         out.append(f"Files ({len(plan.mappings)}){where}:")
         if resolved:
+            for note in dict.fromkeys(n for r in resolved for n in r["notes"]):
+                out.append(f"  ! {note}")
             for r in resolved:
                 note = "" if r["status"] == "new" else f"   [{r['status']}]"
                 if r["case_adjusted"]:
@@ -296,8 +401,10 @@ def format_plan(plan: PlacementPlan, game_id: str | None, game: DiscoveredGame |
         else:
             for m in plan.mappings:
                 out.append(f"  {m.source}  ->  {m.dest}")
-        if game is None and plan.target is not Target.UNKNOWN:
-            out.append("  (game not installed/found, so destinations weren't checked against a real folder)")
+        if game is None and game_id:
+            out.append(f"  ({GAMES[game_id].name} was not found, so destinations weren't checked against a real folder)")
+        elif game is None:
+            out.append("  (no game chosen, so destinations weren't checked against a real folder)")
 
     if plan.skipped:
         out.append("")
@@ -311,6 +418,27 @@ def format_plan(plan: PlacementPlan, game_id: str | None, game: DiscoveredGame |
 
 def _conf(c: Confidence) -> str:
     return c.name.lower()
+
+
+def _tree(files: list[str], limit: int = 60) -> list[str]:
+    """Indented folder tree of *files* (relative POSIX paths)."""
+    lines: list[str] = []
+    shown: set[str] = set()
+    for path in files:
+        parts = path.split("/")
+        for depth in range(len(parts) - 1):
+            folder = "/".join(parts[: depth + 1])
+            if folder not in shown:
+                shown.add(folder)
+                lines.append("  " + "    " * depth + parts[depth] + "/")
+        lines.append("  " + "    " * (len(parts) - 1) + parts[-1])
+    if len(lines) > limit:
+        lines = lines[:limit] + [f"  ... and {len(lines) - limit} more lines"]
+    return lines
+
+
+def _quote(text: str) -> str:
+    return text if text and all(c.isalnum() or c in "-_./~" for c in text) else "'" + text.replace("'", "'\\''") + "'"
 
 
 # ---------------------------------------------------------------- plugin-info
