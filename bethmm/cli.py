@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import shutil
 import sys
 import tempfile
@@ -27,7 +28,7 @@ from bethmm.discovery import DiscoveredGame, get_games
 from bethmm.games import GAMES
 from bethmm.log import setup_logging
 from bethmm.pathresolve import CaseResolver
-from bethmm.placement import Confidence, PlacementPlan, Target, analyze_directory
+from bethmm.placement import Confidence, PlacementPlan, Rule, Target, analyze_directory
 from bethmm.plugin_header import PluginHeaderError, candidate_games, read_plugin_header
 from bethmm.settings import LINK_MODES, GameOverride, Settings, SettingsError, load_settings, save_settings
 
@@ -201,7 +202,7 @@ def _resolve_against_game(plan: PlacementPlan, game: DiscoveredGame) -> list[dic
         out.append({
             "source": m.source,
             "dest": str(r.rel),
-            "case_adjusted": str(r.rel) != m.dest,
+            "case_adjusted": _case_note(m.dest, r.rel, r.new_dirs),
             "status": status,
             "new_dirs": [str(d) for d in r.new_dirs],
             "notes": list(r.ambiguous),
@@ -209,9 +210,30 @@ def _resolve_against_game(plan: PlacementPlan, game: DiscoveredGame) -> list[dic
     return out
 
 
+def _case_note(wanted: str, rel, new_dirs) -> str | None:
+    """Why the resolved path is spelled differently from the mod's, if it is."""
+    wanted_parts = wanted.replace("\\", "/").split("/")
+    new = {str(d) for d in new_dirs}
+    reasons = set()
+    for i, (mine, actual) in enumerate(zip(wanted_parts, rel.parts)):
+        if mine != actual:
+            prefix = "/".join(rel.parts[: i + 1])
+            reasons.add("new folder spelled like the game's folders" if prefix in new else "case matched to existing folder")
+    return "; ".join(sorted(reasons)) or None
+
+
+_RULE_TEXT = {
+    Rule.FOMOD: "FOMOD installer",
+    Rule.DATA_FOLDER: "has a Data folder",
+    Rule.DATA_CONTENT: "plugins/archives/Data folders",
+    Rule.GAME_ROOT_CONTENT: "game-folder files",
+    Rule.UNKNOWN: "nothing recognised",
+    Rule.MANUAL: "your choice",
+}
+
 _TARGET_TEXT = {
     Target.DATA: "the Data folder",
-    Target.GAME_ROOT: "the game folder (next to the .exe)",
+    Target.GAME_ROOT: "the game folder, next to the .exe",
     Target.UNKNOWN: "unknown - you will need to choose",
 }
 
@@ -238,10 +260,12 @@ def format_plan(plan: PlacementPlan, game_id: str | None, game: DiscoveredGame |
     if game_id and game_id != guess.game_id:
         out.append(f"           checking against {GAMES[game_id].name} as requested")
 
-    out.append(f"Installs : into {_TARGET_TEXT[plan.target]} ({_conf(plan.confidence)} confidence, rule: {plan.rule.value})")
-    if plan.wrapper_dirs:
-        out.append(f"           wrapper folders skipped: {' / '.join(plan.wrapper_dirs)}")
-    if plan.root:
+    rule = _RULE_TEXT[plan.rule]
+    if plan.target is Target.UNKNOWN:
+        out.append(f"Installs : {_TARGET_TEXT[plan.target]} ({rule})")
+    else:
+        out.append(f"Installs : into {_TARGET_TEXT[plan.target]} - {_conf(plan.confidence)} confidence ({rule})")
+    if plan.root and plan.root != "/".join(plan.wrapper_dirs):
         out.append(f"           mod root inside archive: {plan.root}/")
     for reason in plan.reasons:
         out.append(f"           - {reason}")
@@ -267,7 +291,7 @@ def format_plan(plan: PlacementPlan, game_id: str | None, game: DiscoveredGame |
             for r in resolved:
                 note = "" if r["status"] == "new" else f"   [{r['status']}]"
                 if r["case_adjusted"]:
-                    note += "   [case matched to existing folder]"
+                    note += f"   [{r['case_adjusted']}]"
                 out.append(f"  {r['source']}  ->  {r['dest']}{note}")
         else:
             for m in plan.mappings:
@@ -302,13 +326,19 @@ def cmd_plugin_info(args) -> int:
             status = 1
             continue
         kind = "Oblivion-style" if h.header_size == 20 else f"form version {h.form_version}"
-        flags = [f for f, on in (("ESM", h.is_master_flag), ("light/ESL", h.is_light_flag)) if on]
+        votes = candidate_games(h, Path(name).name)
+        flags = ["ESM"] if h.is_master_flag else []
+        # 0x200 means "light" only in Fallout 4 and Skyrim SE; show other bits raw.
+        if h.is_light_flag and votes and votes[0].game_id in ("fallout4", "skyrimse"):
+            flags.append("light/ESL")
+        other = h.flags & ~0x1 & ~(0x200 if "light/ESL" in flags else 0)
+        if other:
+            flags.append(f"0x{other:x}")
         print(f"{name}:")
         print(f"  header  : HEDR {h.hedr_version}, {kind}" + (f", flags {', '.join(flags)}" if flags else ""))
         if h.author:
             print(f"  author  : {h.author}")
         print(f"  masters : {', '.join(h.masters) if h.masters else '(none)'}")
-        votes = candidate_games(h, Path(name).name)
         if votes:
             print(f"  game    : {GAMES[votes[0].game_id].name}  ({votes[0].reason})")
             for v in votes[1:]:
@@ -350,9 +380,9 @@ def cmd_override(args) -> int:
     else:
         o = settings.game_overrides.get(args.game) or GameOverride()
         if args.root is not None:
-            o.root = str(Path(args.root).expanduser()) if args.root else None
+            o.root = os.path.abspath(os.path.expanduser(args.root)) if args.root else None
         if args.prefix is not None:
-            o.prefix = str(Path(args.prefix).expanduser()) if args.prefix else None
+            o.prefix = os.path.abspath(os.path.expanduser(args.prefix)) if args.prefix else None
         if args.wine_user is not None:
             o.wine_user = args.wine_user or None
         if args.link_mode is not None:

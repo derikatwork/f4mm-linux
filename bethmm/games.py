@@ -139,7 +139,8 @@ GAMES: dict[str, GameDef] = {
             name="Skyrim Special Edition",
             exe_names=("SkyrimSE.exe",),
             main_master="Skyrim.esm",
-            official_masters=("Skyrim.esm",) + _SKYRIM_DLC,
+            # _ResourcePack.esl ships with Anniversary-era installs (GOG included).
+            official_masters=("Skyrim.esm",) + _SKYRIM_DLC + ("_ResourcePack.esl",),
             implicit_plugins=("Skyrim.esm",) + _SKYRIM_DLC,
             script_extender="SKSE",
             se_loader="skse64_loader.exe",

@@ -58,3 +58,11 @@ def test_app_dirs_follow_xdg(monkeypatch, tmp_path):
 def test_tests_never_use_real_home():
     assert "appdirs" in str(paths.config_dir())
     assert not str(paths.data_dir()).startswith(str(Path.home() / ".local"))
+
+
+def test_hand_edited_override_values_are_type_checked(tmp_path):
+    (tmp_path / "s.json").write_text(json.dumps({"game_overrides": {
+        "fallout4": {"ignore": "false", "root": 5, "prefix": "  ", "wine_user": "derik", "link_mode": "hardlink"},
+    }}))
+    o = load_settings(tmp_path / "s.json").game_overrides["fallout4"]
+    assert o == GameOverride(root=None, prefix=None, wine_user="derik", link_mode="hardlink", ignore=False)

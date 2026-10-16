@@ -11,8 +11,16 @@ time. Older uploads omit the timestamp. Examples::
         -> name "SkyUI 5 2 SE", mod_id 12604, version "5.2SE", timestamp None
     "Mod Name - Main File-1234-1-0a-1600000000 (1).7z"
         -> browser duplicate suffix " (1)" is ignored; version "1.0a"
+    "Project-22-Remix-1234-1-0.7z"
+        -> name "Project-22-Remix", mod_id 1234, version "1.0"
     "my_random_archive.zip"
         -> name "my random archive", everything else None
+
+A name only counts as a Nexus download when an all-digit mod ID follows a
+non-empty name and is itself followed by a version or a timestamp, so
+"Textures-2.zip" stays a plain name. Without a timestamp the version must
+contain a digit ("Patch-2-Final.zip" is a plain name, "Mod-1234-Final-<ts>"
+is not).
 """
 
 from __future__ import annotations
@@ -41,8 +49,13 @@ class NexusInfo:
 ARCHIVE_EXTS = (".7z", ".zip", ".rar")
 
 _DUPLICATE_SUFFIX = re.compile(r"\s*\(\d+\)$")
-_TIMESTAMP = re.compile(r"^\d{10}$")
+#: Mod IDs are well below a billion; longer digit runs are never IDs (and
+#: int() refuses runs over 4300 digits).
+_NUMBER = re.compile(r"^[0-9]{1,9}$")
+_TIMESTAMP = re.compile(r"^[0-9]{10}$")
 _VERSION_TOKEN = re.compile(r"^[0-9A-Za-z_.+]+$")
+#: Version tokens that start like a version number ("1", "0a", "2SE", "v1").
+_STRICT_VERSION_TOKEN = re.compile(r"^[vV]?[0-9]")
 
 
 def parse_nexus_filename(filename: str) -> NexusInfo:
@@ -51,7 +64,7 @@ def parse_nexus_filename(filename: str) -> NexusInfo:
     Never raises for ordinary strings: unrecognised names give a NexusInfo with
     only ``display_name`` and ``stem`` filled in.
     """
-    name = filename.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+    name = filename.strip().replace("\\", "/").rstrip("/").rsplit("/", 1)[-1].strip()
     lower = name.lower()
     for ext in ARCHIVE_EXTS:
         if lower.endswith(ext) and len(name) > len(ext):
@@ -65,7 +78,7 @@ def parse_nexus_filename(filename: str) -> NexusInfo:
         timestamp = int(tokens[-1])
         tokens = tokens[:-1]
 
-    mod_index = _find_mod_id(tokens)
+    mod_index = _find_mod_id(tokens, timestamp is not None)
     if mod_index is None:
         return NexusInfo(_display(stem), None, None, None, stem)
 
@@ -79,27 +92,37 @@ def parse_nexus_filename(filename: str) -> NexusInfo:
     )
 
 
-def _find_mod_id(tokens: list[str]) -> int | None:
+def _find_mod_id(tokens: list[str], has_timestamp: bool) -> int | None:
     """Index of the token holding the mod ID, or None.
 
-    The mod ID is an all-digit token after a non-empty name whose remaining
-    tokens look like a version. Multi-digit IDs are preferred so that a name
-    such as "Project-2-Remix" doesn't swallow the real ID.
+    The mod ID is an all-digit token after a non-empty name, followed by at
+    least one version-looking token (or nothing, when a timestamp was found).
+    Without a timestamp the version must contain a digit. Among the
+    candidates, multi-digit IDs win over single digits (versions are mostly
+    single digits, IDs almost never), then those whose version tokens all
+    start with a digit (or "v" + digit) over looser ones, then the leftmost:
+    "Project-22-Remix-1234-1-0" -> ID 1234, "Mod-1234-beta-2-<ts>" -> ID 1234,
+    version beta.2, and "Mod-1234-10-2" -> ID 1234, version 10.2.
     """
-    candidates = []
+    if not tokens or not tokens[0].strip():
+        return None
+    best: int | None = None
+    best_rank: tuple[bool, bool] | None = None
     for i in range(1, len(tokens)):
-        if not tokens[i].isdigit() or not "-".join(tokens[:i]).strip():
+        if not _NUMBER.match(tokens[i]):
             continue
         rest = tokens[i + 1:]
-        if rest and not all(_VERSION_TOKEN.match(t) for t in rest):
+        if not rest and not has_timestamp:
             continue
-        if rest and not any(ch.isdigit() for t in rest for ch in t):
+        if not all(_VERSION_TOKEN.match(t) for t in rest):
             continue
-        candidates.append(i)
-    if not candidates:
-        return None
-    multi = [i for i in candidates if len(tokens[i]) >= 2]
-    return (multi or candidates)[0]
+        if rest and not has_timestamp and not any(ch.isdigit() for t in rest for ch in t):
+            continue
+        strict = all(_STRICT_VERSION_TOKEN.match(t) for t in rest)
+        rank = (len(tokens[i]) < 2, not strict)
+        if best_rank is None or rank < best_rank:
+            best, best_rank = i, rank
+    return best
 
 
 def _display(name: str) -> str:

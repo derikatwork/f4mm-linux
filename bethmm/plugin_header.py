@@ -32,6 +32,7 @@ The header size is detected by looking for "HEDR" at offset 20 (Oblivion) or
 
 from __future__ import annotations
 
+import re
 import struct
 from dataclasses import dataclass
 from pathlib import Path
@@ -106,6 +107,8 @@ def parse_plugin_header(data: bytes) -> PluginHeader:
     elif data[24:28] == b"HEDR":
         header_size = 24
         (form_version,) = struct.unpack_from("<H", data, 20)
+    elif len(data) < 28:
+        raise PluginHeaderError("plugin header is truncated")
     else:
         raise PluginHeaderError("TES4 record has no HEDR subrecord")
 
@@ -156,7 +159,9 @@ def parse_plugin_header(data: bytes) -> PluginHeader:
             description = _zstring(payload) or None
 
     if hedr_version is None:
-        raise PluginHeaderError("plugin header is truncated before HEDR")
+        if truncated:
+            raise PluginHeaderError("plugin header is truncated before HEDR")
+        raise PluginHeaderError("TES4 record is empty")
     return PluginHeader(
         masters=tuple(masters),
         hedr_version=hedr_version,
@@ -209,8 +214,32 @@ WEIGHT_HEDR_EXACT = 4
 WEIGHT_HEDR_LOOSE = 2
 
 
+#: Creation Club file names (lowercased): "cc" + creator code + game tag + number,
+#: e.g. ccBGSFO4044-HellfirePowerArmor.esl, ccOTMFO4001-Remnants.esl,
+#: ccZSEF04001-BHouse.esm (sic), ccQDRSSE001-SurvivalMode.esl; Starfield's own
+#: Creations are SFBGS<id>.esm.
+_CC_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"cc[a-z]+f[o0]4\d"), "fallout4"),
+    (re.compile(r"cc[a-z]+sse\d"), "skyrimse"),
+    (re.compile(r"sfbgs"), "starfield"),
+)
+
+
 def _hedr_matches(version: float, candidates: tuple[float, ...]) -> bool:
     return any(abs(version - c) < 0.005 for c in candidates)
+
+
+def _master_games(master: str) -> tuple[tuple[str, ...], int]:
+    """Games that ship *master* and the weight of a vote from it; ((), 0) if none."""
+    key = master.lower()
+    games = OFFICIAL_MASTER_TO_GAMES.get(key, ())
+    if games:
+        is_main = any(GAMES[g].main_master.lower() == key for g in games)
+        return games, WEIGHT_MAIN_MASTER if is_main else WEIGHT_DLC_MASTER
+    for pattern, game_id in _CC_PATTERNS:
+        if pattern.match(key):
+            return (game_id,), WEIGHT_DLC_MASTER
+    return (), 0
 
 
 def candidate_games(header: PluginHeader, plugin_name: str = "plugin") -> list[GameVote]:
@@ -219,11 +248,15 @@ def candidate_games(header: PluginHeader, plugin_name: str = "plugin") -> list[G
     At most one vote per game (the strongest). Evidence, in order of strength:
 
     * a master that is an official game/DLC master (Fallout4.esm, Skyrim.esm,
-      FalloutNV.esm ...). Skyrim.esm is shared by Skyrim LE and SE, so the
-      record form version splits them (44 = SE, 40-43 = LE). A plugin with
-      FalloutNV.esm as a master is New Vegas even if it also lists
+      FalloutNV.esm ...). Skyrim.esm is shared by Skyrim LE and SE: another
+      master only one of them ships (an SE Creation Club file) decides, then
+      being a light plugin (flag 0x200 or a *plugin_name* ending in .esl;
+      only SE loads those), otherwise the record form version splits them
+      (44 = SE, 40-43 = LE). A
+      plugin with FalloutNV.esm as a master is New Vegas even if it also lists
       Fallout3.esm (Tale of Two Wastelands).
-    * Creation Club masters by naming convention (ccBGSFO4*, cc*SSE*, SFBGS*).
+    * Creation Club masters by naming convention (cc<creator>FO4<n>*,
+      cc<creator>SSE<n>*, SFBGS*).
     * a 20-byte record header -> Oblivion.
     * the HEDR version, narrowed by form version where the game's form
       versions are known (only when no master identified a game).
@@ -236,27 +269,22 @@ def candidate_games(header: PluginHeader, plugin_name: str = "plugin") -> list[G
             votes[game_id] = GameVote(game_id, weight, reason)
 
     form = header.form_version
-    for master in header.masters:
-        key = master.lower()
-        games = OFFICIAL_MASTER_TO_GAMES.get(key, ())
-        if not games:
-            if key.startswith("ccbgsfo4"):
-                games = ("fallout4",)
-            elif key.startswith("cc") and "sse" in key:
-                games = ("skyrimse",)
-            elif key.startswith("sfbgs"):
-                games = ("starfield",)
-            else:
-                continue
-            weight = WEIGHT_DLC_MASTER
-        else:
-            weight = WEIGHT_MAIN_MASTER if any(GAMES[g].main_master.lower() == key for g in games) else WEIGHT_DLC_MASTER
-        if len(games) > 1 and form is not None:
-            narrowed = tuple(g for g in games if form in GAMES[g].form_versions)
-            if narrowed:
-                games = narrowed
+    light = header.is_light_flag or plugin_name.lower().endswith(".esl")
+    resolved = [(master, *_master_games(master)) for master in header.masters]
+    resolved = [(master, games, weight) for master, games, weight in resolved if games]
+    pinned = {games[0] for _, games, _ in resolved if len(games) == 1}
+    for master, games, weight in resolved:
+        detail = ""
+        if len(games) > 1:
+            narrowed = tuple(g for g in games if g in pinned)
+            if not narrowed and light:
+                narrowed = tuple(g for g in games if GAMES[g].supports_esl)
+                detail = " (light plugin)" if narrowed else ""
+            if not narrowed and form is not None:
+                narrowed = tuple(g for g in games if form in GAMES[g].form_versions)
+                detail = f" (form version {form})"
+            games = narrowed or games
         for game_id in games:
-            detail = f" (form version {form})" if len(OFFICIAL_MASTER_TO_GAMES.get(key, ())) > 1 and form is not None else ""
             vote(game_id, weight, f"{plugin_name} requires {master}{detail}")
 
     if "falloutnv" in votes and "fallout3" in votes:

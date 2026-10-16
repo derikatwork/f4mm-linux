@@ -91,28 +91,48 @@ def _fold(name: str) -> str:
     return "".join(_fold_char(c) for c in name)
 
 
+def _fold_key(key: Iterable[str]) -> _Key:
+    return tuple(_fold(p) for p in key)
+
+
 def _is_cased(c: str) -> bool:
     return c.isupper() or c.islower()
 
 
+class _Tally:
+    """Running classification of directory names (see :func:`infer_dir_convention`)."""
+
+    __slots__ = ("seen", "lower", "capitalized")
+
+    def __init__(self) -> None:
+        self.seen = False  # some name has a cased letter
+        self.lower = True  # ...and every such name is all-lowercase
+        self.capitalized = True  # ...and every such name's first cased letter is uppercase
+
+    def add(self, name: str) -> None:
+        first = next((c for c in name if _is_cased(c)), None)
+        if first is not None:
+            self.seen = True
+            self.lower = self.lower and name == name.lower()
+            self.capitalized = self.capitalized and first.isupper()
+
+
+def _convention(*tallies: _Tally) -> Convention:
+    if not any(t.seen for t in tallies):
+        return "none"
+    if all(t.lower for t in tallies):
+        return "lower"
+    return "capitalized" if all(t.capitalized for t in tallies) else "none"
+
+
 def infer_dir_convention(existing_dir_names: Iterable[str]) -> Convention:
     """Classify sibling directory names as "lower", "capitalized" or "none"."""
-    lower = capitalized = True
-    seen = False
+    tally = _Tally()
     for name in existing_dir_names:
-        first = next((c for c in name if _is_cased(c)), None)
-        if first is None:
-            continue
-        seen = True
-        if name != name.lower():
-            lower = False
-        if not first.isupper():
-            capitalized = False
-        if not lower and not capitalized:
+        tally.add(name)
+        if not tally.lower and not tally.capitalized:
             return "none"
-    if not seen:
-        return "none"
-    return "lower" if lower else "capitalized"
+    return _convention(tally)
 
 
 def apply_convention(name: str, convention: Convention) -> str:
@@ -154,18 +174,28 @@ def _split(rel: str | os.PathLike[str], *, allow_empty: bool = False) -> _Key:
 
 
 class _Listing:
-    """Entries of one directory: exact name -> is_dir, plus a folded-name index."""
+    """Entries of one directory: exact name -> is_dir, a folded-name index and
+    a running tally of the sub-directory naming convention."""
 
-    __slots__ = ("entries", "index")
+    __slots__ = ("entries", "index", "dirs")
 
     def __init__(self) -> None:
         self.entries: dict[str, bool] = {}
         self.index: dict[str, list[str]] = {}
+        self.dirs = _Tally()
 
     def add(self, name: str, is_dir: bool) -> None:
-        if name not in self.entries:
+        was_dir = self.entries.get(name)
+        if was_dir is None:
             self.index.setdefault(_fold(name), []).append(name)
         self.entries[name] = is_dir
+        if is_dir and not was_dir:
+            self.dirs.add(name)
+        elif was_dir and not is_dir:
+            # A directory became a file (plan vs. a rescanned tree): recount.
+            self.dirs = _Tally()
+            for other in self.dir_names():
+                self.dirs.add(other)
 
     def matches(self, folded: str) -> list[str]:
         return self.index.get(folded, [])
@@ -191,6 +221,8 @@ class CaseResolver:
         game root). It may not exist yet, in which case everything is new."""
         self.base = Path(base)
         self._listings: dict[_Key, _Listing] = {}
+        # Every folded prefix of every cached key -> the cached keys below it.
+        self._cached_under: dict[_Key, set[_Key]] = {}
         self._planned: dict[_Key, _Listing] = {}
 
     def resolve(self, rel: str | PurePosixPath, *, is_dir: bool = False, plan: bool = False) -> ResolvedPath:
@@ -244,8 +276,7 @@ class CaseResolver:
                 continue
 
             if want_dir:
-                siblings = list(disk.dir_names()) + list(planned.dir_names())
-                resolved.append(apply_convention(comp, infer_dir_convention(siblings)))
+                resolved.append(apply_convention(comp, _convention(disk.dirs, planned.dirs)))
                 new_dirs.append(PurePosixPath(*resolved))
             else:
                 resolved.append(comp)
@@ -271,16 +302,26 @@ class CaseResolver:
         """Forget cached listings (all, or just *rel_dir*'s). Planned entries are kept.
 
         *rel_dir* is matched case-insensitively, and listings cached below it
-        are forgotten too since they may be stale as well.
+        are forgotten too since they may be stale as well. Whether *rel_dir*
+        itself exists is part of its parent's listing: after creating or
+        removing a folder, invalidate the folder's parent.
         """
         if rel_dir is None:
             self._listings.clear()
+            self._cached_under.clear()
             return
-        prefix = tuple(_fold(p) for p in _split(rel_dir, allow_empty=True))
+        prefix = _fold_key(_split(rel_dir, allow_empty=True))
         n = len(prefix)
-        for key in list(self._listings):
-            if len(key) >= n and tuple(_fold(p) for p in key[:n]) == prefix:
-                del self._listings[key]
+        for key in self._cached_under.pop(prefix, ()):
+            del self._listings[key]
+            folded = _fold_key(key)
+            for i in range(n):
+                under = self._cached_under[folded[:i]]
+                under.discard(key)
+                if not under:
+                    del self._cached_under[folded[:i]]
+            for i in range(n + 1, len(folded) + 1):
+                self._cached_under.pop(folded[:i], None)
 
     def clear_plan(self) -> None:
         """Forget every planned entry."""
@@ -298,6 +339,9 @@ class CaseResolver:
                 # Missing, not a directory, or unreadable: nothing to match.
                 pass
             self._listings[key] = listing
+            folded = _fold_key(key)
+            for i in range(len(folded) + 1):
+                self._cached_under.setdefault(folded[:i], set()).add(key)
         return listing
 
 

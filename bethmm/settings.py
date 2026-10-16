@@ -26,10 +26,16 @@ class GameOverride:
 
     @classmethod
     def from_dict(cls, data: dict) -> "GameOverride":
-        known = {k: data[k] for k in ("root", "prefix", "wine_user", "link_mode", "ignore") if k in data}
-        override = cls(**known)
-        if override.link_mode not in LINK_MODES:
-            override.link_mode = "symlink"
+        """Tolerant of hand-edited files: wrongly typed values are ignored."""
+        override = cls()
+        for key in ("root", "prefix", "wine_user"):
+            value = data.get(key)
+            if isinstance(value, str) and value.strip():
+                setattr(override, key, value)
+        if data.get("link_mode") in LINK_MODES:
+            override.link_mode = data["link_mode"]
+        if isinstance(data.get("ignore"), bool):
+            override.ignore = data["ignore"]
         return override
 
 
