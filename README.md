@@ -14,11 +14,12 @@ The project is built in phases:
 | Phase | What | State |
 |---|---|---|
 | 1 | Game discovery, placement rules, tests, read-only CLI | **done** |
-| 2 | Staging, deploy/undeploy with symlinks, manifest, CLI | next |
-| 3 | Desktop GUI (PySide6) | |
+| 2 | Staging, deploy/undeploy with symlinks, manifest, CLI | **done** |
+| 3 | Desktop GUI (PySide6) | next |
 | 4 | FOMOD installer, plugins.txt management | |
 
-**Phase 1 never changes your game folders.** Every command in this phase only reads.
+Until phase 4, plugins (`.esp/.esm/.esl`) are linked into `Data` but **not** added to
+`plugins.txt` — enable them in the game's launcher or edit `plugins.txt` by hand.
 
 ## Install (Ubuntu and Ubuntu-based: Mint, Pop!_OS, Zorin, ...)
 
@@ -63,7 +64,86 @@ ln -s ~/.local/share/beth-mod-manager/venv/bin/bethmm ~/.local/bin/bethmm
 ```
 </details>
 
-## Using phase 1
+## Managing mods
+
+```bash
+bethmm use fallout4                                   # pick the game once (or add --game to each command)
+bethmm install ~/Downloads/"Some Mod-1234-1-2-1700000000.7z"
+bethmm list                                           # lower in the list = wins conflicts
+bethmm disable "Some Mod"        # or its number from 'list', or part of its name
+bethmm enable 3
+bethmm move "Some Mod" --down    # --up, --top, --bottom, --to N
+bethmm conflicts --files
+bethmm uninstall "Some Mod"
+```
+
+What `install` does:
+
+1. extracts the archive into a temporary folder and works out the game and where
+   each file goes (same rules as `analyze`; `--root`/`--target` to choose yourself);
+2. shows the plan and asks you to confirm (`--yes` to skip, `--dry-run` to only look);
+3. moves the files to `~/.local/share/beth-mod-manager/mods/<game>/<mod>/` and adds
+   the mod at the bottom of the list (so it wins conflicts);
+4. links every file into the game folder: one **symlink per file**, so several mods
+   can share a folder. Folder names are matched case-insensitively (a mod's
+   `Textures/` goes into your existing `textures/`), and new folders follow the
+   game's naming style.
+
+If a mod replaces an original game file, the original is moved to
+`~/.local/share/beth-mod-manager/backups/<game>/` first and moved back when no
+enabled mod provides that file any more. Installing a newer version of a mod you
+already have (same Nexus mod ID or name) updates it in place, keeping its position
+(`--new` installs it separately instead).
+
+**The app never deletes or edits a file it didn't create.** If you (or a tool such as
+xEdit or BethINI) replace one of its links with a real file, that file is left alone
+and reported.
+
+### Back to vanilla, checking and repairing
+
+```bash
+bethmm purge              # remove every link, restore every original, remove the folders it made
+bethmm purge --all        # every game
+bethmm deploy             # put the enabled mods back (also re-creates links that went missing)
+bethmm verify             # compare the game folder with what the app recorded
+bethmm verify --repair    # fix what is safe to fix (stray links, interrupted runs), then redeploy
+bethmm status             # per game: mods, links, backups
+bethmm history            # the latest file operations
+```
+
+`purge` keeps your mods installed; after a purge nothing is linked until you run
+`bethmm deploy` again. Every operation is recorded in
+`~/.local/share/beth-mod-manager/manifest.db` *before* it happens, so even if the app
+is killed halfway, `verify --repair` can clean up.
+
+### Dry run
+
+Add `--dry-run` to `install`, `enable`, `disable`, `move`, `uninstall`, `deploy`,
+`purge` or `verify --repair` to see exactly which files would be linked, backed up or
+restored without changing anything. `bethmm config --dry-run on` makes that the
+default for everything until you switch it off.
+
+### Does the game see the links?
+
+```bash
+bethmm check-links fallout4
+```
+
+puts a test file into the game's Data folder through a symlink and asks Wine
+(the runner Lutris uses for that game) to read it, then removes it. Wine follows
+symlinks normally. If the check fails — most likely with the **Flatpak** version of
+Lutris, whose sandbox may not see `~/.local/share` — switch that game to hardlinks:
+
+```bash
+bethmm override fallout4 --link-mode hardlink
+bethmm deploy
+```
+
+Hardlinks are real directory entries inside the game folder, so sandboxes see them,
+but they only work when the game and `~/.local/share` are on the same disk; the app
+checks this and tells you if they aren't.
+
+## Using phase 1 commands
 
 ### Find your games
 
@@ -147,8 +227,9 @@ Prints the plugin's masters, header version and the game it was made for.
 | Settings | `~/.config/beth-mod-manager/settings.json` |
 | Game discovery cache | `~/.local/share/beth-mod-manager/games.json` |
 | Log of every file operation (settings/cache writes, extractions, temp folders) | `~/.local/share/beth-mod-manager/logs/bethmm.log` |
-| Staged mods (phase 2) | `~/.local/share/beth-mod-manager/mods/<game>/<mod>/` |
-| Backups of replaced vanilla files (phase 2) | `~/.local/share/beth-mod-manager/backups/<game>/` |
+| Installed mods (staged files) | `~/.local/share/beth-mod-manager/mods/<game>/<mod>/` |
+| Originals of game files replaced by mods | `~/.local/share/beth-mod-manager/backups/<game>/` |
+| Manifest (mod list, every link/backup/folder the app made, history) | `~/.local/share/beth-mod-manager/manifest.db` |
 
 ## Running the tests
 

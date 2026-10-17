@@ -52,6 +52,8 @@ class Settings:
     sevenzip: str | None = None
     #: Show what would happen without touching game folders.
     dry_run: bool = False
+    #: Game that mod commands act on when no --game is given.
+    current_game: str | None = None
     game_overrides: dict[str, GameOverride] = field(default_factory=dict)
 
     def games_dir_path(self) -> Path:
@@ -74,7 +76,12 @@ class Settings:
             settings.scan_depth = data["scan_depth"]
         if isinstance(data.get("sevenzip"), str) or data.get("sevenzip") is None:
             settings.sevenzip = data.get("sevenzip")
-        settings.dry_run = bool(data.get("dry_run", False))
+        settings.dry_run = data.get("dry_run") is True
+        current = data.get("current_game")
+        if isinstance(current, str):
+            from bethmm.games import GAMES
+
+            settings.current_game = current if current in GAMES else None
         overrides = data.get("game_overrides") or {}
         if isinstance(overrides, dict):
             settings.game_overrides = {
