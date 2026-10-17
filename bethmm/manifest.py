@@ -10,6 +10,9 @@ did to each game folder.
 * ``backups``: every original game file the app moved aside to make room for
   a link, and where it was moved;
 * ``created_dirs``: every folder the app created in a game folder;
+* ``left_alone``: paths where the user (or a game update) replaced one of the
+  app's links with a file of their own; the app leaves that file alone until
+  it is gone;
 * ``games``: per game, the root the deployment belongs to and whether mods are
   currently deployed (``purge`` clears it);
 * ``journal``: an append-only history of every file operation.
@@ -38,7 +41,8 @@ from typing import Iterator, Sequence
 from bethmm import paths
 from bethmm.pathresolve import fold_path
 
-SCHEMA_VERSION = 1
+#: 2 added ``left_alone`` and ``deployed.size`` / ``deployed.mtime_ns``.
+SCHEMA_VERSION = 2
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -78,6 +82,8 @@ CREATE TABLE IF NOT EXISTS deployed (
     link_type TEXT NOT NULL,
     inode INTEGER,
     dev INTEGER,
+    size INTEGER,
+    mtime_ns INTEGER,
     PRIMARY KEY (game_id, path_key)
 );
 CREATE TABLE IF NOT EXISTS backups (
@@ -89,6 +95,12 @@ CREATE TABLE IF NOT EXISTS backups (
     PRIMARY KEY (game_id, path_key)
 );
 CREATE TABLE IF NOT EXISTS created_dirs (
+    game_id TEXT NOT NULL,
+    path TEXT NOT NULL,
+    path_key TEXT NOT NULL,
+    PRIMARY KEY (game_id, path_key)
+);
+CREATE TABLE IF NOT EXISTS left_alone (
     game_id TEXT NOT NULL,
     path TEXT NOT NULL,
     path_key TEXT NOT NULL,
@@ -160,6 +172,10 @@ class DeployedFile:
     link_type: str
     inode: int | None = None
     dev: int | None = None
+    #: Hardlinks: size and mtime when linked, so a new file that happens to
+    #: reuse the inode number is not mistaken for the link.
+    size: int | None = None
+    mtime_ns: int | None = None
 
 
 @dataclass(frozen=True)
@@ -199,6 +215,7 @@ class Manifest:
         self.path = Path(path) if path is not None else paths.manifest_path()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock_fd: int | None = None
+        self._db: sqlite3.Connection | None = None
         if lock:
             self._acquire_lock()
         try:
@@ -206,8 +223,12 @@ class Manifest:
             self._db.row_factory = sqlite3.Row
             self._db.execute("PRAGMA foreign_keys = ON")
             self._migrate()
-        except BaseException:
+        except BaseException as exc:
+            if self._db is not None:
+                self._db.close()
             self._release_lock()
+            if isinstance(exc, sqlite3.DatabaseError):
+                raise ManifestError(f"{self.path} is not a readable manifest: {exc}") from exc
             raise
 
     # ------------------------------------------------------------ lifecycle
@@ -232,7 +253,8 @@ class Manifest:
 
     def close(self) -> None:
         try:
-            self._db.close()
+            if self._db is not None:
+                self._db.close()
         finally:
             self._release_lock()
 
@@ -243,14 +265,28 @@ class Manifest:
         self.close()
 
     def _migrate(self) -> None:
-        self._db.executescript(_SCHEMA)
-        row = self._db.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
-        if row is None:
-            self._db.execute("INSERT INTO meta (key, value) VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),))
-        elif int(row["value"]) > SCHEMA_VERSION:
-            raise ManifestError(
-                f"{self.path} was written by a newer version of the app (schema {row['value']}); update the app"
-            )
+        # Check the version before creating anything, so a newer manifest is left untouched.
+        if self._db.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta'").fetchone():
+            row = self._db.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
+            try:
+                version = int(row["value"]) if row is not None else None
+            except ValueError:
+                raise ManifestError(f"{self.path} has an unreadable schema version {row['value']!r}") from None
+            if version is not None and version > SCHEMA_VERSION:
+                raise ManifestError(
+                    f"{self.path} was written by a newer version of the app (schema {version}); update the app"
+                )
+        self._db.executescript(_SCHEMA)  # creates whatever an older schema lacks
+        columns = {r["name"] for r in self._db.execute("PRAGMA table_info(deployed)")}
+        for column in ("size", "mtime_ns"):
+            if column not in columns:
+                try:
+                    self._db.execute(f"ALTER TABLE deployed ADD COLUMN {column} INTEGER")
+                except sqlite3.OperationalError as exc:
+                    if "duplicate column" not in str(exc):  # another process upgraded it just now
+                        raise
+        self._db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?)",
+                         (str(SCHEMA_VERSION),))
 
     @contextmanager
     def transaction(self) -> Iterator[None]:
@@ -324,7 +360,8 @@ class Manifest:
         enabled: bool = True,
     ) -> ModRecord:
         """Add a mod at the bottom of the list (highest priority)."""
-        with self.transaction():
+        rows = self._file_rows(files)
+        with self.transaction(), self._folder_taken(game_id, folder):
             top = self._db.execute(
                 "SELECT COALESCE(MAX(priority), 0) AS p FROM mods WHERE game_id = ?", (game_id,)
             ).fetchone()["p"]
@@ -335,15 +372,37 @@ class Manifest:
                  json.dumps(plan or {}, sort_keys=True)),
             )
             mod_id = cur.lastrowid
-            self._insert_files(mod_id, files)
+            self._insert_files(mod_id, rows)
         return self.mod(mod_id)
 
-    def _insert_files(self, mod_id: int, files: Sequence[ModFile]) -> None:
-        rows: dict[str, tuple] = {}
+    @contextmanager
+    def _folder_taken(self, game_id: str, folder: str | None) -> Iterator[None]:
+        try:
+            yield
+        except sqlite3.IntegrityError as exc:
+            raise ManifestError(f"another mod of {game_id} already uses the staging folder {folder!r}") from exc
+
+    @staticmethod
+    def _file_rows(files: Sequence[ModFile]) -> dict[str, tuple[str, str]]:
+        """Validated files keyed by folded destination; a later duplicate (by
+        case) replaces the earlier, so each mod has one file per destination."""
+        rows: dict[str, tuple[str, str]] = {}
         for f in files:
-            # One destination per mod; a later duplicate (by case) replaces the earlier.
-            rows[fold_path(f.dest)] = (mod_id, f.source, f.dest, fold_path(f.dest))
-        self._db.executemany("INSERT INTO mod_files (mod_id, source, dest, dest_key) VALUES (?, ?, ?, ?)", rows.values())
+            source = f.source.replace("\\", "/")
+            if not source.strip("/") or source.startswith("/") or ".." in source.split("/"):
+                raise ManifestError(f"invalid staged file path {f.source!r}")
+            try:
+                key = fold_path(f.dest)
+            except ValueError as exc:
+                raise ManifestError(f"invalid destination {f.dest!r}: {exc}") from None
+            rows[key] = (f.source, f.dest)
+        return rows
+
+    def _insert_files(self, mod_id: int, rows: dict[str, tuple[str, str]]) -> None:
+        self._db.executemany(
+            "INSERT INTO mod_files (mod_id, source, dest, dest_key) VALUES (?, ?, ?, ?)",
+            [(mod_id, source, dest, key) for key, (source, dest) in rows.items()],
+        )
 
     def update_mod(
         self,
@@ -358,7 +417,9 @@ class Manifest:
         plan: dict | None = None,
     ) -> ModRecord:
         """Replace a mod's files and/or details, keeping its place in the list."""
-        with self.transaction():
+        rows = self._file_rows(files) if files is not None else None
+        game_id = self.mod(mod_id).game_id
+        with self.transaction(), self._folder_taken(game_id, folder):
             sets, values = [], []
             for column, value in (("folder", folder), ("name", name), ("version", version),
                                   ("nexus_id", nexus_id), ("source_archive", source_archive)):
@@ -370,9 +431,9 @@ class Manifest:
                 values.append(json.dumps(plan, sort_keys=True))
             if sets:
                 self._db.execute(f"UPDATE mods SET {', '.join(sets)} WHERE id = ?", (*values, mod_id))
-            if files is not None:
+            if rows is not None:
                 self._db.execute("DELETE FROM mod_files WHERE mod_id = ?", (mod_id,))
-                self._insert_files(mod_id, files)
+                self._insert_files(mod_id, rows)
         return self.mod(mod_id)
 
     def mod(self, mod_id: int) -> ModRecord:
@@ -391,9 +452,11 @@ class Manifest:
         name (any case), or a unique part of its name."""
         mods = self.mods(game_id)
         q = query.strip()
-        if q.startswith("#") and q[1:].isdigit():
+        if not q:
+            raise ManifestError("no mod given")
+        if q.startswith("#") and q[1:].isdecimal():
             match = [m for m in mods if m.id == int(q[1:])]
-        elif q.isdigit():
+        elif q.isdecimal():
             index = int(q)
             match = [mods[index - 1]] if 1 <= index <= len(mods) else []
         else:
@@ -417,6 +480,7 @@ class Manifest:
 
     def set_order(self, game_id: str, ordered_ids: Sequence[int]) -> None:
         """Renumber priorities: *ordered_ids* lists every mod of the game, lowest priority first."""
+        ordered_ids = list(ordered_ids)
         current = {m.id for m in self.mods(game_id)}
         if set(ordered_ids) != current or len(ordered_ids) != len(current):
             raise ManifestError("the new order must list every installed mod of the game exactly once")
@@ -436,16 +500,16 @@ class Manifest:
         rows = self._db.execute("SELECT * FROM deployed WHERE game_id = ?", (game_id,))
         return {
             r["path_key"]: DeployedFile(r["game_id"], r["path"], r["mod_id"], r["source"], r["link_type"],
-                                        r["inode"], r["dev"])
+                                        r["inode"], r["dev"], r["size"], r["mtime_ns"])
             for r in rows
         }
 
     def record_link(self, link: DeployedFile) -> None:
         self._db.execute(
-            "INSERT OR REPLACE INTO deployed (game_id, path, path_key, mod_id, source, link_type, inode, dev) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO deployed (game_id, path, path_key, mod_id, source, link_type, inode, dev, "
+            "size, mtime_ns) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (link.game_id, link.path, fold_path(link.path), link.mod_id, link.source, link.link_type,
-             link.inode, link.dev),
+             link.inode, link.dev, link.size, link.mtime_ns),
         )
 
     def forget_link(self, game_id: str, path: str) -> None:
@@ -471,16 +535,32 @@ class Manifest:
 
     def record_dir(self, game_id: str, path: str) -> None:
         self._db.execute(
-            "INSERT OR IGNORE INTO created_dirs (game_id, path, path_key) VALUES (?, ?, ?)",
+            "INSERT INTO created_dirs (game_id, path, path_key) VALUES (?, ?, ?) "
+            "ON CONFLICT (game_id, path_key) DO UPDATE SET path = excluded.path",
             (game_id, path, fold_path(path)),
         )
 
     def forget_dir(self, game_id: str, path: str) -> None:
         self._db.execute("DELETE FROM created_dirs WHERE game_id = ? AND path_key = ?", (game_id, fold_path(path)))
 
+    def left_alone(self, game_id: str) -> dict[str, str]:
+        """Paths holding a file of the user's where the app's link was, folded key -> path."""
+        rows = self._db.execute("SELECT path, path_key FROM left_alone WHERE game_id = ?", (game_id,))
+        return {r["path_key"]: r["path"] for r in rows}
+
+    def record_left_alone(self, game_id: str, path: str) -> None:
+        self._db.execute(
+            "INSERT INTO left_alone (game_id, path, path_key) VALUES (?, ?, ?) "
+            "ON CONFLICT (game_id, path_key) DO UPDATE SET path = excluded.path",
+            (game_id, path, fold_path(path)),
+        )
+
+    def forget_left_alone(self, game_id: str, path: str) -> None:
+        self._db.execute("DELETE FROM left_alone WHERE game_id = ? AND path_key = ?", (game_id, fold_path(path)))
+
     def has_footprint(self, game_id: str | None = None) -> bool:
         """Whether the app has anything (links, backups, folders) in a game folder."""
-        where, args = ("WHERE game_id = ?", (game_id,)) if game_id else ("", ())
+        where, args = ("WHERE game_id = ?", (game_id,)) if game_id is not None else ("", ())
         for table in ("deployed", "backups", "created_dirs"):
             if self._db.execute(f"SELECT 1 FROM {table} {where} LIMIT 1", args).fetchone():
                 return True
@@ -518,6 +598,6 @@ class Manifest:
 
     def history(self, game_id: str | None = None, limit: int = 50) -> list[JournalEntry]:
         """Most recent journal entries, oldest first."""
-        where, args = ("WHERE game_id = ?", (game_id,)) if game_id else ("", ())
+        where, args = ("WHERE game_id = ?", (game_id,)) if game_id is not None else ("", ())
         rows = self._db.execute(f"SELECT * FROM journal {where} ORDER BY id DESC LIMIT ?", (*args, limit)).fetchall()
         return [self._entry(r) for r in reversed(rows)]

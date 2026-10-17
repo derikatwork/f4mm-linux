@@ -35,17 +35,42 @@ folder case-insensitively (" (2)", " (3)" ... appended).
 
 Only ``discard`` and ``remove_staging`` delete anything, and only inside the
 app's own tmp and mods folders (checked with realpath; anything else raises
-``StagingError``). Every file operation is logged.
+``StagingError``). The one exception is ``commit``'s move across filesystems,
+which removes the extracted files once copied, or its own unfinished copy.
+Every file operation is logged.
 """
 
 from __future__ import annotations
 
+import errno
+import logging
+import os
+import re
+import shutil
+import stat
+import tempfile
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Sequence
 
-from bethmm.manifest import Manifest, ModRecord
+from bethmm import archive, paths, placement
+from bethmm.manifest import Manifest, ManifestError, ModFile, ModRecord
+from bethmm.pathresolve import fold_path
 from bethmm.placement import PlacementPlan, Target
+
+log = logging.getLogger(__name__)
+
+MAX_FOLDER_CHARS = 100
+#: ext4 and most Linux filesystems allow 255 bytes per name; leave room for " (NNN)".
+MAX_FOLDER_BYTES = 200
+#: Used when nothing usable is left of a mod name.
+FALLBACK_NAME = "mod"
+
+#: Extensions stripped from an archive's file name for the suggested mod name.
+_ARCHIVE_SUFFIXES = (".tar.gz", ".tar.bz2", ".tar.xz", ".tgz", ".7z", ".zip", ".rar", ".tar", ".gz", ".bz2", ".xz")
+_DUPLICATE_SUFFIX = re.compile(r"\s*\(\d+\)$")
+_WORKDIR_PREFIX = "install-"
 
 
 class StagingError(Exception):
@@ -75,6 +100,9 @@ class CommitResult:
     replaced: bool = False
 
 
+# ---------------------------------------------------------------- prepare
+
+
 def prepare(
     source: str | Path,
     *,
@@ -89,26 +117,183 @@ def prepare(
     ``SevenZipMissing`` for archive problems and ``ValueError`` from
     ``plan_for_roots`` for an invalid root/target choice. The temp folder is
     removed again if anything fails.
+
+    A *target* without *roots* applies to the root the placement rules found
+    (after stepping into wrapper folders).
     """
-    raise NotImplementedError
+    source = Path(source).expanduser().absolute()
+    if not source.exists():
+        raise StagingError(f"{source} does not exist")
+    is_folder = source.is_dir()
+    if not is_folder and not source.is_file():
+        raise StagingError(f"{source} is neither a file nor a folder")
+
+    tmp = paths.tmp_dir()
+    _mkdir(tmp)
+    if is_folder and _inside_or_same(os.path.realpath(tmp), os.path.realpath(source)):
+        raise StagingError(f"can't install {source}: it contains the app's own data folder")
+    workdir = Path(tempfile.mkdtemp(prefix=_WORKDIR_PREFIX, dir=tmp))
+    log.info("MKDIR %s", workdir)
+    files_dir = workdir / "x"
+    try:
+        warnings: list[str] = []
+        if is_folder:
+            warnings += _copy_folder(source, files_dir)
+            # Like an archive's: "Data\x.esp" becomes Data/x.esp, as the placement rules read it.
+            archive._split_backslash_names(files_dir, warnings)
+        else:
+            warnings += archive.extract_archive(source, files_dir, sevenzip).warnings
+        files, reader, scan_warnings = placement.scan_directory(files_dir)
+        warnings += scan_warnings
+        options = dict(header_reader=reader, installed_games=installed_games, archive_name=source.name)
+        if roots is None and target is None:
+            plan = placement.analyze_files(files, **options)
+        else:
+            if roots is None:
+                roots = [placement.analyze_files(files).root]
+            plan = placement.plan_for_roots(files, roots, target, **options)
+    except BaseException:
+        try:
+            _remove_tree(workdir, paths.tmp_dir(), 1, "the app's temporary folder")
+        except (OSError, StagingError) as exc:
+            log.error("could not remove the temporary folder %s: %s", workdir, exc)
+        raise
+    return Prepared(source, workdir, files_dir, sorted(files), plan, warnings)
+
+
+def _copy_folder(source: Path, dest: Path) -> list[str]:
+    """Copy the folders and regular files below *source* into *dest* without
+    following symlinks; symlinks and special files are skipped with a warning."""
+    log.info("COPY %s -> %s", source, dest)
+    warnings: list[str] = []
+    count = 0
+    dest.mkdir()
+    pending = [(source, dest, "")]
+    try:
+        while pending:
+            src_dir, dst_dir, prefix = pending.pop()
+            with os.scandir(src_dir) as it:
+                entries = sorted(it, key=lambda e: e.name)
+            for entry in entries:
+                rel = prefix + entry.name
+                mode = entry.stat(follow_symlinks=False).st_mode
+                if stat.S_ISLNK(mode):
+                    warnings.append(f"skipped symlink {rel} in the mod folder")
+                    log.warning("skipped symlink %s in %s", rel, source)
+                elif stat.S_ISDIR(mode):
+                    target = dst_dir / entry.name
+                    target.mkdir()
+                    pending.append((Path(entry.path), target, rel + "/"))
+                elif stat.S_ISREG(mode):
+                    shutil.copy2(entry.path, dst_dir / entry.name, follow_symlinks=False)
+                    count += 1
+                else:
+                    warnings.append(f"skipped special file {rel} in the mod folder")
+                    log.warning("skipped special file %s in %s", rel, source)
+    except OSError as exc:
+        where = exc.filename or source
+        raise StagingError(f"could not copy {where}: {exc.strerror or exc}") from exc
+    log.info("COPIED %d files from %s", count, source)
+    return warnings
+
+
+# ---------------------------------------------------------------- names
 
 
 def suggested_name(prepared: Prepared) -> str:
     """Display name for the mod: the Nexus name from the archive file name,
     else the archive/folder name without extension."""
-    raise NotImplementedError
+    nexus = prepared.plan.nexus
+    if nexus is not None and nexus.is_nexus and nexus.display_name.strip():
+        return _clean_text(nexus.display_name) or FALLBACK_NAME
+    name = prepared.source.name.strip()
+    low = name.lower()
+    for ext in _ARCHIVE_SUFFIXES:
+        if low.endswith(ext) and len(name) > len(ext):
+            name = _DUPLICATE_SUFFIX.sub("", name[: -len(ext)])
+            break
+    return _clean_text(name) or FALLBACK_NAME
+
+
+def _clean_text(text: str) -> str:
+    """*text* safe to store and print: control characters become spaces,
+    undecodable bytes (lone surrogates) U+FFFD, whitespace collapsed."""
+    out = []
+    for c in text:
+        if 0xD800 <= ord(c) <= 0xDFFF:
+            out.append("\ufffd")
+        elif unicodedata.category(c) == "Cc":
+            out.append(" ")
+        else:
+            out.append(c)
+    return " ".join("".join(out).split())
+
+
+def _truncate(name: str, max_chars: int, max_bytes: int) -> str:
+    name = name[:max_chars]
+    while len(name.encode("utf-8")) > max_bytes:
+        name = name[:-1]
+    return name.rstrip()
+
+
+def _sanitize_folder(name: str) -> str:
+    out = []
+    for c in name.strip():
+        if c in "/\\" or c == "\0" or unicodedata.category(c) == "Cc" or 0xD800 <= ord(c) <= 0xDFFF:
+            out.append("_")
+        else:
+            out.append(c)
+    text = "".join(out)
+    while True:
+        stripped = text.strip().lstrip(".")
+        if stripped == text:
+            break
+        text = stripped
+    return _truncate(text, MAX_FOLDER_CHARS, MAX_FOLDER_BYTES) or FALLBACK_NAME
 
 
 def folder_name(name: str, existing: Sequence[str] = ()) -> str:
     """A safe staging folder name for *name*, unique against *existing*
     (case-insensitively). See module docstring for the rules."""
-    raise NotImplementedError
+    base = _sanitize_folder(name)
+    taken: set[str] = set()
+    for e in existing:
+        taken.add(e.casefold())
+        taken.add(e.upper())
+
+    def free(candidate: str) -> bool:
+        return candidate.casefold() not in taken and candidate.upper() not in taken
+
+    if free(base):
+        return base
+    n = 2
+    while True:
+        suffix = f" ({n})"
+        candidate = _truncate(base, MAX_FOLDER_CHARS - len(suffix), MAX_FOLDER_BYTES - len(suffix)) + suffix
+        if free(candidate):
+            return candidate
+        n += 1
 
 
 def find_existing(manifest: Manifest, game_id: str, prepared: Prepared, name: str | None = None) -> ModRecord | None:
     """An installed mod this one would update: the same Nexus mod ID, else the
-    same name (case-insensitive). None when there is no such mod."""
-    raise NotImplementedError
+    same name (case-insensitive). None when there is no such mod.
+
+    When several mods share the Nexus ID (main and optional files of one Nexus
+    page), the one with the same name is preferred, else the first in the list.
+    """
+    mods = manifest.mods(game_id)
+    wanted = _clean_text(name if name is not None else suggested_name(prepared)).casefold()
+    same_name = [m for m in mods if _clean_text(m.name).casefold() == wanted]
+    nexus = prepared.plan.nexus
+    if nexus is not None and nexus.is_nexus:
+        same_id = [m for m in mods if m.nexus_id == nexus.mod_id]
+        if same_id:
+            return next((m for m in same_id if m in same_name), same_id[0])
+    return same_name[0] if same_name else None
+
+
+# ---------------------------------------------------------------- commit
 
 
 def commit(
@@ -123,18 +308,263 @@ def commit(
 
     Raises ``StagingError`` when the plan has no mappings or its target is
     UNKNOWN (the user must choose a root/target first), when the plan is a
-    FOMOD without mappings, or when *replace* belongs to another game.
+    FOMOD without mappings, when *replace* belongs to another game, or when
+    ``prepared.files_dir`` is not an install folder made by ``prepare``. A
+    failure or interruption before the manifest is saved moves the files back.
     The manifest's ``plan`` field stores ``{"root", "target", "rule",
     "wrapper_dirs", "skipped": <count>}`` from the PlacementPlan.
+
+    Without *name* a new mod is called ``suggested_name(prepared)`` and a
+    replaced mod keeps its name.
     """
-    raise NotImplementedError
+    plan = prepared.plan
+    if not plan.mappings:
+        if plan.is_fomod:
+            raise StagingError(
+                "this mod is a FOMOD installer; choose which of its folders to install (and where) first"
+            )
+        raise StagingError("no files would be installed; choose the mod's root folder and target first")
+    if plan.target is Target.UNKNOWN and not plan.is_fomod:
+        raise StagingError("it is not clear where these files belong; choose Data or the game folder first")
+
+    current: ModRecord | None = None
+    if replace is not None:
+        if replace.game_id != game_id:
+            raise StagingError(f"{replace.name!r} is installed for {replace.game_id}, not {game_id}")
+        try:
+            current = manifest.mod(replace.id)
+        except ManifestError as exc:
+            raise StagingError(f"{replace.name!r} is no longer installed") from exc
+        if current.game_id != game_id:
+            raise StagingError(f"{current.name!r} is installed for {current.game_id}, not {game_id}")
+
+    if name is not None:
+        mod_name = _clean_text(name)
+        if not mod_name:
+            raise StagingError("the mod name is empty")
+    else:
+        mod_name = current.name if current is not None else suggested_name(prepared)
+
+    # Only a folder prepare() made is ever moved (and later deleted with the mod).
+    if not Path(os.path.abspath(prepared.files_dir)).parent.name.startswith(_WORKDIR_PREFIX):
+        raise StagingError(f"refusing to install from {prepared.files_dir}: not one of the app's install folders")
+    _check_location(prepared.files_dir, paths.tmp_dir(), 2, "the app's temporary folder", "install from")
+    if not prepared.files_dir.is_dir():
+        raise StagingError(f"{prepared.files_dir} is gone; this install was already committed or discarded")
+    files = _checked_files(prepared)
+
+    mods_root = paths.mods_dir(game_id)
+    _mkdir(mods_root)
+    existing = os.listdir(mods_root) + [m.folder for m in manifest.mods(game_id)]
+    folder = folder_name(mod_name, existing)
+    staging = mods_root / folder
+    if os.path.lexists(staging):
+        raise StagingError(f"{staging} already exists")
+
+    nexus = plan.nexus if plan.nexus is not None and plan.nexus.is_nexus else None
+    details = dict(
+        version=nexus.version if nexus else None,
+        nexus_id=nexus.mod_id if nexus else None,
+        source_archive=_clean_path(prepared.source),
+        plan={
+            "root": plan.root,
+            "target": plan.target.value,
+            "rule": plan.rule.value,
+            "wrapper_dirs": list(plan.wrapper_dirs),
+            "skipped": len(plan.skipped),
+        },
+    )
+
+    _move(prepared.files_dir, staging)
+    try:
+        # One transaction around the write and its read-back: an interruption
+        # anywhere before it is saved rolls it back, and the files go back too.
+        with manifest.transaction():
+            if current is None:
+                mod = manifest.add_mod(game_id, mod_name, folder, files, **details)
+                result = CommitResult(mod)
+            else:
+                mod = manifest.update_mod(current.id, folder=folder, files=files, name=mod_name, **details)
+                result = CommitResult(mod, old_folder=mods_root / current.folder, replaced=True)
+    except BaseException:
+        try:
+            _move(staging, prepared.files_dir)
+        except (OSError, StagingError) as exc:
+            log.error("could not move %s back to %s: %s", staging, prepared.files_dir, exc)
+        raise
+    log.info("%s mod %r (#%d) for %s in %s with %d files", "UPDATED" if result.replaced else "INSTALLED",
+             mod.name, mod.id, game_id, staging, len(files))
+    return result
+
+
+def _checked_files(prepared: Prepared) -> list[ModFile]:
+    """The plan's mappings as ModFiles, refusing anything that isn't a regular
+    file inside ``files_dir`` or a destination that could leave the game folder."""
+    base = os.path.realpath(prepared.files_dir)
+    files: list[ModFile] = []
+    bad: list[str] = []
+    for m in prepared.plan.mappings:
+        try:
+            fold_path(m.source)
+            fold_path(m.dest)
+            m.source.encode("utf-8")
+            m.dest.encode("utf-8")
+        except (ValueError, UnicodeEncodeError):
+            bad.append(m.source)
+            continue
+        full = os.path.join(prepared.files_dir, m.source)
+        try:
+            regular = stat.S_ISREG(os.lstat(full).st_mode)
+        except OSError:
+            regular = False
+        if not regular or not _inside(os.path.realpath(full), base):
+            bad.append(m.source)
+            continue
+        files.append(ModFile(source=m.source, dest=m.dest))
+    if bad:
+        shown = ", ".join(repr(b) for b in bad[:5])
+        more = f" and {len(bad) - 5} more" if len(bad) > 5 else ""
+        raise StagingError(f"can't install these files (missing, not regular files or unusable names): {shown}{more}")
+    return files
+
+
+def _clean_path(path: Path) -> str:
+    text = str(path)
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        text = os.fsencode(text).decode("utf-8", errors="replace")
+    return text
+
+
+# ---------------------------------------------------------------- deleting
 
 
 def discard(prepared: Prepared) -> None:
-    """Remove what is left of the temp folder (safe to call twice)."""
-    raise NotImplementedError
+    """Remove what is left of the temp folder (safe to call twice).
+
+    Meant for ``finally`` blocks: a disk error is logged, not raised (a
+    leftover temp folder does no harm); a folder that is not one of the app's
+    install folders still raises ``StagingError``.
+    """
+    if not prepared.workdir.name.startswith(_WORKDIR_PREFIX):
+        raise StagingError(f"refusing to delete {prepared.workdir}: not one of the app's install folders")
+    try:
+        _remove_tree(prepared.workdir, paths.tmp_dir(), 1, "the app's temporary folder")
+    except OSError as exc:
+        log.error("could not remove the temporary folder %s: %s", prepared.workdir, exc)
 
 
 def remove_staging(folder: str | Path) -> None:
     """Delete a mod's staging folder -- only ever inside ``paths.mods_dir()``."""
-    raise NotImplementedError
+    _remove_tree(Path(folder), paths.mods_dir(), 2, "a game's mods folder")
+
+
+def _check_location(path: Path, base: Path, depth: int, what: str, action: str = "delete") -> str:
+    """The realpath of *path*, which must lie exactly *depth* levels below
+    *base* both as written (abspath) and resolved (realpath of both), and must
+    not itself be a symlink; StagingError otherwise."""
+    if os.path.islink(path):
+        raise StagingError(f"refusing to {action} {path}: it is a symlink")
+    real = os.path.realpath(path)
+    for candidate, root in ((os.path.abspath(path), os.path.abspath(base)), (real, os.path.realpath(base))):
+        rel = os.path.relpath(candidate, root)
+        parts = rel.split(os.sep)
+        if os.path.isabs(rel) or rel == os.curdir or os.pardir in parts or len(parts) != depth:
+            raise StagingError(f"refusing to {action} {path}: it is not a folder in {what} ({base})")
+    return real
+
+
+def _remove_tree(path: Path, base: Path, depth: int, what: str) -> None:
+    """Delete the folder *path* after ``_check_location``. Missing folders are
+    fine; anything else raises StagingError."""
+    real = _check_location(path, base, depth, what)
+    if not os.path.lexists(real):
+        return
+    if os.path.islink(real) or not os.path.isdir(real):
+        raise StagingError(f"refusing to delete {path}: it is not a folder")
+    _make_deletable(real)
+    shutil.rmtree(real)
+    log.info("DELETE %s", real)
+
+
+def _make_deletable(top: str) -> None:
+    """Give the owner rwx on every folder below *top* (archives can carry
+    read-only folders, whose contents could not be removed otherwise)."""
+    needed = stat.S_IRWXU
+
+    def fix(dir_path: str) -> None:
+        try:
+            st = os.lstat(dir_path)
+            if stat.S_ISDIR(st.st_mode) and st.st_mode & needed != needed:
+                os.chmod(dir_path, stat.S_IMODE(st.st_mode) | needed)
+        except OSError:
+            pass
+
+    fix(top)
+    for dirpath, dirnames, _filenames in os.walk(top):
+        for d in dirnames:
+            fix(os.path.join(dirpath, d))
+
+
+# ---------------------------------------------------------------- helpers
+
+
+def _inside(path: str, base: str) -> bool:
+    return path.startswith(base.rstrip(os.sep) + os.sep)
+
+
+def _inside_or_same(path: str, base: str) -> bool:
+    return path == base or _inside(path, base)
+
+
+def _mkdir(path: Path) -> None:
+    if path.is_dir():
+        return
+    missing = []
+    p = path
+    while not p.exists() and p != p.parent:
+        missing.append(p)
+        p = p.parent
+    path.mkdir(parents=True, exist_ok=True)
+    for p in reversed(missing):
+        log.info("MKDIR %s", p)
+
+
+def _move(source: Path, dest: Path) -> None:
+    """Rename the folder *source* to *dest*, which must not exist. Across
+    filesystems *source* is copied into a new *dest* and removed only once the
+    copy is complete; a failed copy is removed again, so no partial folder is
+    left behind."""
+    if os.path.lexists(dest):
+        raise StagingError(f"can't move {source} to {dest}: it already exists")
+    try:
+        os.rename(source, dest)
+    except OSError as exc:
+        if exc.errno != errno.EXDEV:
+            raise
+        os.mkdir(dest)  # fails if the name was taken meanwhile; from here on dest is ours
+        try:
+            shutil.copytree(source, dest, symlinks=True, dirs_exist_ok=True)
+            _delete_moved(source)
+        except BaseException as failure:
+            # Failed or interrupted before the move was complete: drop the copy.
+            # (Both folders are the app's own copies of the user's archive or folder.)
+            _delete_moved(dest)
+            if isinstance(failure, shutil.Error):
+                errors = failure.args[0] if failure.args and isinstance(failure.args[0], list) else []
+                detail = errors[0][-1] if errors and isinstance(errors[0], tuple) else str(failure)
+                raise StagingError(f"could not copy {source} to {dest}: {detail}") from failure
+            raise
+    log.info("MOVE %s -> %s", source, dest)
+
+
+def _delete_moved(path: Path) -> None:
+    """Remove a folder ``_move`` created itself, or one it has completely
+    copied elsewhere. Errors are logged: the files are safe either way."""
+    try:
+        _make_deletable(os.fspath(path))
+        shutil.rmtree(path)
+        log.info("DELETE %s", path)
+    except OSError as exc:
+        log.error("could not remove %s: %s", path, exc)
