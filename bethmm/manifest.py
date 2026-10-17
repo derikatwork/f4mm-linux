@@ -22,7 +22,7 @@ spelling used on disk, plus a case-folded key (``pathresolve.fold_path``) so
 that ``Textures/A.dds`` and ``textures/a.DDS`` are the same entry.
 
 Only one process may change the manifest at a time: opening it with
-``lock=True`` takes an exclusive ``flock`` on ``manifest.lock`` next to the
+``lock=True`` takes an exclusive ``flock`` on ``manifest.db.lock`` next to the
 database and raises :class:`ManifestLocked` if another process holds it.
 """
 
@@ -568,10 +568,12 @@ class Manifest:
     def forget_left_alone(self, game_id: str, path: str) -> None:
         self._db.execute("DELETE FROM left_alone WHERE game_id = ? AND path_key = ?", (game_id, fold_path(path)))
 
-    def has_footprint(self, game_id: str | None = None) -> bool:
-        """Whether the app has anything (links, backups, folders) in a game folder."""
+    def has_footprint(self, game_id: str | None = None, *, dirs: bool = True) -> bool:
+        """Whether the app has anything (links, backups, and with *dirs* the
+        folders it made) in a game folder."""
         where, args = ("WHERE game_id = ?", (game_id,)) if game_id is not None else ("", ())
-        for table in ("deployed", "backups", "created_dirs"):
+        tables = ("deployed", "backups", "created_dirs") if dirs else ("deployed", "backups")
+        for table in tables:
             if self._db.execute(f"SELECT 1 FROM {table} {where} LIMIT 1", args).fetchone():
                 return True
         return False

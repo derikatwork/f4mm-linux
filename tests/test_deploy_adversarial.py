@@ -366,12 +366,17 @@ def test_user_file_in_created_folder_keeps_folder(world):
     assert any("Data/Textures/New" in w for w in result.warnings)
     assert user.read_text() == "user"
     assert not world.path("Data/Textures/New/a.dds").exists()
-    assert world.manifest.created_dirs(GAME) == {}  # the folder is the user's now
+    # The app made the folder, so it stays recorded and is removed once empty.
+    assert world.manifest.created_dirs(GAME) == {"DATA/TEXTURES/NEW": "Data/Textures/New"}
     world.purge()
     snap = snapshot(world.root)
     assert snap.pop("Data/Textures/New/mine.dds")[0] == "file"
     assert snap.pop("Data/Textures/New") == ("dir",)
     assert snap == world.vanilla
+    user.unlink()
+    world.purge()
+    assert snapshot(world.root) == world.vanilla, "the empty folder the app made is removed later"
+    assert world.manifest.created_dirs(GAME) == {}
 
 
 def test_user_file_in_created_folder_on_purge(world):
@@ -381,7 +386,9 @@ def test_user_file_in_created_folder_on_purge(world):
     world.purge()
     assert world.path("Data/New/mine.txt").read_text() == "user"
     assert not world.path("Data/New/Deep").exists()
-    assert not world.manifest.has_footprint(GAME)
+    # Nothing left to undo; the folder the app made stays recorded while the user's file is in it.
+    assert not world.manifest.has_footprint(GAME, dirs=False)
+    assert world.manifest.created_dirs(GAME) == {"DATA/NEW": "Data/New"}
 
 
 def test_staged_file_deleted_falls_back_to_next_provider(world):
@@ -790,8 +797,18 @@ class TamperSim(Sim):
         self.check()
         m, root = self.m, self.world.root
         assert m.deployed(GAME) == {}
-        assert m.created_dirs(GAME) == {}
-        assert deploy.verify(m, self.world.target()).ok
+        # A folder the app made stays recorded only while it still holds
+        # something the user put there (it is removed once empty).
+        for path in m.created_dirs(GAME).values():
+            folder = root / path
+            assert folder.is_dir() and any(p.is_file() and not p.is_symlink() for p in folder.rglob("*")), path
+        report = deploy.verify(m, self.world.target())
+        # Originals stay tracked while a user's file sits at their path.
+        for backup in report.held_backups:
+            here = root / backup.path
+            assert here.is_file() and not here.is_symlink(), backup.path
+        report.held_backups = []
+        assert report.ok, report
         mods_root = os.path.realpath(paths.mods_dir())
         for p in root.rglob("*"):
             if p.is_symlink():
@@ -1206,7 +1223,8 @@ def test_cross_device_move_works(world, monkeypatch):
     real_rename = os.rename
 
     def rename(src, dst):
-        if str(dst).startswith(str(paths.backups_dir())) or str(src).startswith(str(paths.backups_dir())):
+        # Only a rename between the game folder and the data folder crosses filesystems.
+        if str(dst).startswith(str(paths.data_dir())) != str(src).startswith(str(paths.data_dir())):
             raise OSError(errno.EXDEV, "Invalid cross-device link")
         return real_rename(src, dst)
 

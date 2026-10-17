@@ -631,7 +631,7 @@ def cmd_status(args) -> int:
     with Manifest() as manifest:
         game_ids = manifest.game_ids()
         if args.deployed_only:
-            busy = [g for g in game_ids if manifest.has_footprint(g)]
+            busy = [g for g in game_ids if manifest.has_footprint(g, dirs=False)]
             for g in busy:
                 print(f"{GAMES[g].name if g in GAMES else g}: mods are deployed")
             return 1 if busy else 0
