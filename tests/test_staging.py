@@ -388,14 +388,20 @@ def test_folder_name_unique_case_insensitively():
     assert folder_name("..", ["mod"]) == "mod (2)"
 
 
-def test_find_existing_by_nexus_id_then_name(tmp_path, manifest):
+def test_find_existing_by_name_then_nexus_file(tmp_path, manifest):
     prepared = _fake_prepared(tmp_path, "Cool Mod-1234-2-0-1700000000.zip")
     assert find_existing(manifest, "fallout4", prepared) is None
-    by_name = manifest.add_mod("fallout4", "cool mod", "cool mod", [])
-    assert find_existing(manifest, "fallout4", prepared).id == by_name.id
-    by_id = manifest.add_mod("fallout4", "Renamed by user", "renamed", [], nexus_id=1234)
-    assert find_existing(manifest, "fallout4", prepared).id == by_id.id
-    # Several mods from the same Nexus page: the one with the same name wins.
+    # Another file from the same Nexus page (an optional patch) is a separate mod.
+    manifest.add_mod("fallout4", "Cool Mod DLC Patch", "patch", [], nexus_id=1234,
+                     source_archive="/dl/Cool Mod DLC Patch-1234-1-0-1600000000.zip")
+    assert find_existing(manifest, "fallout4", prepared) is None
+    # A mod the user renamed is still found through its original download name.
+    renamed = manifest.add_mod("fallout4", "Renamed by user", "renamed", [], nexus_id=1234,
+                               source_archive="/dl/Cool Mod-1234-1-0-1600000000.zip")
+    assert find_existing(manifest, "fallout4", prepared).id == renamed.id
+    # The same name wins over everything; with several, the one with the same Nexus ID.
+    plain = manifest.add_mod("fallout4", "cool mod", "cool mod", [])
+    assert find_existing(manifest, "fallout4", prepared).id == plain.id
     same_both = manifest.add_mod("fallout4", "Cool Mod", "cm", [], nexus_id=1234)
     assert find_existing(manifest, "fallout4", prepared).id == same_both.id
     # Other games never match.

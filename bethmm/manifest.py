@@ -120,6 +120,10 @@ CREATE INDEX IF NOT EXISTS journal_unfinished ON journal (status) WHERE status =
 """
 
 
+#: Default of ``update_mod``'s optional details: leave the stored value as it is.
+KEEP = object()
+
+
 class ManifestError(Exception):
     pass
 
@@ -411,19 +415,25 @@ class Manifest:
         folder: str | None = None,
         files: Sequence[ModFile] | None = None,
         name: str | None = None,
-        version: str | None = None,
-        nexus_id: int | None = None,
-        source_archive: str | None = None,
+        version: "str | None | object" = KEEP,
+        nexus_id: "int | None | object" = KEEP,
+        source_archive: "str | None | object" = KEEP,
         plan: dict | None = None,
     ) -> ModRecord:
-        """Replace a mod's files and/or details, keeping its place in the list."""
+        """Replace a mod's files and/or details, keeping its place in the list.
+
+        ``version``, ``nexus_id`` and ``source_archive`` are left alone unless
+        given; passing None clears them (an update from a non-Nexus archive)."""
         rows = self._file_rows(files) if files is not None else None
         game_id = self.mod(mod_id).game_id
         with self.transaction(), self._folder_taken(game_id, folder):
             sets, values = [], []
-            for column, value in (("folder", folder), ("name", name), ("version", version),
-                                  ("nexus_id", nexus_id), ("source_archive", source_archive)):
+            for column, value in (("folder", folder), ("name", name)):
                 if value is not None:
+                    sets.append(f"{column} = ?")
+                    values.append(value)
+            for column, value in (("version", version), ("nexus_id", nexus_id), ("source_archive", source_archive)):
+                if value is not KEEP:
                     sets.append(f"{column} = ?")
                     values.append(value)
             if plan is not None:

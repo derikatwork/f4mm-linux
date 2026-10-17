@@ -215,14 +215,54 @@ def test_install_requires_confirmation(home, fo4, tmp_path, capsys, monkeypatch)
         assert m.mods("fallout4") == []
 
 
-def test_low_confidence_game_needs_game_flag_with_yes(home, fo4, tmp_path, capsys):
-    make_tree(home / "Games" / "skyrim" / "drive_c" / "GOG Games" / "Skyrim", ["SkyrimSE.exe", "Data/"])
+def test_unidentified_mod_goes_to_current_game(home, fo4, tmp_path, capsys):
     tex = mod_zip(tmp_path, "Tex-1-1-0.zip", {"textures/x.dds": b"x"})
-    load = load_settings()
-    assert load.current_game == "fallout4"
+    assert load_settings().current_game == "fallout4"
+    assert main(["install", str(tex), "--yes"]) == 0
+    assert "installing into Fallout 4 (your current game)" in capsys.readouterr().out
+    assert (fo4 / "Data" / "textures" / "x.dds").read_bytes() == b"x"
+
+
+def test_without_current_game_two_games_need_game_flag(home, fo4, tmp_path, capsys):
+    from bethmm.settings import save_settings
+
+    make_tree(home / "Games" / "skyrim" / "drive_c" / "GOG Games" / "Skyrim", ["SkyrimSE.exe", "Data/"])
+    assert main(["games", "--rescan"]) == 0
+    settings = load_settings()
+    settings.current_game = None
+    save_settings(settings)
+    capsys.readouterr()
+    tex = mod_zip(tmp_path, "Tex-1-1-0.zip", {"textures/x.dds": b"x"})
     assert main(["install", str(tex), "--yes"]) == 1
-    assert "add --game" in capsys.readouterr().err
+    assert "which game?" in capsys.readouterr().err
     assert main(["install", str(tex), "--yes", "--game", "fallout4"]) == 0
+
+
+def test_optional_file_from_same_nexus_page_installs_separately(home, fo4, tmp_path, capsys):
+    main_file = mod_zip(tmp_path, "Armorsmith Extended-2228-4-6-1700000000.zip", {"AE.esp": esp()})
+    patch = mod_zip(tmp_path, "AE DLC Patch-2228-1-0-1700000500.zip", {"AE_DLC.esp": esp()})
+    assert main(["install", str(main_file), "--yes"]) == 0
+    assert main(["install", str(patch), "--yes"]) == 0
+    capsys.readouterr()
+    with Manifest() as m:
+        assert [x.name for x in m.mods("fallout4")] == ["Armorsmith Extended", "AE DLC Patch"]
+    assert (fo4 / "Data" / "AE.esp").is_symlink() and (fo4 / "Data" / "AE_DLC.esp").is_symlink()
+
+
+def test_update_without_deploy_keeps_old_files_until_repair(home, fo4, tmp_path, capsys):
+    v1 = mod_zip(tmp_path, "Cool Mod-555-1-0-1700000000.zip", {"Cool.esp": esp(), "textures/old.dds": b"old"})
+    v2 = mod_zip(tmp_path, "Cool Mod-555-2-0-1700000100.zip", {"Cool.esp": esp(), "textures/new.dds": b"new"})
+    assert main(["install", str(v1), "--yes"]) == 0
+    with Manifest() as m:
+        old_folder = m.find_mod("fallout4", "Cool Mod").staging_dir()
+    assert main(["install", str(v2), "--yes", "--no-deploy"]) == 0
+    assert "kept the previous files" in capsys.readouterr().out
+    assert old_folder.is_dir()
+    assert (fo4 / "Data" / "textures" / "old.dds").read_bytes() == b"old", "old links still work"
+    assert main(["deploy"]) == 0
+    assert main(["verify", "--repair"]) == 0
+    assert not old_folder.exists()
+    assert (fo4 / "Data" / "textures" / "new.dds").read_bytes() == b"new"
 
 
 def test_verify_and_repair(home, fo4, tmp_path, capsys):
@@ -237,7 +277,8 @@ def test_verify_and_repair(home, fo4, tmp_path, capsys):
     b_link.unlink()
     b_link.write_bytes(b"user's own edit")
     stray = fo4 / "Data" / "stray.esp"
-    stray.symlink_to(paths.mods_dir("fallout4") / "A-1-1-0" / "A.esp")
+    with Manifest() as m:
+        stray.symlink_to(m.find_mod("fallout4", "A").staging_dir() / "A.esp")
 
     assert main(["verify"]) == 1
     out = capsys.readouterr().out

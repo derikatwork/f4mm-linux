@@ -56,6 +56,7 @@ from typing import Sequence
 
 from bethmm import archive, paths, placement
 from bethmm.manifest import Manifest, ManifestError, ModFile, ModRecord
+from bethmm.nexus import parse_nexus_filename
 from bethmm.pathresolve import fold_path
 from bethmm.placement import PlacementPlan, Target
 
@@ -276,21 +277,33 @@ def folder_name(name: str, existing: Sequence[str] = ()) -> str:
 
 
 def find_existing(manifest: Manifest, game_id: str, prepared: Prepared, name: str | None = None) -> ModRecord | None:
-    """An installed mod this one would update: the same Nexus mod ID, else the
-    same name (case-insensitive). None when there is no such mod.
+    """An installed mod this one would update, or None:
 
-    When several mods share the Nexus ID (main and optional files of one Nexus
-    page), the one with the same name is preferred, else the first in the list.
+    * a mod with the same name (case-insensitive) -- with several, the one with
+      the same Nexus mod ID;
+    * else a mod with the same Nexus mod ID whose original download had the same
+      Nexus file name. A mod the user renamed still gets updated, while another
+      file from the same Nexus page (an optional patch, an add-on) is installed
+      as a mod of its own.
     """
     mods = manifest.mods(game_id)
     wanted = _clean_text(name if name is not None else suggested_name(prepared)).casefold()
     same_name = [m for m in mods if _clean_text(m.name).casefold() == wanted]
     nexus = prepared.plan.nexus
-    if nexus is not None and nexus.is_nexus:
-        same_id = [m for m in mods if m.nexus_id == nexus.mod_id]
-        if same_id:
-            return next((m for m in same_id if m in same_name), same_id[0])
-    return same_name[0] if same_name else None
+    is_nexus = nexus is not None and nexus.is_nexus
+    if same_name:
+        if is_nexus:
+            return next((m for m in same_name if m.nexus_id == nexus.mod_id), same_name[0])
+        return same_name[0]
+    if is_nexus:
+        file_name = _clean_text(nexus.display_name).casefold()
+        for m in mods:
+            if m.nexus_id != nexus.mod_id or not m.source_archive:
+                continue
+            original = parse_nexus_filename(Path(m.source_archive).name)
+            if original.mod_id == nexus.mod_id and _clean_text(original.display_name).casefold() == file_name:
+                return m
+    return None
 
 
 # ---------------------------------------------------------------- commit
