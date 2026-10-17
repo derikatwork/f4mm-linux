@@ -400,7 +400,10 @@ def test_find_existing_by_name_then_nexus_file(tmp_path, manifest):
                                source_archive="/dl/Cool Mod-1234-1-0-1600000000.zip")
     assert find_existing(manifest, "fallout4", prepared).id == renamed.id
     # The same name wins over everything; with several, the one with the same Nexus ID.
-    plain = manifest.add_mod("fallout4", "cool mod", "cool mod", [])
+    # Without a Nexus ID on one side it must share a file (two mods may both be "main").
+    manifest.add_mod("fallout4", "cool mod", "unrelated", [ModFile("x.esp", "Data/x.esp")])
+    assert find_existing(manifest, "fallout4", prepared).id == renamed.id
+    plain = manifest.add_mod("fallout4", "cool mod", "cool mod", [ModFile("a.esp", "data/coolmod.ESP")])
     assert find_existing(manifest, "fallout4", prepared).id == plain.id
     same_both = manifest.add_mod("fallout4", "Cool Mod", "cm", [], nexus_id=1234)
     assert find_existing(manifest, "fallout4", prepared).id == same_both.id
@@ -410,14 +413,15 @@ def test_find_existing_by_name_then_nexus_file(tmp_path, manifest):
 
 def test_find_existing_same_name_of_another_nexus_mod_is_not_an_update(tmp_path, manifest):
     """'2K' of mod 2222 doesn't replace '2K' of mod 1111."""
-    other = manifest.add_mod("fallout4", "2K", "2K", [], nexus_id=1111,
+    # (Even sharing a file: a different Nexus mod is never the same mod.)
+    other = manifest.add_mod("fallout4", "2K", "2K", [ModFile("CoolMod.esp", "Data/CoolMod.esp")], nexus_id=1111,
                              source_archive="/dl/2K-1111-1-0-1600000000.zip")
     prepared = _fake_prepared(tmp_path, "2K-2222-3-1-1700000000.zip")
     assert find_existing(manifest, "fallout4", prepared) is None
-    # Same name and no known Nexus ID on one side: still an update.
-    unknown = manifest.add_mod("fallout4", "2k", "2k b", [])
+    # Same name and no known Nexus ID on one side: an update if they share a file.
+    unknown = manifest.add_mod("fallout4", "2k", "2k b", [ModFile("CoolMod.esp", "Data/CoolMod.esp")])
     assert find_existing(manifest, "fallout4", prepared).id == unknown.id
-    plain = _fake_prepared(tmp_path, "2K.zip")
+    plain = _fake_prepared(tmp_path, "2K.zip")  # no Nexus ID: either one may be it
     assert find_existing(manifest, "fallout4", plain).id in (other.id, unknown.id)
 
 
@@ -461,12 +465,17 @@ def test_retire_marks_only_staging_folders(tmp_path):
 
 def test_find_existing_plain_name(tmp_path, manifest):
     prepared = _fake_prepared(tmp_path, "my_mod.zip")
-    other = manifest.add_mod("fallout4", "Something", "s", [], nexus_id=99)
+    shared = [ModFile("CoolMod.esp", "Data/CoolMod.esp")]
+    other = manifest.add_mod("fallout4", "Something", "s", shared)
     assert find_existing(manifest, "fallout4", prepared) is None
-    mod = manifest.add_mod("fallout4", "MY_MOD", "my_mod", [])
+    # Same name but no file in common: two unrelated downloads called "my_mod".
+    manifest.add_mod("fallout4", "my_mod", "my_mod b", [ModFile("x.esp", "Data/x.esp")])
+    assert find_existing(manifest, "fallout4", prepared) is None
+    mod = manifest.add_mod("fallout4", "MY_MOD", "my_mod", shared)
     assert find_existing(manifest, "fallout4", prepared).id == mod.id
+    # --name: the mod called that, else still the archive's own name (so it renames on update).
     assert find_existing(manifest, "fallout4", prepared, name="something").id == other.id
-    assert find_existing(manifest, "fallout4", prepared, name="nothing") is None
+    assert find_existing(manifest, "fallout4", prepared, name="nothing").id == mod.id
 
 
 # ---------------------------------------------------------------- commit
@@ -935,3 +944,16 @@ def test_nothing_outside_tmp_and_mods_is_written(tmp_path, monkeypatch):
     assert outside_snapshot() == before
     assert sorted(os.listdir(data / "tmp")) == []
     assert sorted(os.listdir(data / "mods" / "fallout4")) == []
+
+
+def test_commit_marks_the_previous_folder_retired_before_switching(tmp_path, manifest):
+    """Even if the app dies during the redeploy after an update, verify --repair
+    can tell the previous version's folder is the app's own."""
+    from bethmm.staging import is_retired
+    old_prepared = _fake_prepared(tmp_path, "Cool Mod-1234-1-0-1600000000.zip")
+    old = commit(old_prepared, manifest, "fallout4").mod
+    discard(old_prepared)
+    new_prepared = _fake_prepared(tmp_path, "Cool Mod-1234-2-0-1700000000.zip")
+    result = commit(new_prepared, manifest, "fallout4", replace=manifest.mod(old.id))
+    discard(new_prepared)
+    assert is_retired(result.old_folder) and not is_retired(result.mod.staging_dir())

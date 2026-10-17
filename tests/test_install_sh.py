@@ -46,8 +46,11 @@ def fake_install(tmp_path: Path, exit_code: int, output: str) -> dict:
     home = tmp_path / "home"
     venv = home / ".local/share/beth-mod-manager/venv"
     (venv / "bin").mkdir(parents=True)
+    python = venv / "bin" / "python"  # "-c 'import bethmm'" works; "-m bethmm status ..." answers
+    python.write_text(f"#!/bin/sh\n[ \"$1\" = -c ] && exit 0\necho '{output}'\nexit {exit_code}\n")
+    python.chmod(0o755)
     bethmm = venv / "bin" / "bethmm"
-    bethmm.write_text(f"#!/bin/sh\necho '{output}'\nexit {exit_code}\n")
+    bethmm.write_text("#!/bin/sh\nexit 0\n")
     bethmm.chmod(0o755)
     (home / ".local/bin").mkdir(parents=True)
     (home / ".local/bin/bethmm").symlink_to(bethmm)
@@ -83,3 +86,26 @@ def test_uninstall_force_skips_the_check(tmp_path):
     result = run("--uninstall", "--force", env=env)
     assert result.returncode == 0, result.stderr
     assert not (Path(env["HOME"]) / ".local/share/beth-mod-manager/venv").exists()
+
+
+def test_uninstall_with_a_broken_environment_still_checks(tmp_path):
+    """The venv's Python is gone (e.g. after a distro upgrade): the check runs
+    with the app in this folder, and nothing deployed means it goes ahead."""
+    env = fake_install(tmp_path, 1, "never asked")
+    home = Path(env["HOME"])
+    (home / ".local/share/beth-mod-manager/venv/bin/python").unlink()
+    (home / ".local/share/beth-mod-manager/venv/bin/python").symlink_to("/nonexistent/python3.11")
+    env["BETHMM_DATA_DIR"] = str(home / "data")
+    env["BETHMM_CONFIG_DIR"] = str(home / "config")
+    result = run("--uninstall", env=env)
+    assert result.returncode == 0, result.stderr
+    assert not (home / ".local/share/beth-mod-manager/venv").exists()
+
+
+def test_uninstall_under_sudo_refuses(tmp_path):
+    if os.geteuid() != 0:
+        pytest.skip("needs root")
+    env = fake_install(tmp_path, 0, "")
+    env["SUDO_USER"] = "someone"
+    result = run("--uninstall", env=env)
+    assert result.returncode == 1 and "not with sudo" in result.stderr

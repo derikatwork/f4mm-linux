@@ -214,6 +214,13 @@ class JournalEntry:
     status: str
 
 
+BUSY_MESSAGE = "another bethmm command is using the manifest right now; try again when it has finished"
+
+
+def _is_locked(exc: BaseException) -> bool:
+    return isinstance(exc, sqlite3.OperationalError) and "locked" in str(exc)
+
+
 class Manifest:
     def __init__(self, path: str | Path | None = None, *, lock: bool = False) -> None:
         self.path = Path(path) if path is not None else paths.manifest_path()
@@ -231,6 +238,8 @@ class Manifest:
             if self._db is not None:
                 self._db.close()
             self._release_lock()
+            if _is_locked(exc):
+                raise ManifestLocked(BUSY_MESSAGE) from exc
             if isinstance(exc, sqlite3.DatabaseError):
                 raise ManifestError(f"{self.path} is not a readable manifest: {exc}") from exc
             raise
@@ -280,6 +289,8 @@ class Manifest:
                 raise ManifestError(
                     f"{self.path} was written by a newer version of the app (schema {version}); update the app"
                 )
+            if version == SCHEMA_VERSION:
+                return  # nothing to write: opening never waits for another process's changes
         self._db.executescript(_SCHEMA)  # creates whatever an older schema lacks
         columns = {r["name"] for r in self._db.execute("PRAGMA table_info(deployed)")}
         for column in ("size", "mtime_ns"):
@@ -298,7 +309,12 @@ class Manifest:
         if self._db.in_transaction:
             yield
             return
-        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            self._db.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError as exc:
+            if _is_locked(exc):
+                raise ManifestLocked(BUSY_MESSAGE) from exc
+            raise
         try:
             yield
         except BaseException:
@@ -569,14 +585,15 @@ class Manifest:
         self._db.execute("DELETE FROM left_alone WHERE game_id = ? AND path_key = ?", (game_id, fold_path(path)))
 
     def has_footprint(self, game_id: str | None = None, *, dirs: bool = True) -> bool:
-        """Whether the app has anything (links, backups, and with *dirs* the
-        folders it made) in a game folder."""
+        """Whether the app has anything in a game folder: links, backups,
+        operations an interrupted run started, and with *dirs* the folders it made."""
         where, args = ("WHERE game_id = ?", (game_id,)) if game_id is not None else ("", ())
         tables = ("deployed", "backups", "created_dirs") if dirs else ("deployed", "backups")
         for table in tables:
             if self._db.execute(f"SELECT 1 FROM {table} {where} LIMIT 1", args).fetchone():
                 return True
-        return False
+        intent = f"{where} AND status = 'intent'" if where else "WHERE status = 'intent'"
+        return self._db.execute(f"SELECT 1 FROM journal {intent} LIMIT 1", args).fetchone() is not None
 
     # ------------------------------------------------------------ journal
 

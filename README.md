@@ -104,15 +104,16 @@ enabled mod provides that file any more.
 Installing a newer version of a mod you already have updates it in place, keeping
 its position and enabled state. An archive counts as a newer version when
 
-* it has the same name as an installed mod (unless both come from Nexus with
-  different mod IDs — two unrelated mods may both call their file "2K"), or
+* it has the same name as an installed mod and either comes from the same Nexus
+  mod page or shares at least one file with it (two unrelated mods may both be
+  called "2K" or "main"), or
 * it comes from the same Nexus mod page and its Nexus file name is the same apart
   from version numbers ("Cool Mod 1.2" → "Cool Mod 1.3"). Other files of the same
   page — an optional patch, "PART 2" — are separate mods.
 
 The plan says "This updates ..." before you confirm. `--new` installs it
 separately instead; `--replace MOD` makes it the new version of a mod the rules
-didn't match.
+didn't match. `--name NAME` on an update renames the mod.
 
 **The app never deletes or edits a file it didn't create.** If you (or a tool such as
 xEdit or BethINI) replace one of its links with a real file, that file is left alone
@@ -137,10 +138,12 @@ bethmm history            # the latest file operations
 is killed halfway, the next `deploy`/`purge` or `verify --repair` cleans up.
 
 `verify --repair` removes stray links into the app's mods folder and half-made
-links or half-copied files of an interrupted run, puts back unrecorded originals
-from the backups folder, forgets records of things that are gone, and deletes the
-previous version of an updated mod once no link uses it. It never deletes a folder
-in the mods folder that the app didn't mark as its own — it only reports it.
+links of an interrupted run, puts back unrecorded originals from the backups
+folder, forgets records of things that are gone, moves files left by an
+interrupted move to `backups/<game>/.superseded/`, and deletes the previous version
+of an updated mod once no link uses it. It never deletes a folder in the mods
+folder that the app didn't mark as its own — it only reports it. While the game
+folder is missing or empty (say, on a drive that isn't mounted) it changes nothing.
 
 When a game update (or anything else) puts a new file where a mod had replaced the
 original, that file is left alone and the old original stays in the backups.
@@ -150,8 +153,11 @@ original back, or `verify --repair --release-held` stops tracking the old origin
 
 If you moved the game to another folder (and pointed the app there with
 `bethmm override --root`), `purge` cleans up the new folder; deploy again
-afterwards. If the game folder is gone altogether, `purge` forgets the app's links
-there and moves the originals it had backed up to `backups/<game>/.superseded/`.
+afterwards. If you installed the game again somewhere else, `purge` cleans up the
+old folder first. If the game folder is missing or empty, `purge` refuses and
+changes nothing — it may only be on a drive that isn't mounted. When the game is
+really gone, `purge --forget-missing` forgets the app's links there and moves the
+originals it had backed up to `backups/<game>/.superseded/` (nothing is deleted).
 
 ### Dry run
 

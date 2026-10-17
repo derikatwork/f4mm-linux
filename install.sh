@@ -60,8 +60,23 @@ while [ $# -gt 0 ]; do
     shift
 done
 
-[ "$UNINSTALL" -eq 1 ] || [ "$(id -u)" -ne 0 ] || [ "$FORCE" -eq 1 ] \
-    || die "run this as your normal user, not with sudo (it asks for sudo itself when needed)"
+# Under sudo, $HOME is root's: an install would be root's, an uninstall would find nothing.
+if [ "$(id -u)" -eq 0 ] && [ "$FORCE" -eq 0 ] && { [ "$UNINSTALL" -eq 0 ] || [ -n "${SUDO_USER:-}" ]; }; then
+    die "run this as your normal user, not with sudo (it asks for sudo itself when needed)"
+fi
+
+python_ok() { "$1" -c 'import sys; sys.exit(sys.version_info < (3, 11))' 2>/dev/null; }
+
+find_python() {
+    local candidate
+    for candidate in python3 python3.13 python3.12 python3.11; do
+        if command -v "$candidate" >/dev/null 2>&1 && python_ok "$candidate"; then
+            command -v "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
 
 confirm() {
     # confirm "question" -> 0 for yes. Defaults to yes; --yes answers for you.
@@ -76,8 +91,16 @@ confirm() {
 
 if [ "$UNINSTALL" -eq 1 ]; then
     step "Uninstalling $APP_NAME"
-    if [ -x "$VENV/bin/bethmm" ] && [ "$FORCE" -eq 0 ]; then
-        if ! status="$("$VENV/bin/bethmm" status --deployed-only 2>&1)"; then
+    if [ -e "$VENV" ] && [ "$FORCE" -eq 0 ]; then
+        # The installed app answers, or (if its Python is gone) the app in this folder.
+        if "$VENV/bin/python" -c 'import bethmm' >/dev/null 2>&1; then
+            check=("$VENV/bin/python" -m bethmm status --deployed-only)
+        elif PY="$(find_python)"; then
+            check=(env PYTHONPATH="$REPO_DIR" "$PY" -m bethmm status --deployed-only)
+        else
+            die "can't run the app to check that no mods are deployed (no Python 3.11+ found); install python3, or use --force"
+        fi
+        if ! status="$("${check[@]}" 2>&1)"; then
             printf '%s\n' "$status" >&2
             die "the app still has files in a game folder (see above). Run 'bethmm purge --all' first, or --force to uninstall anyway"
         fi
@@ -113,19 +136,6 @@ if [ -r /etc/os-release ]; then
            SYSTEM_PACKAGES=0 ;;
     esac
 fi
-
-python_ok() { "$1" -c 'import sys; sys.exit(sys.version_info < (3, 11))' 2>/dev/null; }
-
-find_python() {
-    local candidate
-    for candidate in python3 python3.13 python3.12 python3.11; do
-        if command -v "$candidate" >/dev/null 2>&1 && python_ok "$candidate"; then
-            command -v "$candidate"
-            return 0
-        fi
-    done
-    return 1
-}
 
 pkg_installed() { dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q "install ok installed"; }
 pkg_available() {
@@ -200,8 +210,8 @@ command -v 7z >/dev/null 2>&1 || command -v 7zz >/dev/null 2>&1 || die "7z is st
 # ------------------------------------------------------------------ app
 
 step "Installing $APP_NAME into $VENV"
-if [ -x "$VENV/bin/python" ] && ! python_ok "$VENV/bin/python"; then
-    say "existing environment uses an old Python; recreating it"
+if [ -e "$VENV" ] && ! python_ok "$VENV/bin/python"; then
+    say "the existing environment in $VENV can't be used (its Python is gone or too old); recreating it"
     rm -rf "$VENV"
 fi
 if [ ! -x "$VENV/bin/python" ]; then

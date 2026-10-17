@@ -963,7 +963,10 @@ def test_killed_at_every_file_operation(tmp_path, monkeypatch, mode, action, swi
             report = verify_and_repair(world)
             # (A kill before the first operation -- e.g. in check_link_mode -- leaves no journal entry.)
             assert killed or not report.interrupted
-            assert deploy.verify(world.manifest, world.target()).ok, f"call {n}: repair left problems"
+            after = deploy.verify(world.manifest, world.target())
+            # Originals the repair freed go back with the deploy or purge that follows.
+            after.restorable = []
+            assert after.ok, f"call {n}: repair left problems"
             if action == "deploy":
                 result = world.deploy()
                 assert not result.failed, (n, result.failed)

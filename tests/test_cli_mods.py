@@ -513,7 +513,10 @@ def test_purge_after_the_game_folder_is_gone(home, fo4, tmp_path, capsys):
     shutil.rmtree(fo4)
     assert main(["games", "--rescan"]) == 0
     capsys.readouterr()
-    assert main(["purge", "--all", "--yes"]) == 0
+    assert main(["purge", "--all", "--yes"]) == 1  # maybe just not mounted: refuses
+    assert "--forget-missing" in capsys.readouterr().out
+    assert main(["status", "--deployed-only"]) == 1
+    assert main(["purge", "--all", "--yes", "--forget-missing"]) == 0
     out = capsys.readouterr().out
     assert "superseded" in out
     assert main(["status", "--deployed-only"]) == 0
@@ -537,3 +540,133 @@ def test_conflicts_files_shows_the_deployed_path(home, fo4, tmp_path, capsys):
     assert main(["conflicts", "--files"]) == 0
     out = capsys.readouterr().out
     assert "Data/textures/SomeMod/a.dds: A < B" in out
+
+
+# ---------------------------------------------------------------- second review round
+
+
+def test_dry_run_output_is_printed_after_the_manifest_is_released(home, fo4, tmp_path, monkeypatch):
+    """A dry run piped into a pager must not keep other commands waiting."""
+    import sqlite3
+    import sys
+    a = mod_zip(tmp_path, "A-1-1-0.zip", {"A.esp": esp()})
+    assert main(["install", str(a), "--yes"]) == 0
+    seen = []
+
+    class Pager:
+        def write(self, text):
+            if not seen:
+                db = sqlite3.connect(paths.manifest_path(), timeout=0.2, isolation_level=None)
+                try:
+                    db.execute("BEGIN IMMEDIATE")  # what another bethmm command needs
+                    db.execute("ROLLBACK")
+                    seen.append("free")
+                except sqlite3.OperationalError:
+                    seen.append("locked")
+                finally:
+                    db.close()
+            return len(text)
+
+        def flush(self):
+            pass
+
+    monkeypatch.setattr(sys, "stdout", Pager())
+    assert main(["disable", "A", "--dry-run"]) == 0
+    assert seen == ["free"]
+
+
+def test_opening_the_manifest_never_waits_for_a_writer(home, fo4, tmp_path):
+    import sqlite3
+    a = mod_zip(tmp_path, "A-1-1-0.zip", {"A.esp": esp()})
+    assert main(["install", str(a), "--yes"]) == 0
+    db = sqlite3.connect(paths.manifest_path(), isolation_level=None)
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        with Manifest() as m:
+            assert m.find_mod("fallout4", "A")
+    finally:
+        db.execute("ROLLBACK")
+        db.close()
+
+
+def test_interrupted_first_install_is_seen_by_status_and_purge_all(home, fo4, tmp_path, monkeypatch, capsys):
+    a = mod_zip(tmp_path, "A-1-1-0.zip", {"A.esp": esp()})
+    real = Manifest.record_link
+
+    def killed(self, *args, **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(Manifest, "record_link", killed)
+    assert main(["install", str(a), "--yes"]) == 130
+    monkeypatch.setattr(Manifest, "record_link", real)
+    assert (fo4 / "Data" / "A.esp").is_symlink()
+    capsys.readouterr()
+    assert main(["status", "--deployed-only"]) == 1
+    assert "interrupted" in capsys.readouterr().out
+    assert main(["purge", "--all", "--yes"]) == 0
+    assert not os.path.lexists(fo4 / "Data" / "A.esp")
+    assert main(["status", "--deployed-only"]) == 0
+
+
+def test_verify_repair_on_a_purged_game_puts_back_a_freed_original(home, fo4, tmp_path, capsys):
+    a = mod_zip(tmp_path, "A-1-1-0.zip", {"textures/vanilla.dds": b"mod", "A.esp": esp()})
+    assert main(["install", str(a), "--yes"]) == 0
+    link = fo4 / "Data" / "textures" / "vanilla.dds"
+    link.unlink()
+    link.write_bytes(b"patched by a game update")
+    assert main(["purge", "--yes"]) == 0
+    link.unlink()
+    capsys.readouterr()
+    assert main(["verify"]) == 1
+    assert "not back in the game folder" in capsys.readouterr().out
+    assert main(["verify", "--repair"]) == 0
+    assert link.read_bytes() == b"vanilla"
+
+
+def test_verify_with_the_game_folder_missing(home, fo4, tmp_path, capsys):
+    a = mod_zip(tmp_path, "A-1-1-0.zip", {"A.esp": esp()})
+    assert main(["install", str(a), "--yes"]) == 0
+    away = fo4.with_name("away")
+    os.rename(fo4, away)
+    capsys.readouterr()
+    assert main(["verify", "--repair"]) == 1
+    assert "missing or empty" in capsys.readouterr().out
+    with Manifest() as m:
+        assert len(m.deployed("fallout4")) == 1
+    os.rename(away, fo4)
+    assert main(["verify"]) == 0
+
+
+def test_install_name_on_update_of_a_plain_archive_renames(home, fo4, tmp_path, capsys):
+    v1 = mod_zip(tmp_path, "mymod.zip", {"MyMod.esp": esp(), "textures/a.dds": b"1"})
+    assert main(["install", str(v1), "--yes"]) == 0
+    (tmp_path / "new").mkdir()
+    v2 = mod_zip(tmp_path / "new", "mymod.zip", {"MyMod.esp": esp(), "textures/a.dds": b"2"})
+    assert main(["install", str(v2), "--yes", "--name", "My Mod"]) == 0
+    with Manifest() as m:
+        assert [x.name for x in m.mods("fallout4")] == ["My Mod"]
+    assert (fo4 / "Data" / "textures" / "a.dds").read_bytes() == b"2"
+
+
+def test_same_generic_name_without_shared_files_is_a_separate_mod(home, fo4, tmp_path, capsys):
+    one = mod_zip(tmp_path, "main.zip", {"One.esp": esp()})
+    assert main(["install", str(one), "--yes"]) == 0
+    (tmp_path / "other").mkdir()
+    two = mod_zip(tmp_path / "other", "main.zip", {"Two.esp": esp()})
+    assert main(["install", str(two), "--yes"]) == 0
+    with Manifest() as m:
+        assert len(m.mods("fallout4")) == 2
+    assert (fo4 / "Data" / "One.esp").is_file() and (fo4 / "Data" / "Two.esp").is_file()
+
+
+def test_install_dry_run_refuses_unusable_file_names_cleanly(home, fo4, tmp_path, capsys):
+    src = tmp_path / "Odd Mod"
+    make_tree(src, {"Odd.esp": esp()})
+    bad = os.path.join(os.fsencode(src / "textures"), b"\xff.dds")
+    os.makedirs(os.path.dirname(bad))
+    with open(bad, "wb") as fh:
+        fh.write(b"x")
+    for extra in (["--dry-run"], ["--yes"]):
+        result = main(["install", str(src), *extra])
+        err = capsys.readouterr().err
+        assert result == 1 and "error:" in err and "Traceback" not in err, extra

@@ -26,6 +26,7 @@ import logging
 import os
 import shutil
 import signal
+import sqlite3
 import sys
 import tempfile
 import time
@@ -34,7 +35,7 @@ from pathlib import Path
 from bethmm import APP_NAME, __version__, deploy, paths
 from bethmm.archive import ArchiveError, extract_archive
 from bethmm.deploy import DeployError
-from bethmm.manifest import Manifest, ManifestError
+from bethmm.manifest import BUSY_MESSAGE, Manifest, ManifestError
 from bethmm.staging import StagingError
 from bethmm.discovery import DiscoveredGame, cache_is_current, get_games
 from bethmm.games import GAMES
@@ -81,6 +82,10 @@ def main(argv: list[str] | None = None) -> int:
         return args.func(args) or 0
     except (CliError, ArchiveError, SettingsError, DeployError, ManifestError, StagingError) as exc:
         print(f"error: {exc}", file=sys.stderr)
+        return 1
+    except sqlite3.Error as exc:
+        busy = isinstance(exc, sqlite3.OperationalError) and "locked" in str(exc)
+        print(f"error: {BUSY_MESSAGE if busy else f'the manifest: {exc}'}", file=sys.stderr)
         return 1
     except OSError as exc:
         where = f" ({exc.filename})" if exc.filename else ""

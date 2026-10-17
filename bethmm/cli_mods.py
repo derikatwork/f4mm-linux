@@ -9,17 +9,18 @@ which prints what would happen and changes nothing.
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import sys
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stdout
 from pathlib import Path
 from typing import Callable, Iterator
 
 from bethmm import deploy, paths, staging, winecheck
 from bethmm.discovery import DiscoveredGame, get_games
 from bethmm.games import GAMES
-from bethmm.manifest import Manifest, ManifestError, ModFile, ModRecord
+from bethmm.manifest import Manifest, ManifestError, ModRecord
 from bethmm.placement import Confidence, Target
 from bethmm.settings import Settings, load_settings, save_settings
 
@@ -101,6 +102,9 @@ def register(sub: argparse._SubParsersAction, error: type[Exception]) -> None:
     p = sub.add_parser("purge", help="remove everything the app put in the game folder (mods stay installed)")
     game_arg(p)
     p.add_argument("--all", action="store_true", help="every game")
+    p.add_argument("--forget-missing", action="store_true",
+                   help="the game folder is gone for good (not just on a drive that isn't mounted): forget the "
+                        "app's links there and keep the originals it backed up in backups/<game>/.superseded/")
     p.add_argument("-y", "--yes", action="store_true", help="don't ask for confirmation")
     dry_arg(p)
     p.add_argument("-v", "--verbose", action="store_true", help="list every file operation")
@@ -185,13 +189,18 @@ class _Rollback(Exception):
 
 @contextmanager
 def _preview(manifest: Manifest) -> Iterator[None]:
-    """Make changes inside a transaction that is always rolled back."""
+    """Make changes inside a transaction that is always rolled back. What is
+    printed meanwhile appears after the rollback, so a paged or suspended
+    dry run never keeps other bethmm commands waiting."""
+    output = io.StringIO()
     try:
-        with manifest.transaction():
+        with manifest.transaction(), redirect_stdout(output):
             yield
             raise _Rollback
     except _Rollback:
         pass
+    finally:
+        sys.stdout.write(output.getvalue())
 
 
 def _mod_names(manifest: Manifest, game_id: str) -> dict[int, str]:
@@ -372,8 +381,7 @@ def cmd_install(args) -> int:
             if result.old_folder is not None:
                 old = str(result.old_folder) + "/"
                 still_linked = [d for d in manifest.deployed(game.game_id).values() if d.source.startswith(old)]
-                if still_linked:
-                    staging.retire(result.old_folder)
+                if still_linked:  # (marked as retired by commit)
                     print(f"  ! kept the previous files in {result.old_folder}: {len(still_linked)} link(s) still "
                           "point there. Run 'bethmm deploy'; then 'bethmm verify --repair' deletes the folder.")
                 else:
@@ -400,7 +408,7 @@ def _preview_install(manifest: Manifest, game_id: str, target: deploy.GameTarget
     (pointing at the extracted files) inside a transaction that is rolled back."""
     # An absolute folder: mods_dir / folder is then the extracted files themselves.
     folder = os.path.abspath(prepared.files_dir)
-    files = [ModFile(m.source, m.dest) for m in prepared.plan.mappings]
+    files = staging.checked_files(prepared)  # refuses what the real install refuses
     with _preview(manifest):
         if existing is not None:
             manifest.update_mod(existing.id, folder=folder, files=files, name=name)
@@ -633,7 +641,8 @@ def cmd_purge(args) -> int:
             target = deploy.GameTarget(game_id, Path(root), settings.override(game_id).link_mode)
             print(f"{GAMES[game_id].name}:")
             try:
-                status |= _report(deploy.purge(manifest, target, dry_run=dry), manifest, verbose=args.verbose)
+                result = deploy.purge(manifest, target, dry_run=dry, forget_missing=args.forget_missing)
+                status |= _report(result, manifest, verbose=args.verbose)
             except deploy.DeployError as exc:
                 print(f"  ! {exc}")
                 status = 1
@@ -656,10 +665,17 @@ def cmd_verify(args) -> int:
         report = deploy.verify(manifest, target)
         retired, unknown = _unused_staging(manifest, game.game_id)
         problems = not report.ok or bool(retired)
+        if report.root_missing:
+            print(f"{game.name}: the game folder {report.root} is missing or empty, so nothing was checked.")
+            print("  If it is on a drive that isn't mounted, mount it and run this again. If the game is gone,")
+            print(f"  'bethmm purge --forget-missing --game {game.game_id}' forgets the app's links there.")
+            return 1
         if not problems:
             print(f"{game.name}: everything the app deployed is in place.")
         else:
             print(f"{game.name}: found problems:")
+        if report.moved_from is not None:
+            print(f"  note: the mods were deployed into {report.moved_from}, which is gone; checked {report.root}")
         for record in report.missing:
             print(f"  missing link: {record.path}")
         for record in report.foreign:
@@ -674,7 +690,9 @@ def cmd_verify(args) -> int:
             print(f"  original kept in the backups because another file is at its path: {backup.path} "
                   f"({backup.backup})")
         for full in report.temp_leftovers:
-            print(f"  half-copied file from an interrupted move: {full}")
+            print(f"  file left by an interrupted move: {full}")
+        for backup in report.restorable:
+            print(f"  original not back in the game folder yet: {backup.path} ({backup.backup})")
         for path in report.missing_dirs:
             print(f"  folder gone: {path}")
         for entry in report.interrupted:
@@ -684,6 +702,8 @@ def cmd_verify(args) -> int:
         for path in report.left_alone:
             print(f"  note: {path} is a file the app didn't create, where a mod's link was; it is left alone "
                   "(delete it to let the mod link there again)")
+        for old, now in report.case_moved:
+            print(f"  note: the link {old} is now at {now} (a folder was renamed); the next deploy records that")
         for folder in unknown:
             print(f"  note: {folder} is in the mods folder, but no installed mod uses it; the app leaves it alone")
         if not problems:
@@ -765,24 +785,28 @@ def _deployed_only(manifest: Manifest, game_ids: list[str]) -> int:
     busy = False
     for g in game_ids:
         links, backups = manifest.deployed(g), manifest.backups(g)
-        if not links and not backups:
+        unfinished = manifest.unfinished_journal(g)
+        if not links and not backups and not unfinished:
             continue
         state = manifest.game_state(g)
         root = Path(state.root) if state is not None else None
-        held: list = []
-        if root is not None and root.is_dir():
-            held = deploy.verify(manifest, deploy.GameTarget(g, root)).held_backups
+        report = deploy.verify(manifest, deploy.GameTarget(g, root)) if root is not None else None
+        held = report.held_backups if report is not None and not report.root_missing else []
         parts = []
         if links:
             parts.append(f"{len(links)} link(s) in {root or 'the game folder'}")
+        if unfinished:
+            parts.append(f"{len(unfinished)} operation(s) of an interrupted run that a purge cleans up")
         restorable = len(backups) - len(held)
         if restorable:
             parts.append(f"{restorable} original game file(s) in the app's backups that a purge puts back")
         if held:
             parts.append(f"{len(held)} original(s) kept in the backups because a newer file is at their path "
                          "(safe to leave; 'bethmm verify --repair --release-held' stops tracking them)")
+        if report is not None and report.root_missing:
+            parts.append(f"the game folder {root} is missing or empty (a drive that isn't mounted?)")
         print(f"{GAMES[g].name if g in GAMES else g}: " + "; ".join(parts))
-        busy = busy or bool(links) or restorable > 0
+        busy = busy or bool(links) or bool(unfinished) or restorable > 0
     if busy:
         print("Run 'bethmm purge --all' to put the game folders back as they were.")
     return 1 if busy else 0

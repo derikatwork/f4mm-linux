@@ -279,9 +279,11 @@ def folder_name(name: str, existing: Sequence[str] = ()) -> str:
 def find_existing(manifest: Manifest, game_id: str, prepared: Prepared, name: str | None = None) -> ModRecord | None:
     """An installed mod this one would update, or None:
 
-    * a mod with the same name (case-insensitive), unless both have a Nexus
-      mod ID and they differ ("2K" or "Main File" of two unrelated mods) --
-      with several, the one with the same Nexus mod ID;
+    * a mod with the same name (case-insensitive; *name*, the name the user
+      gave, is tried first, then the name the archive suggests): when both
+      come from the same Nexus mod page always, otherwise only when they
+      share at least one file -- two unrelated mods may both be called "2K"
+      or "main";
     * else a mod with the same Nexus mod ID whose original download had the
       same Nexus file name, ignoring version numbers in it ("Cool Mod 1.2" ->
       "Cool Mod 1.3"). A mod the user renamed still gets updated, while
@@ -289,15 +291,21 @@ def find_existing(manifest: Manifest, game_id: str, prepared: Prepared, name: st
       "PART 2") is installed as a mod of its own.
     """
     mods = manifest.mods(game_id)
-    wanted = _clean_text(name if name is not None else suggested_name(prepared)).casefold()
-    same_name = [m for m in mods if _clean_text(m.name).casefold() == wanted]
     nexus = prepared.plan.nexus
     is_nexus = nexus is not None and nexus.is_nexus
-    if is_nexus:
-        same_name = sorted((m for m in same_name if m.nexus_id in (nexus.mod_id, None)),
-                           key=lambda m: m.nexus_id != nexus.mod_id)
-    if same_name:
-        return same_name[0]
+    dests = {fold_path(m.dest) for m in prepared.plan.mappings}
+
+    def related(mod: ModRecord) -> bool:
+        if is_nexus and mod.nexus_id == nexus.mod_id:
+            return True
+        if is_nexus and mod.nexus_id is not None:
+            return False  # another Nexus mod
+        return any(fold_path(f.dest) in dests for f in manifest.mod_files(mod.id))
+
+    for wanted in dict.fromkeys(_clean_text(n).casefold() for n in (name, suggested_name(prepared)) if n):
+        same_name = [m for m in mods if _clean_text(m.name).casefold() == wanted and related(m)]
+        if same_name:
+            return min(same_name, key=lambda m: not (is_nexus and m.nexus_id == nexus.mod_id))
     if is_nexus:
         for m in mods:
             if m.nexus_id != nexus.mod_id or not m.source_archive:
@@ -344,6 +352,17 @@ def retire(folder: Path) -> None:
     marker = folder / RETIRED_MARKER
     marker.write_text("This folder held a previous version of a mod. The app deletes it once no link uses it.\n")
     log.info("WRITE %s", marker)
+
+
+def unretire(folder: Path) -> None:
+    """Take the mark off *folder* again (the update didn't happen)."""
+    marker = folder / RETIRED_MARKER
+    try:
+        if marker.is_file() and not marker.is_symlink():
+            marker.unlink()
+            log.info("DELETE %s", marker)
+    except OSError as exc:
+        log.error("could not remove %s: %s", marker, exc)
 
 
 def is_retired(folder: Path) -> bool:
@@ -410,7 +429,7 @@ def commit(
     _check_location(prepared.files_dir, paths.tmp_dir(), 2, "the app's temporary folder", "install from")
     if not prepared.files_dir.is_dir():
         raise StagingError(f"{prepared.files_dir} is gone; this install was already committed or discarded")
-    files = _checked_files(prepared)
+    files = checked_files(prepared)
 
     mods_root = paths.mods_dir(game_id)
     _mkdir(mods_root)
@@ -434,6 +453,11 @@ def commit(
         },
     )
 
+    old_folder = mods_root / current.folder if current is not None else None
+    if old_folder is not None and old_folder.is_dir() and not old_folder.is_symlink():
+        # Marked before the switch, so even if the app dies during the redeploy
+        # that follows, 'verify --repair' deletes it once no link uses it.
+        retire(old_folder)
     _move(prepared.files_dir, staging)
     try:
         # One transaction around the write and its read-back: an interruption
@@ -452,13 +476,15 @@ def commit(
             _move(staging, prepared.files_dir)
         except (OSError, StagingError) as exc:
             log.error("could not move %s back to %s: %s", staging, prepared.files_dir, exc)
+        if old_folder is not None:
+            unretire(old_folder)
         raise
     log.info("%s mod %r (#%d) for %s in %s with %d files", "UPDATED" if result.replaced else "INSTALLED",
              mod.name, mod.id, game_id, staging, len(files))
     return result
 
 
-def _checked_files(prepared: Prepared) -> list[ModFile]:
+def checked_files(prepared: Prepared) -> list[ModFile]:
     """The plan's mappings as ModFiles, refusing anything that isn't a regular
     file inside ``files_dir`` or a destination that could leave the game folder."""
     base = os.path.realpath(prepared.files_dir)

@@ -17,6 +17,7 @@ from bethmm.deploy import GameTarget
 from bethmm.manifest import Manifest
 
 import test_deploy_adversarial as adv
+from helpers import make_tree
 from test_deploy import GAME, add_mod, assert_deployed, assert_vanilla, snapshot, staged
 from test_deploy_adversarial import Boom, Killed, fail_once, verify_and_repair
 
@@ -118,8 +119,11 @@ def test_temp_leftover_is_reported_and_removed(world):
     assert sorted(report.temp_leftovers) == sorted([str(leftover), str(in_game)])
     assert not report.orphan_backups  # not mistaken for an unrecorded original
     actions = deploy.repair(world.manifest, world.target(), report)
-    assert any("half-copied" in a for a in actions)
+    assert any("interrupted move" in a for a in actions)
     assert not leftover.exists() and not in_game.exists()
+    # Moved aside, never deleted: it may be the only copy of a file.
+    kept = sorted(p.name for p in (paths.backups_dir(GAME) / deploy.SUPERSEDED_DIR).rglob("*") if p.is_file())
+    assert kept == sorted([leftover.name, in_game.name])
     assert deploy.verify(world.manifest, world.target()).ok
     world.purge()
     assert_vanilla(world)
@@ -382,23 +386,30 @@ def test_purge_after_game_folder_vanished(world):
     world.deploy()
     (backup,) = world.manifest.backups(GAME).values()
     shutil.rmtree(world.root)
-    dry = world.purge(dry_run=True)
+    # It may only be on a drive that isn't mounted: nothing is forgotten unless asked.
+    with pytest.raises(deploy.GameFolderGone, match="forget-missing"):
+        world.purge()
+    assert world.manifest.has_footprint(GAME) and Path(backup.backup).exists()
+    dry = world.purge(dry_run=True, forget_missing=True)
     assert world.manifest.has_footprint(GAME) and Path(backup.backup).exists()
     assert any("would keep" in w for w in dry.warnings)
-    result = world.purge()
-    assert any("no longer exist" in w or "does not exist" in w for w in result.warnings)
+    result = world.purge(forget_missing=True)
+    assert any("missing or empty" in w for w in result.warnings)
     assert not world.manifest.has_footprint(GAME)
     kept = list((paths.backups_dir(GAME) / deploy.SUPERSEDED_DIR).rglob("Fallout4.esm"))
     assert len(kept) == 1 and kept[0].read_text() == "vanilla esm"  # nothing deleted
     assert not world.manifest.game_state(GAME).deployed
     world.purge()  # nothing left to do, no error
+    world.purge(forget_missing=True)
 
 
 def test_purge_after_game_folder_vanished_and_target_moved_too(world, tmp_path):
     add_mod(world.manifest, "A", {"Data/A.esp": "a"})
     world.deploy()
     shutil.rmtree(world.root)
-    result = deploy.purge(world.manifest, GameTarget(GAME, tmp_path / "elsewhere"))
+    with pytest.raises(deploy.GameFolderGone):
+        deploy.purge(world.manifest, GameTarget(GAME, tmp_path / "elsewhere"))
+    result = deploy.purge(world.manifest, GameTarget(GAME, tmp_path / "elsewhere"), forget_missing=True)
     assert not result.failed
     assert not world.manifest.has_footprint(GAME)
 
@@ -483,4 +494,227 @@ def test_dry_run_reports_what_the_real_run_does(world, mode):
         real = run()
         assert not real.failed
         assert [(op.kind, op.path) for op in dry.done] == [(op.kind, op.path) for op in real.done], change
+    assert_vanilla(world)
+
+
+# ================================================================ second review round
+
+
+def _unmount(world) -> Path:
+    """Simulate the game's drive being unmounted: the folder disappears."""
+    away = world.root.with_name("unmounted")
+    os.rename(world.root, away)
+    return away
+
+
+def _remount(world, away: Path) -> None:
+    os.rename(away, world.root)
+
+
+@pytest.mark.parametrize("mode", ["symlink", "hardlink"])
+def test_purge_with_the_drive_unmounted_changes_nothing(world, mode):
+    world.mode = mode
+    add_mod(world.manifest, "A", {"Data/Fallout4.esm": "modded", "Data/A.esp": "a"})
+    world.deploy()
+    records = (world.manifest.deployed(GAME), world.manifest.backups(GAME), world.manifest.created_dirs(GAME))
+    away = _unmount(world)
+    with pytest.raises(deploy.GameFolderGone, match="mounted"):
+        world.purge()
+    with pytest.raises(deploy.DeployError):
+        world.deploy()
+    assert (world.manifest.deployed(GAME), world.manifest.backups(GAME),
+            world.manifest.created_dirs(GAME)) == records
+    _remount(world, away)
+    world.purge()
+    assert_vanilla(world)
+
+
+def test_empty_mount_point_is_treated_as_missing(world):
+    add_mod(world.manifest, "A", {"Data/Fallout4.esm": "modded"})
+    world.deploy()
+    away = _unmount(world)
+    world.root.mkdir()  # the empty mount point
+    with pytest.raises(deploy.GameFolderGone):
+        world.purge()
+    with pytest.raises(deploy.DeployError, match="empty"):
+        world.deploy()
+    assert os.listdir(world.root) == []  # nothing restored into it
+    report = deploy.verify(world.manifest, world.target())
+    assert report.root_missing and not report.ok
+    world.root.rmdir()
+    _remount(world, away)
+    world.purge()
+    assert_vanilla(world)
+
+
+@pytest.mark.parametrize("mode", ["symlink", "hardlink"])
+def test_verify_and_repair_with_the_drive_unmounted_change_nothing(world, mode):
+    world.mode = mode
+    a = add_mod(world.manifest, "A", {"Data/Fallout4.esm": "modded", "Data/NewMod/x.dds": "x"})
+    world.deploy()
+    records = (world.manifest.deployed(GAME), world.manifest.backups(GAME), world.manifest.created_dirs(GAME))
+    away = _unmount(world)
+    report = deploy.verify(world.manifest, world.target())
+    assert report.root_missing and not report.missing and not report.missing_dirs
+    actions = deploy.repair(world.manifest, world.target(), report)
+    assert len(actions) == 1 and "change nothing" in actions[0]
+    assert (world.manifest.deployed(GAME), world.manifest.backups(GAME),
+            world.manifest.created_dirs(GAME)) == records
+    _remount(world, away)
+    world.manifest.set_enabled(a.id, False)
+    world.deploy()
+    world.purge()
+    assert_vanilla(world)
+
+
+@pytest.mark.parametrize("mode", ["symlink", "hardlink"])
+def test_verify_after_the_game_moved_checks_the_new_folder(world, mode):
+    world.mode = mode
+    add_mod(world.manifest, "A", {"Data/Fallout4.esm": "modded", "Data/A.esp": "a"})
+    world.deploy()
+    moved = world.root.with_name("Fallout 4 moved")
+    os.rename(world.root, moved)
+    report = deploy.verify(world.manifest, world.target(root=moved))
+    assert report.moved_from == world.root and report.root == moved
+    assert not report.missing and report.ok
+    assert deploy.repair(world.manifest, world.target(root=moved), report) == []
+    assert len(world.manifest.deployed(GAME)) == 2  # live links stay recorded
+    deploy.purge(world.manifest, world.target(root=moved))
+    assert snapshot(moved) == world.vanilla
+    assert not world.manifest.has_footprint(GAME)
+
+
+def test_half_made_hardlink_at_an_original_is_not_a_held_original(world, monkeypatch):
+    world.mode = "hardlink"
+    add_mod(world.manifest, "A", {"Data/Fallout4.esm": "modded"})
+    with monkeypatch.context() as mp:
+        fail_once(mp, Manifest, "record_link")
+        with pytest.raises(Boom):
+            world.deploy()
+    report = deploy.verify(world.manifest, world.target())
+    assert not report.held_backups
+    deploy.repair(world.manifest, world.target(), report, release_held=True)
+    assert world.manifest.backups(GAME)  # the original stays tracked
+    world.deploy()
+    world.purge()
+    assert_vanilla(world)
+
+
+def test_case_renamed_folder_with_hardlink_is_not_a_held_original(world):
+    world.mode = "hardlink"
+    add_mod(world.manifest, "A", {"Data/Textures/Armor/a.dds": "mod a"})
+    world.deploy()
+    os.rename(world.path("Data/Textures"), world.path("Data/textures"))
+    report = deploy.verify(world.manifest, world.target())
+    assert not report.held_backups and not report.missing
+    assert report.case_moved == [("Data/Textures/Armor/a.dds", "Data/textures/Armor/a.dds")]
+    deploy.repair(world.manifest, world.target(), report, release_held=True)
+    world.deploy()
+    world.purge()
+    assert world.path("Data/textures/Armor/a.dds").read_text() == "vanilla armor a"
+    assert not world.manifest.has_footprint(GAME)
+
+
+def test_cross_device_move_makes_the_new_name_durable_before_deleting(world, monkeypatch):
+    events: list[str] = []
+    real_fsync_dir, real_unlink = deploy._fsync_dir, os.unlink
+
+    def fsync_dir(path):
+        events.append(f"fsync {path}")
+        real_fsync_dir(path)
+
+    def unlink(path, *a, **kw):
+        events.append(f"unlink {path}")
+        return real_unlink(path, *a, **kw)
+
+    add_mod(world.manifest, "A", {"Data/Fallout4.esm": "modded"})
+    exdev_between_game_and_data(monkeypatch)
+    monkeypatch.setattr(deploy, "_fsync_dir", fsync_dir)
+    monkeypatch.setattr(os, "unlink", unlink)
+    world.deploy()
+    events.clear()
+    world.purge()
+    original = str(world.path("Data/Fallout4.esm"))
+    fsync_at = events.index(f"fsync {world.path('Data')}")
+    backup_unlink = next(i for i, e in enumerate(events) if e.startswith("unlink") and "backups" in e)
+    assert fsync_at < backup_unlink, events
+    assert world.path("Data/Fallout4.esm").read_text() == "vanilla esm" and os.path.isfile(original)
+
+
+def test_switching_to_a_new_install_after_purge_leaves_records_behind(world, tmp_path):
+    add_mod(world.manifest, "A", {"Data/F4SE/Plugins/p.dll": "dll", "Data/Fallout4.esm": "modded"})
+    world.deploy()
+    world.path("Data/F4SE/Plugins/p.log").write_text("written by the plugin")  # keeps the folder
+    os.unlink(world.path("Data/Fallout4.esm"))
+    world.path("Data/Fallout4.esm").write_text("updated esm")  # holds the original
+    new = tmp_path / "New Install"
+    make_tree(new, {"Fallout4.exe": "exe", "Data/Fallout4.esm": "new vanilla"})
+    target = world.target(root=new)
+    with pytest.raises(deploy.DeployError, match="purge"):
+        deploy.deploy(world.manifest, target)
+    deploy.purge(world.manifest, target)  # cleans up the old folder
+    assert world.path("Data/F4SE/Plugins/p.log").exists()
+    result = deploy.deploy(world.manifest, target)  # no longer refused
+    assert not result.failed
+    assert any("switching" in w for w in result.warnings)
+    assert (new / "Data/F4SE/Plugins/p.dll").read_text() == "dll"
+    assert (new / "Data/Fallout4.esm").read_text() == "modded"
+    (backup,) = world.manifest.backups(GAME).values()
+    assert Path(backup.backup).read_text() == "new vanilla"
+    kept = list((paths.backups_dir(GAME) / deploy.SUPERSEDED_DIR).rglob("Fallout4.esm"))
+    assert [k.read_text() for k in kept] == ["vanilla esm"]
+    deploy.purge(world.manifest, target)
+    assert (new / "Data/Fallout4.esm").read_text() == "new vanilla"
+    assert not os.path.lexists(new / "Data/F4SE")
+    assert world.path("Data/F4SE/Plugins/p.log").exists()  # the old folder is never touched
+
+
+def test_temp_symlink_leftovers_are_found_and_moved_aside(world):
+    add_mod(world.manifest, "A", {"Data/Fallout4.esm": "modded"})
+    world.deploy()
+    game_tmp = world.path(f"Data/{deploy.TEMP_PREFIX}aaa")
+    game_tmp.symlink_to("/somewhere")
+    backup_tmp = paths.backups_dir(GAME) / f"{deploy.TEMP_PREFIX}bbb"
+    backup_tmp.symlink_to("/elsewhere")
+    report = deploy.verify(world.manifest, world.target())
+    assert sorted(report.temp_leftovers) == sorted([str(game_tmp), str(backup_tmp)])
+    deploy.repair(world.manifest, world.target(), report)
+    assert not os.path.lexists(game_tmp) and not os.path.lexists(backup_tmp)
+    world.purge()
+    assert_vanilla(world)
+
+
+def test_empty_user_folder_in_another_case_is_not_removed(world):
+    add_mod(world.manifest, "A", {"Data/NewMod/x.dds": "x"})
+    world.deploy()
+    os.unlink(world.path("Data/NewMod/x.dds"))
+    os.rmdir(world.path("Data/NewMod"))
+    world.path("Data/newmod").mkdir()  # the user's own, empty
+    world.purge()
+    assert world.path("Data/newmod").is_dir()
+    assert not world.manifest.has_footprint(GAME)
+
+
+def test_interrupted_first_link_counts_as_footprint_until_purged(world, monkeypatch):
+    add_mod(world.manifest, "A", {"Data/A.esp": "a"})
+    with monkeypatch.context() as mp:
+        fail_once(mp, Manifest, "record_link")
+        with pytest.raises(Boom):
+            world.deploy()
+    assert world.manifest.has_footprint(GAME)
+    result = world.purge()
+    assert not result.failed
+    assert_vanilla(world)  # including: no unfinished journal entries left
+
+
+def test_restorable_original_is_reported(world):
+    add_mod(world.manifest, "A", {"Data/Fallout4.esm": "modded"})
+    world.deploy()
+    os.unlink(world.path("Data/Fallout4.esm"))
+    world.path("Data/Fallout4.esm").write_text("updated esm")
+    world.purge()  # the original is held
+    os.unlink(world.path("Data/Fallout4.esm"))
+    report = deploy.verify(world.manifest, world.target())
+    assert [b.path for b in report.restorable] == ["Data/Fallout4.esm"] and not report.ok
+    world.purge()
     assert_vanilla(world)
