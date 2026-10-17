@@ -56,7 +56,7 @@ from typing import Sequence
 
 from bethmm import archive, paths, placement
 from bethmm.manifest import Manifest, ManifestError, ModFile, ModRecord
-from bethmm.nexus import parse_nexus_filename
+from bethmm.nexus import NexusInfo, parse_nexus_filename
 from bethmm.pathresolve import fold_path
 from bethmm.placement import PlacementPlan, Target
 
@@ -72,6 +72,7 @@ FALLBACK_NAME = "mod"
 _ARCHIVE_SUFFIXES = (".tar.gz", ".tar.bz2", ".tar.xz", ".tgz", ".7z", ".zip", ".rar", ".tar", ".gz", ".bz2", ".xz")
 _DUPLICATE_SUFFIX = re.compile(r"\s*\(\d+\)$")
 _WORKDIR_PREFIX = "install-"
+_PLUGIN_SUFFIXES = (".esp", ".esm", ".esl")
 
 
 class StagingError(Exception):
@@ -204,19 +205,25 @@ def _copy_folder(source: Path, dest: Path) -> list[str]:
 def suggested_name(prepared: Prepared) -> str:
     """Display name for the mod: the Nexus name from the archive file name,
     else the archive/folder name without extension."""
-    nexus = prepared.plan.nexus
-    if nexus is not None and nexus.is_nexus and nexus.display_name.strip():
-        return _clean_text(nexus.display_name) or FALLBACK_NAME
-    name = prepared.source.name.strip()
+    return archive_name(prepared.source.name, prepared.plan.nexus)
+
+
+def archive_name(file_name: str, nexus: NexusInfo | None = None) -> str:
+    """The display name the archive (or folder) *file_name* suggests; *nexus*
+    is its parsed Nexus file name, if already known."""
+    nexus = nexus if nexus is not None else parse_nexus_filename(file_name)
+    if nexus.is_nexus and nexus.display_name.strip():
+        return clean_text(nexus.display_name) or FALLBACK_NAME
+    name = file_name.strip()
     low = name.lower()
     for ext in _ARCHIVE_SUFFIXES:
         if low.endswith(ext) and len(name) > len(ext):
             name = _DUPLICATE_SUFFIX.sub("", name[: -len(ext)])
             break
-    return _clean_text(name) or FALLBACK_NAME
+    return clean_text(name) or FALLBACK_NAME
 
 
-def _clean_text(text: str) -> str:
+def clean_text(text: str) -> str:
     """*text* safe to store and print: control characters become spaces,
     undecodable bytes (lone surrogates) U+FFFD, whitespace collapsed."""
     out = []
@@ -280,10 +287,12 @@ def find_existing(manifest: Manifest, game_id: str, prepared: Prepared, name: st
     """An installed mod this one would update, or None:
 
     * a mod with the same name (case-insensitive; *name*, the name the user
-      gave, is tried first, then the name the archive suggests): when both
-      come from the same Nexus mod page always, otherwise only when they
-      share at least one file -- two unrelated mods may both be called "2K"
-      or "main";
+      gave, is tried first, then the name the archive suggests), or one
+      installed from an archive of that name (a mod the user renamed): when
+      both come from the same Nexus mod page always; otherwise only when it
+      looks like the same mod -- the same plugins, or at least half of the
+      installed mod's files. Two unrelated mods may both be called "2K" or
+      "main", and a patch or retexture shares only a few files;
     * else a mod with the same Nexus mod ID whose original download had the
       same Nexus file name, ignoring version numbers in it ("Cool Mod 1.2" ->
       "Cool Mod 1.3"). A mod the user renamed still gets updated, while
@@ -294,18 +303,29 @@ def find_existing(manifest: Manifest, game_id: str, prepared: Prepared, name: st
     nexus = prepared.plan.nexus
     is_nexus = nexus is not None and nexus.is_nexus
     dests = {fold_path(m.dest) for m in prepared.plan.mappings}
+    plugins = {d for d in dests if d.lower().endswith(_PLUGIN_SUFFIXES)}
 
     def related(mod: ModRecord) -> bool:
         if is_nexus and mod.nexus_id == nexus.mod_id:
             return True
         if is_nexus and mod.nexus_id is not None:
             return False  # another Nexus mod
-        return any(fold_path(f.dest) in dests for f in manifest.mod_files(mod.id))
+        old = {fold_path(f.dest) for f in manifest.mod_files(mod.id)}
+        old_plugins = {d for d in old if d.lower().endswith(_PLUGIN_SUFFIXES)}
+        return bool(old) and (bool(old_plugins & plugins) or 2 * len(old & dests) >= len(old))
 
-    for wanted in dict.fromkeys(_clean_text(n).casefold() for n in (name, suggested_name(prepared)) if n):
-        same_name = [m for m in mods if _clean_text(m.name).casefold() == wanted and related(m)]
+    def best(candidates: list[ModRecord]) -> ModRecord:
+        return min(candidates, key=lambda m: not (is_nexus and m.nexus_id == nexus.mod_id))
+
+    suggested = suggested_name(prepared)
+    for wanted in dict.fromkeys(clean_text(n).casefold() for n in (name, suggested) if n):
+        same_name = [m for m in mods if clean_text(m.name).casefold() == wanted and related(m)]
         if same_name:
-            return min(same_name, key=lambda m: not (is_nexus and m.nexus_id == nexus.mod_id))
+            return best(same_name)
+    renamed = [m for m in mods if m.source_archive and related(m)
+               and archive_name(Path(m.source_archive).name).casefold() == suggested.casefold()]
+    if renamed:
+        return best(renamed)
     if is_nexus:
         for m in mods:
             if m.nexus_id != nexus.mod_id or not m.source_archive:
@@ -326,7 +346,7 @@ def base_name(name: str, *versions: str | None) -> str:
     """*name* without version numbers (also the given *versions*, however
     they are written in it), folded: what stays the same from one version of
     a Nexus file to the next. Plain numbers ("PART 2") are kept."""
-    text = _clean_text(name)
+    text = clean_text(name)
     for version in versions:
         m = re.fullmatch(r"v?(\d+(?:[._-]\d+)+)([A-Za-z]*)", (version or "").strip())
         if m is None:
@@ -417,7 +437,7 @@ def commit(
             raise StagingError(f"{current.name!r} is installed for {current.game_id}, not {game_id}")
 
     if name is not None:
-        mod_name = _clean_text(name)
+        mod_name = clean_text(name)
         if not mod_name:
             raise StagingError("the mod name is empty")
     else:

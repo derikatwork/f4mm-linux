@@ -48,7 +48,8 @@ tests), `--no-system-packages` (never call apt), `--uninstall` (removes the app
 and the `bethmm` command; your mods, backups and settings stay — it refuses while
 mods are still deployed in a game folder and shows what is left; run
 `bethmm purge --all` first), `--force` (install even as root, or uninstall even
-though mods are still deployed).
+though mods are still deployed). If an update of your distro broke the app's
+environment, running `./install.sh` again recreates it.
 
 `.rar` support comes from `7zip-rar`, which lives in Ubuntu's multiverse repository.
 If the script says it isn't available: `sudo add-apt-repository multiverse` and run
@@ -104,9 +105,11 @@ enabled mod provides that file any more.
 Installing a newer version of a mod you already have updates it in place, keeping
 its position and enabled state. An archive counts as a newer version when
 
-* it has the same name as an installed mod and either comes from the same Nexus
-  mod page or shares at least one file with it (two unrelated mods may both be
-  called "2K" or "main"), or
+* it has the same name as an installed mod (or as the archive that mod was
+  installed from, so a mod you renamed still counts) and either comes from the
+  same Nexus mod page or looks like the same mod: the same plugins, or at least
+  half of its files. Two unrelated mods may both be called "2K" or "main", and a
+  patch or retexture shares only a few files; or
 * it comes from the same Nexus mod page and its Nexus file name is the same apart
   from version numbers ("Cool Mod 1.2" → "Cool Mod 1.3"). Other files of the same
   page — an optional patch, "PART 2" — are separate mods.
@@ -128,7 +131,7 @@ bethmm deploy             # put the enabled mods back (also re-creates links tha
 bethmm verify             # compare the game folder with what the app recorded
 bethmm verify --repair    # fix what is safe to fix, then redeploy (or purge again if purged)
 bethmm status             # per game: mods, links, backups
-bethmm status --deployed-only   # what the app still has in game folders
+bethmm status --deployed-only   # what the app still has in game folders (exit status 3 if anything)
 bethmm history            # the latest file operations
 ```
 
@@ -153,11 +156,14 @@ original back, or `verify --repair --release-held` stops tracking the old origin
 
 If you moved the game to another folder (and pointed the app there with
 `bethmm override --root`), `purge` cleans up the new folder; deploy again
-afterwards. If you installed the game again somewhere else, `purge` cleans up the
-old folder first. If the game folder is missing or empty, `purge` refuses and
-changes nothing — it may only be on a drive that isn't mounted. When the game is
-really gone, `purge --forget-missing` forgets the app's links there and moves the
-originals it had backed up to `backups/<game>/.superseded/` (nothing is deleted).
+afterwards (the app checks that its links really are in the new folder). If you
+installed the game again somewhere else, `purge` cleans up the old folder first.
+If the folder the mods were deployed into is missing or empty, `purge` refuses
+and changes nothing — it may only be on a drive that isn't mounted, even if
+another copy of the game is found. When that install is really gone,
+`purge --forget-missing` forgets the app's links there and moves the originals it
+had backed up to `backups/<game>/.superseded/` (nothing is deleted); this works
+for a game that is no longer found, too.
 
 ### Dry run
 

@@ -18,7 +18,7 @@ from bethmm.manifest import Manifest
 
 import test_deploy_adversarial as adv
 from helpers import make_tree
-from test_deploy import GAME, add_mod, assert_deployed, assert_vanilla, snapshot, staged
+from test_deploy import GAME, VANILLA, add_mod, assert_deployed, assert_vanilla, snapshot, staged
 from test_deploy_adversarial import Boom, Killed, fail_once, verify_and_repair
 
 # The adversarial suite's fixtures: a fast manifest and a fake game folder.
@@ -392,9 +392,9 @@ def test_purge_after_game_folder_vanished(world):
     assert world.manifest.has_footprint(GAME) and Path(backup.backup).exists()
     dry = world.purge(dry_run=True, forget_missing=True)
     assert world.manifest.has_footprint(GAME) and Path(backup.backup).exists()
-    assert any("would keep" in w for w in dry.warnings)
+    assert any("would keep" in n for n in dry.forgotten)
     result = world.purge(forget_missing=True)
-    assert any("missing or empty" in w for w in result.warnings)
+    assert any("forgot" in n for n in result.forgotten)
     assert not world.manifest.has_footprint(GAME)
     kept = list((paths.backups_dir(GAME) / deploy.SUPERSEDED_DIR).rglob("Fallout4.esm"))
     assert len(kept) == 1 and kept[0].read_text() == "vanilla esm"  # nothing deleted
@@ -718,3 +718,166 @@ def test_restorable_original_is_reported(world):
     assert [b.path for b in report.restorable] == ["Data/Fallout4.esm"] and not report.ok
     world.purge()
     assert_vanilla(world)
+
+
+# ================================================================ third review round
+
+
+def _second_install(tmp_path) -> Path:
+    other = tmp_path / "Fallout 4 copy"
+    make_tree(other, dict(VANILLA))
+    return other
+
+
+@pytest.mark.parametrize("mode", ["symlink", "hardlink"])
+def test_unmounted_drive_with_a_second_install_is_not_a_move(world, tmp_path, mode):
+    """The game is found in another folder while the drive with the modded one
+    isn't mounted: that other copy is not where the mods are."""
+    world.mode = mode
+    add_mod(world.manifest, "A", {"Data/Fallout4.esm": "modded", "Data/A.esp": "a"})
+    world.deploy()
+    other = _second_install(tmp_path)
+    other_snapshot = snapshot(other)
+    records = (world.manifest.deployed(GAME), world.manifest.backups(GAME))
+    away = _unmount(world)
+    target = world.target(root=other)
+    with pytest.raises(deploy.GameFolderGone, match="not in"):
+        deploy.purge(world.manifest, target)
+    report = deploy.verify(world.manifest, target)
+    assert report.root_missing and report.moved_from is None
+    assert "change nothing" in deploy.repair(world.manifest, target, report)[0]
+    with pytest.raises(deploy.DeployError, match="forget-missing"):
+        deploy.deploy(world.manifest, target)
+    assert (world.manifest.deployed(GAME), world.manifest.backups(GAME)) == records
+    assert snapshot(other) == other_snapshot
+    _remount(world, away)
+    world.purge()
+    assert_vanilla(world)
+
+
+def test_old_folder_left_as_empty_folders_after_a_move(world):
+    """Some ways of moving leave the old folder tree behind, empty."""
+    add_mod(world.manifest, "A", {"Data/Fallout4.esm": "modded", "Data/A.esp": "a"})
+    world.deploy()
+    moved = world.root.with_name("Fallout 4 moved")
+    shutil.copytree(world.root, moved, symlinks=True)
+    for dirpath, _dirs, files in os.walk(world.root):
+        for name in files:
+            os.unlink(os.path.join(dirpath, name))
+    result = deploy.purge(world.manifest, world.target(root=moved))
+    assert not result.failed and any("moved" in w for w in result.warnings)
+    assert contents(moved) == {k: v[:3] for k, v in world.vanilla.items()}  # (copied: new inodes)
+    assert not [f for _d, _s, f in os.walk(world.root) if f]  # nothing restored into the empty tree
+
+
+def test_data_folder_on_a_drive_that_is_not_mounted(world, tmp_path):
+    add_mod(world.manifest, "A", {"Data/Fallout4.esm": "modded"})
+    world.deploy()
+    elsewhere = tmp_path / "second drive" / "Data"
+    elsewhere.parent.mkdir()
+    os.rename(world.path("Data"), elsewhere)
+    os.symlink(elsewhere, world.path("Data"))
+    os.rename(elsewhere.parent, tmp_path / "unmounted")
+    with pytest.raises(deploy.GameFolderGone):
+        world.purge()
+    assert world.manifest.deployed(GAME)
+    os.rename(tmp_path / "unmounted", elsewhere.parent)
+    world.purge()
+    assert (world.path("Data/Fallout4.esm")).read_text() == "vanilla esm"
+
+
+def test_hardlink_whose_staged_file_was_replaced_is_not_a_held_original(world):
+    world.mode = "hardlink"
+    mod = add_mod(world.manifest, "A", {"Data/Fallout4.esm": "modded"})
+    world.deploy()
+    staged_file = staged(mod, "Data/Fallout4.esm")
+    replacement = staged_file.with_name("new")
+    replacement.write_text("modded v2")
+    os.replace(replacement, staged_file)
+    report = deploy.verify(world.manifest, world.target())
+    assert not report.held_backups
+    deploy.repair(world.manifest, world.target(), report, release_held=True)
+    assert world.manifest.backups(GAME)
+    world.purge()
+    assert world.path("Data/Fallout4.esm").read_text() == "vanilla esm"
+
+
+def test_old_install_deleted_new_install_elsewhere(world, tmp_path):
+    add_mod(world.manifest, "A", {"Data/Fallout4.esm": "modded"})
+    world.deploy()
+    shutil.rmtree(world.root)
+    new = _second_install(tmp_path)
+    target = world.target(root=new)
+    with pytest.raises(deploy.DeployError, match="forget-missing"):
+        deploy.deploy(world.manifest, target)
+    with pytest.raises(deploy.GameFolderGone):
+        deploy.purge(world.manifest, target)
+    result = deploy.purge(world.manifest, target, forget_missing=True)
+    assert result.forgotten and snapshot(new) == snapshot(new)
+    assert world.manifest.left_alone(GAME) == {}
+    deploy.deploy(world.manifest, target)
+    assert (new / "Data/Fallout4.esm").read_text() == "modded"
+    deploy.purge(world.manifest, target)
+    assert (new / "Data/Fallout4.esm").read_text() == "vanilla esm"
+
+
+def test_left_alone_records_of_the_old_folder_dont_apply_to_a_new_one(world, tmp_path):
+    add_mod(world.manifest, "A", {"Data/Textures/Armor/a.dds": "mod a"})
+    world.deploy()
+    os.unlink(world.path("Data/Textures/Armor/a.dds"))
+    world.path("Data/Textures/Armor/a.dds").write_text("from a game update")
+    world.purge()
+    deploy.repair(world.manifest, world.target(), deploy.verify(world.manifest, world.target()), release_held=True)
+    assert world.manifest.left_alone(GAME) and not world.manifest.has_footprint(GAME)
+    new = _second_install(tmp_path)
+    result = deploy.deploy(world.manifest, world.target(root=new))
+    assert not result.plan.blocked
+    assert (new / "Data/Textures/Armor/a.dds").read_text() == "mod a"
+    assert world.manifest.left_alone(GAME) == {}
+
+
+def test_never_deploys_into_an_empty_folder(world, tmp_path):
+    add_mod(world.manifest, "A", {"Data/A.esp": "a"})
+    empty = tmp_path / "mount point"
+    empty.mkdir()
+    with pytest.raises(deploy.DeployError, match="empty"):
+        deploy.deploy(world.manifest, world.target(root=empty))
+    assert os.listdir(empty) == []
+
+
+def test_user_folder_in_another_case_survives_a_deploy_then_purge(world):
+    add_mod(world.manifest, "A", {"Data/NewMod/x.dds": "x"})
+    world.deploy()
+    shutil.rmtree(world.path("Data/NewMod"))
+    world.path("Data/newmod").mkdir()  # the user's own
+    world.deploy()  # links into the user's folder
+    assert world.path("Data/newmod/x.dds").read_text() == "x"
+    world.purge()
+    assert world.path("Data/newmod").is_dir()
+    assert not world.manifest.has_footprint(GAME)
+
+
+def test_interrupted_link_in_a_folder_renamed_in_another_case(world, monkeypatch):
+    world.mode = "hardlink"
+    add_mod(world.manifest, "A", {"Data/Textures/Armor/a.dds": "mod a"})
+    with monkeypatch.context() as mp:
+        fail_once(mp, Manifest, "record_link")
+        with pytest.raises(Boom):
+            world.deploy()
+    os.rename(world.path("Data/Textures"), world.path("Data/textures"))
+    world.purge()
+    assert world.path("Data/textures/Armor/a.dds").read_text() == "vanilla armor a"
+    assert not world.manifest.has_footprint(GAME)
+
+
+def test_unprovable_link_of_an_interrupted_run_keeps_its_journal_entry(world, monkeypatch):
+    world.mode = "hardlink"
+    mod = add_mod(world.manifest, "A", {"Data/Fallout4.esm": "modded"})
+    with monkeypatch.context() as mp:
+        fail_once(mp, Manifest, "record_link")
+        with pytest.raises(Boom):
+            world.deploy()
+    staged(mod, "Data/Fallout4.esm").unlink()  # the link can't be proven to be the app's any more
+    world.purge()
+    assert world.manifest.unfinished_journal(GAME)  # still evidence: status stays busy
+    assert world.manifest.has_footprint(GAME)

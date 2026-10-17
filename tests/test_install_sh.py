@@ -46,8 +46,8 @@ def fake_install(tmp_path: Path, exit_code: int, output: str) -> dict:
     home = tmp_path / "home"
     venv = home / ".local/share/beth-mod-manager/venv"
     (venv / "bin").mkdir(parents=True)
-    python = venv / "bin" / "python"  # "-c 'import bethmm'" works; "-m bethmm status ..." answers
-    python.write_text(f"#!/bin/sh\n[ \"$1\" = -c ] && exit 0\necho '{output}'\nexit {exit_code}\n")
+    python = venv / "bin" / "python"  # the probe ('import bethmm.cli') works; running main() answers
+    python.write_text(f"#!/bin/sh\ncase \"$3\" in *main*) echo '{output}'; exit {exit_code};; esac\nexit 0\n")
     python.chmod(0o755)
     bethmm = venv / "bin" / "bethmm"
     bethmm.write_text("#!/bin/sh\nexit 0\n")
@@ -60,7 +60,7 @@ def fake_install(tmp_path: Path, exit_code: int, output: str) -> dict:
 
 
 def test_uninstall_refuses_while_deployed_and_says_why(tmp_path):
-    env = fake_install(tmp_path, 1, "Fallout 4: 2 link(s) in /games/Fallout 4")
+    env = fake_install(tmp_path, 3, "Fallout 4: 2 link(s) in /games/Fallout 4")
     result = run("--uninstall", env=env)
     assert result.returncode == 1
     assert "2 link(s)" in result.stderr and "purge --all" in result.stderr
@@ -81,8 +81,25 @@ def test_uninstall_when_nothing_is_deployed(tmp_path):
     assert "Kept" in result.stdout
 
 
+def test_uninstall_when_the_check_fails_says_so(tmp_path):
+    env = fake_install(tmp_path, 1, "error: the manifest is busy")
+    result = run("--uninstall", env=env)
+    assert result.returncode == 1
+    assert "could not check" in result.stderr and "still has files" not in result.stderr
+    assert (Path(env["HOME"]) / ".local/share/beth-mod-manager/venv").exists()
+
+
+def test_uninstall_with_nothing_installed_fails(tmp_path):
+    home = tmp_path / "empty home"
+    home.mkdir()
+    env = {k: v for k, v in os.environ.items() if not k.startswith("XDG_")}
+    env["HOME"] = str(home)
+    result = run("--uninstall", env=env)
+    assert result.returncode == 1 and "no installation found" in result.stderr
+
+
 def test_uninstall_force_skips_the_check(tmp_path):
-    env = fake_install(tmp_path, 1, "Fallout 4: 2 link(s)")
+    env = fake_install(tmp_path, 3, "Fallout 4: 2 link(s)")
     result = run("--uninstall", "--force", env=env)
     assert result.returncode == 0, result.stderr
     assert not (Path(env["HOME"]) / ".local/share/beth-mod-manager/venv").exists()
@@ -91,7 +108,7 @@ def test_uninstall_force_skips_the_check(tmp_path):
 def test_uninstall_with_a_broken_environment_still_checks(tmp_path):
     """The venv's Python is gone (e.g. after a distro upgrade): the check runs
     with the app in this folder, and nothing deployed means it goes ahead."""
-    env = fake_install(tmp_path, 1, "never asked")
+    env = fake_install(tmp_path, 3, "never asked")
     home = Path(env["HOME"])
     (home / ".local/share/beth-mod-manager/venv/bin/python").unlink()
     (home / ".local/share/beth-mod-manager/venv/bin/python").symlink_to("/nonexistent/python3.11")

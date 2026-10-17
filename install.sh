@@ -61,7 +61,7 @@ while [ $# -gt 0 ]; do
 done
 
 # Under sudo, $HOME is root's: an install would be root's, an uninstall would find nothing.
-if [ "$(id -u)" -eq 0 ] && [ "$FORCE" -eq 0 ] && { [ "$UNINSTALL" -eq 0 ] || [ -n "${SUDO_USER:-}" ]; }; then
+if [ "$(id -u)" -eq 0 ] && [ "$FORCE" -eq 0 ] && { [ "$UNINSTALL" -eq 0 ] || [ -n "${SUDO_USER:-}${PKEXEC_UID:-}" ]; }; then
     die "run this as your normal user, not with sudo (it asks for sudo itself when needed)"
 fi
 
@@ -91,18 +91,31 @@ confirm() {
 
 if [ "$UNINSTALL" -eq 1 ]; then
     step "Uninstalling $APP_NAME"
+    if [ ! -e "$VENV" ] && [ ! -L "$LAUNCHER" ]; then
+        die "no installation found in $DATA_DIR (for this user: $HOME)"
+    fi
     if [ -e "$VENV" ] && [ "$FORCE" -eq 0 ]; then
-        # The installed app answers, or (if its Python is gone) the app in this folder.
-        if "$VENV/bin/python" -c 'import bethmm' >/dev/null 2>&1; then
-            check=("$VENV/bin/python" -m bethmm status --deployed-only)
-        elif PY="$(find_python)"; then
-            check=(env PYTHONPATH="$REPO_DIR" "$PY" -m bethmm status --deployed-only)
+        # The installed app answers, or (if its Python is gone) the app in this
+        # folder. -I: a 'bethmm' folder in the current directory can't stand in.
+        probe='import bethmm.cli'
+        run='import sys; from bethmm.cli import main; sys.exit(main(["status", "--deployed-only"]))'
+        if "$VENV/bin/python" -I -c "$probe" >/dev/null 2>&1; then
+            check=("$VENV/bin/python" -I -c "$run")
+        elif PY="$(find_python)" && "$PY" -I -c "import sys; sys.path.insert(0, sys.argv[1]); $probe" "$REPO_DIR" >/dev/null 2>&1; then
+            check=("$PY" -I -c "import sys; sys.path.insert(0, sys.argv[1]); $run" "$REPO_DIR")
         else
-            die "can't run the app to check that no mods are deployed (no Python 3.11+ found); install python3, or use --force"
+            die "can't run the app to check that no mods are deployed (its environment is broken and no usable Python 3.11+ with python3-yaml was found); fix that, or use --force"
         fi
-        if ! status="$("${check[@]}" 2>&1)"; then
+        set +e
+        status="$("${check[@]}" 2>&1)"
+        code=$?
+        set -e
+        if [ "$code" -eq 3 ]; then
             printf '%s\n' "$status" >&2
             die "the app still has files in a game folder (see above). Run 'bethmm purge --all' first, or --force to uninstall anyway"
+        elif [ "$code" -ne 0 ]; then
+            printf '%s\n' "$status" >&2
+            die "could not check whether mods are still deployed (see above); fix that, or use --force"
         fi
         [ -z "$status" ] || say "$status"
     fi
@@ -210,13 +223,15 @@ command -v 7z >/dev/null 2>&1 || command -v 7zz >/dev/null 2>&1 || die "7z is st
 # ------------------------------------------------------------------ app
 
 step "Installing $APP_NAME into $VENV"
-if [ -e "$VENV" ] && ! python_ok "$VENV/bin/python"; then
-    say "the existing environment in $VENV can't be used (its Python is gone or too old); recreating it"
+# A distro upgrade can leave the environment's Python gone, too old, or a new
+# version that doesn't see the packages installed for the old one.
+if [ -e "$VENV" ] && ! "$VENV/bin/python" -I -c 'import sys, pip; sys.exit(sys.version_info < (3, 11))' >/dev/null 2>&1; then
+    say "the existing environment in $VENV can't be used (its Python changed); recreating it"
     rm -rf "$VENV"
 fi
 if [ ! -x "$VENV/bin/python" ]; then
     mkdir -p "$DATA_DIR"
-    "$PY" -m venv "$VENV"
+    "$(readlink -f "$PY")" -m venv "$VENV"  # the versioned binary: an upgrade can't swap it silently
 fi
 EXTRAS=""
 [ "$DEV" -eq 1 ] && EXTRAS="[dev]"

@@ -348,7 +348,7 @@ def test_status_deployed_only_and_history(home, fo4, tmp_path, capsys):
     assert main(["status", "--deployed-only"]) == 0
     a = mod_zip(tmp_path, "A-1-1-0.zip", {"A.esp": esp()})
     assert main(["install", str(a), "--yes"]) == 0
-    assert main(["status", "--deployed-only"]) == 1
+    assert main(["status", "--deployed-only"]) == 3
     assert main(["status"]) == 0
     assert "1 mod(s), 1 enabled; 1 link(s)" in capsys.readouterr().out
     assert main(["history"]) == 0
@@ -500,7 +500,7 @@ def test_status_deployed_only_lists_what_is_left(home, fo4, tmp_path, capsys):
     assert main(["status", "--deployed-only"]) == 0
     assert main(["install", str(a), "--yes"]) == 0
     capsys.readouterr()
-    assert main(["status", "--deployed-only"]) == 1
+    assert main(["status", "--deployed-only"]) == 3
     out = capsys.readouterr().out
     assert "2 link(s)" in out and "1 original game file(s)" in out and "purge" in out
     assert main(["purge", "--yes"]) == 0
@@ -515,7 +515,7 @@ def test_purge_after_the_game_folder_is_gone(home, fo4, tmp_path, capsys):
     capsys.readouterr()
     assert main(["purge", "--all", "--yes"]) == 1  # maybe just not mounted: refuses
     assert "--forget-missing" in capsys.readouterr().out
-    assert main(["status", "--deployed-only"]) == 1
+    assert main(["status", "--deployed-only"]) == 3
     assert main(["purge", "--all", "--yes", "--forget-missing"]) == 0
     out = capsys.readouterr().out
     assert "superseded" in out
@@ -601,7 +601,7 @@ def test_interrupted_first_install_is_seen_by_status_and_purge_all(home, fo4, tm
     monkeypatch.setattr(Manifest, "record_link", real)
     assert (fo4 / "Data" / "A.esp").is_symlink()
     capsys.readouterr()
-    assert main(["status", "--deployed-only"]) == 1
+    assert main(["status", "--deployed-only"]) == 3
     assert "interrupted" in capsys.readouterr().out
     assert main(["purge", "--all", "--yes"]) == 0
     assert not os.path.lexists(fo4 / "Data" / "A.esp")
@@ -670,3 +670,90 @@ def test_install_dry_run_refuses_unusable_file_names_cleanly(home, fo4, tmp_path
         result = main(["install", str(src), *extra])
         err = capsys.readouterr().err
         assert result == 1 and "error:" in err and "Traceback" not in err, extra
+
+
+# ---------------------------------------------------------------- third review round
+
+
+def test_purge_forget_missing_for_a_game_that_is_no_longer_found(home, fo4, tmp_path, capsys):
+    a = mod_zip(tmp_path, "A-1-1-0.zip", {"textures/vanilla.dds": b"mod", "A.esp": esp()})
+    assert main(["install", str(a), "--yes"]) == 0
+    shutil.rmtree(home / "Games" / "fallout-4")
+    assert main(["games", "--rescan"]) == 0
+    capsys.readouterr()
+    assert main(["verify", "--game", "fallout4"]) == 1
+    assert "missing or empty" in capsys.readouterr().out
+    assert main(["purge", "--game", "fallout4", "--yes"]) == 1
+    assert main(["purge", "--game", "fallout4", "--forget-missing", "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert "would forget" in out.lower() and "nothing would change" not in out.lower()
+    assert main(["purge", "--game", "fallout4", "--forget-missing", "--yes"]) == 0
+    out = capsys.readouterr().out
+    assert "Forgot what the app had" in out and "'bethmm deploy' puts them back" not in out
+    assert main(["status", "--deployed-only"]) == 0
+
+
+def test_install_dry_run_with_an_odd_name_matches_the_real_install(home, fo4, tmp_path, capsys):
+    a = mod_zip(tmp_path, "Good.zip", {"Good.esp": esp()})
+    odd = "G" + b"\xff".decode("utf-8", "surrogateescape") + "ood"
+    assert main(["install", str(a), "--name", odd, "--dry-run"]) == 0
+    assert "Traceback" not in capsys.readouterr().err
+    assert main(["install", str(a), "--name", odd, "--yes"]) == 0
+    with Manifest() as m:
+        assert [x.name for x in m.mods("fallout4")] == ["G�ood"]
+
+
+def test_interrupted_uninstall_leaves_a_folder_verify_repair_deletes(home, fo4, tmp_path, monkeypatch, capsys):
+    from bethmm import staging
+    a = mod_zip(tmp_path, "Cool Mod-555-1-0-1700000000.zip", {"Cool.esp": esp()})
+    assert main(["install", str(a), "--yes"]) == 0
+    with Manifest() as m:
+        folder = m.find_mod("fallout4", "Cool Mod").staging_dir()
+
+    def killed(path):
+        raise KeyboardInterrupt
+
+    with monkeypatch.context() as mp:
+        mp.setattr(staging, "remove_staging", killed)
+        assert main(["uninstall", "Cool Mod", "--yes"]) == 130
+    assert folder.is_dir()
+    assert main(["verify", "--repair"]) == 0
+    assert not folder.exists()
+
+
+def test_retexture_with_the_same_generic_name_is_a_separate_mod(home, fo4, tmp_path, capsys):
+    main_zip = mod_zip(tmp_path, "main.zip", {"ArmorMod.esp": esp(), "textures/armor/a.dds": b"a",
+                                              "textures/armor/b.dds": b"b", "meshes/armor/a.nif": b"n"})
+    retex = mod_zip(tmp_path, "main (1).zip", {"textures/armor/a.dds": b"4K"})
+    assert main(["install", str(main_zip), "--yes"]) == 0
+    capsys.readouterr()
+    assert main(["install", str(retex), "--yes"]) == 0
+    assert "--replace" in capsys.readouterr().out
+    with Manifest() as m:
+        assert len(m.mods("fallout4")) == 2
+    assert (fo4 / "Data" / "ArmorMod.esp").is_file()
+    assert (fo4 / "Data" / "textures" / "armor" / "a.dds").read_bytes() == b"4K"
+
+
+def test_a_renamed_mod_is_still_updated(home, fo4, tmp_path, capsys):
+    for n, files in enumerate(({"CoolMod.esp": esp(), "textures/v1.dds": b"1"},
+                               {"CoolMod.esp": esp(), "textures/v2.dds": b"2"},
+                               {"CoolMod.esp": esp(), "textures/v3.dds": b"3"}), start=1):
+        (tmp_path / f"v{n}").mkdir()
+        archive = mod_zip(tmp_path / f"v{n}", "CoolMod.zip", files)
+        extra = ["--name", "Cool Mod 2"] if n == 2 else []
+        assert main(["install", str(archive), "--yes", *extra]) == 0
+    with Manifest() as m:
+        assert [x.name for x in m.mods("fallout4")] == ["Cool Mod 2"]
+    assert not os.path.lexists(fo4 / "Data" / "textures" / "v2.dds")
+    assert (fo4 / "Data" / "textures" / "v3.dds").read_bytes() == b"3"
+
+
+def test_install_plan_labels_files_of_the_version_it_replaces(home, fo4, tmp_path, capsys):
+    v1 = mod_zip(tmp_path, "Cool Mod-555-1-0-1700000000.zip", {"Cool.esp": esp()})
+    v2 = mod_zip(tmp_path, "Cool Mod-555-2-0-1700000100.zip", {"Cool.esp": esp()})
+    assert main(["install", str(v1), "--yes"]) == 0
+    capsys.readouterr()
+    assert main(["install", str(v2), "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert "replaces the previous version's file" in out and "stays installed" not in out

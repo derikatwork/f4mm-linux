@@ -289,23 +289,27 @@ def _remove_stale_extractions(tmp: Path) -> None:
             _remove_tree(Path(entry.path))
 
 
-def link_owners(game_id: str) -> dict[str, str]:
-    """Folded path -> name of the installed mod whose link the app put there
-    (read-only; empty when nothing was ever installed)."""
-    if not paths.manifest_path().exists():
-        return {}
-    try:
-        with Manifest() as manifest:
-            names = {m.id: m.name for m in manifest.mods(game_id)}
-            return {key: names.get(d.mod_id, "another mod") for key, d in manifest.deployed(game_id).items()}
-    except ManifestError:
-        return {}
+def link_owners(game_id: str, manifest: Manifest | None = None) -> dict[str, tuple[int, str]]:
+    """Folded path -> (id, name) of the installed mod whose link the app put
+    there (read-only; empty when nothing was ever installed)."""
+    if manifest is None:
+        if not paths.manifest_path().exists():
+            return {}
+        try:
+            with Manifest() as opened:
+                return link_owners(game_id, opened)
+        except ManifestError:
+            return {}
+    names = {m.id: m.name for m in manifest.mods(game_id)}
+    return {key: (d.mod_id, names.get(d.mod_id, "another mod")) for key, d in manifest.deployed(game_id).items()}
 
 
 def _resolve_against_game(plan: PlacementPlan, game: DiscoveredGame,
-                          owners: dict[str, str] | None = None) -> list[dict]:
+                          owners: dict[str, tuple[int, str]] | None = None,
+                          replacing: int | None = None) -> list[dict]:
     """Where each mapping would land in the real game folder (read-only).
-    *owners* (from :func:`link_owners`) tells the app's links from game files."""
+    *owners* (from :func:`link_owners`) tells the app's links from game
+    files; *replacing* is the mod this one updates."""
     if not game.root.is_dir():
         return []
     resolver = CaseResolver(game.root)
@@ -316,8 +320,10 @@ def _resolve_against_game(plan: PlacementPlan, game: DiscoveredGame,
         owner = owners.get(fold_path(str(r.rel)))
         if r.type_conflict:
             status = "conflict: a folder/file of the other type already exists there"
+        elif r.exists_on_disk and owner is not None and owner[0] == replacing:
+            status = "replaces the previous version's file"
         elif r.exists_on_disk and owner is not None:
-            status = f"overrides {owner} (its file stays installed)"
+            status = f"overrides {owner[1]} (its file stays installed)"
         elif r.exists_on_disk:
             status = "replaces an existing game file (it would be backed up)"
         elif r.exists:
