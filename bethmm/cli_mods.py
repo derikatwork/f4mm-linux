@@ -234,6 +234,8 @@ def _describe_op(op: deploy.Op, names: dict[int, str]) -> str:
         return f"forget   {op.path}  ({op.note})"
     if op.kind == "dropbackup":
         return f"drop     {op.source}  (spare copy: the original {op.path} is back in place)"
+    if op.kind == "rerecord":
+        return f"record   {op.path}  (the app's link, {op.note}: its folder was renamed)"
     if op.kind in ("unlink", "rmdir") and op.note:
         return f"{op.kind:<8} {op.path}  ({op.note})"
     return f"{op.kind:<8} {op.path}"
@@ -731,10 +733,12 @@ def cmd_verify(args) -> int:
         retired, unknown = _unused_staging(manifest, game_id)
         problems = not report.ok or bool(retired)
         if report.root_missing:
-            print(f"{name}: the game folder {report.root} is missing or empty, so nothing was checked.")
-            print("  If it is on a drive that isn't mounted, mount it and run this again. If the game is gone,")
+            print(f"{name}: the game folder can't be used ({report.missing_reason}), so nothing was checked.")
+            print("  If it is on a drive that isn't mounted, mount it and run this again. If that install is gone,")
             print(f"  'bethmm purge --forget-missing --game {game_id}' forgets the app's links there.")
             return 1
+        for note in report.notes:
+            print(f"{name}: note: {note}")
         if not problems:
             print(f"{name}: everything the app deployed is in place.")
         else:
@@ -771,6 +775,10 @@ def cmd_verify(args) -> int:
             print(f"  note: the link {old} is now at {now} (a folder was renamed); the next deploy records that")
         for folder in unknown:
             print(f"  note: {folder} is in the mods folder, but no installed mod uses it; the app leaves it alone")
+        if report.links_elsewhere:
+            print(f"  {len(report.links_elsewhere)} link(s) into the mods folder are in {target.root}, which is not "
+                  f"the folder the mods were deployed into ({report.root}); left alone, e.g. "
+                  f"{report.links_elsewhere[0]}. If that is the install you play, purge here and deploy there.")
         if not problems:
             if args.repair and not dry:
                 remove_leftovers()

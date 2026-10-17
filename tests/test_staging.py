@@ -901,7 +901,10 @@ def test_file_operations_are_logged(tmp_path, manifest, caplog):
     assert any(m.startswith("COPY ") for m in messages)
     assert any(m.startswith("MOVE ") and str(result.mod.staging_dir()) in m for m in messages)
     assert any(m.startswith("DELETE ") and str(prepared.workdir) in m for m in messages)
-    assert any(m.startswith("DELETE ") and str(result.mod.staging_dir()) in m for m in messages)
+    # Renamed first (so an interrupted deletion leaves a folder the app knows), then deleted.
+    doomed = result.mod.staging_dir().with_name(f".{result.mod.folder}{staging.DELETING_SUFFIX}")
+    assert any(m.startswith("RENAME ") and str(result.mod.staging_dir()) in m for m in messages)
+    assert any(m.startswith("DELETE ") and str(doomed) in m for m in messages)
 
 
 @needs_7z

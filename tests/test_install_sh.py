@@ -126,3 +126,14 @@ def test_uninstall_under_sudo_refuses(tmp_path):
     env["SUDO_USER"] = "someone"
     result = run("--uninstall", env=env)
     assert result.returncode == 1 and "not with sudo" in result.stderr
+
+
+def test_uninstall_with_the_command_pointing_elsewhere_fails(tmp_path):
+    home = tmp_path / "home"
+    (home / ".local/bin").mkdir(parents=True)
+    (home / ".local/bin/bethmm").symlink_to("/opt/other/venv/bin/bethmm")
+    env = {k: v for k, v in os.environ.items() if not k.startswith("XDG_")}
+    env["HOME"] = str(home)
+    result = run("--uninstall", env=env)
+    assert result.returncode == 1 and "points at /opt/other" in result.stderr
+    assert (home / ".local/bin/bethmm").is_symlink()

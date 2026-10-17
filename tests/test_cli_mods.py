@@ -630,7 +630,7 @@ def test_verify_with_the_game_folder_missing(home, fo4, tmp_path, capsys):
     os.rename(fo4, away)
     capsys.readouterr()
     assert main(["verify", "--repair"]) == 1
-    assert "missing or empty" in capsys.readouterr().out
+    assert "can't be used" in capsys.readouterr().out
     with Manifest() as m:
         assert len(m.deployed("fallout4")) == 1
     os.rename(away, fo4)
@@ -682,7 +682,7 @@ def test_purge_forget_missing_for_a_game_that_is_no_longer_found(home, fo4, tmp_
     assert main(["games", "--rescan"]) == 0
     capsys.readouterr()
     assert main(["verify", "--game", "fallout4"]) == 1
-    assert "missing or empty" in capsys.readouterr().out
+    assert "can't be used" in capsys.readouterr().out
     assert main(["purge", "--game", "fallout4", "--yes"]) == 1
     assert main(["purge", "--game", "fallout4", "--forget-missing", "--dry-run"]) == 0
     out = capsys.readouterr().out
@@ -757,3 +757,37 @@ def test_install_plan_labels_files_of_the_version_it_replaces(home, fo4, tmp_pat
     assert main(["install", str(v2), "--dry-run"]) == 0
     out = capsys.readouterr().out
     assert "replaces the previous version's file" in out and "stays installed" not in out
+
+
+# ---------------------------------------------------------------- fourth review round
+
+
+def test_uninstall_killed_while_deleting_leaves_a_folder_verify_repair_deletes(home, fo4, tmp_path, monkeypatch):
+    from bethmm import staging
+    a = mod_zip(tmp_path, "Cool Mod-555-1-0-1700000000.zip", {"Cool.esp": esp(), "textures/a.dds": b"a"})
+    assert main(["install", str(a), "--yes"]) == 0
+    real = staging.shutil.rmtree
+
+    def killed(path, *args, **kwargs):
+        os.unlink(os.path.join(path, staging.RETIRED_MARKER))  # the mark may go first
+        raise KeyboardInterrupt
+
+    with monkeypatch.context() as mp:
+        mp.setattr(staging.shutil, "rmtree", killed)
+        assert main(["uninstall", "Cool Mod", "--yes"]) == 130
+    left = [p for p in paths.mods_dir("fallout4").iterdir()]
+    assert len(left) == 1 and left[0].name.endswith(staging.DELETING_SUFFIX)
+    monkeypatch.setattr(staging.shutil, "rmtree", real)
+    assert main(["verify", "--repair"]) == 0
+    assert list(paths.mods_dir("fallout4").iterdir()) == []
+
+
+def test_retexture_of_half_a_plugin_mod_with_the_same_name_is_separate(home, fo4, tmp_path, capsys):
+    one = mod_zip(tmp_path, "main.zip", {"Armor.esp": esp(), "textures/a.dds": b"a"})
+    (tmp_path / "other").mkdir()
+    two = mod_zip(tmp_path / "other", "main.zip", {"textures/a.dds": b"4K"})
+    assert main(["install", str(one), "--yes"]) == 0
+    assert main(["install", str(two), "--yes"]) == 0
+    with Manifest() as m:
+        assert len(m.mods("fallout4")) == 2
+    assert (fo4 / "Data" / "Armor.esp").is_file()

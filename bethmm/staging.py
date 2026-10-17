@@ -312,7 +312,9 @@ def find_existing(manifest: Manifest, game_id: str, prepared: Prepared, name: st
             return False  # another Nexus mod
         old = {fold_path(f.dest) for f in manifest.mod_files(mod.id)}
         old_plugins = {d for d in old if d.lower().endswith(_PLUGIN_SUFFIXES)}
-        return bool(old) and (bool(old_plugins & plugins) or 2 * len(old & dests) >= len(old))
+        if old_plugins:  # a new version keeps its plugins; a retexture or patch doesn't
+            return bool(old_plugins & plugins)
+        return bool(old) and 2 * len(old & dests) >= len(old)
 
     def best(candidates: list[ModRecord]) -> ModRecord:
         return min(candidates, key=lambda m: not (is_nexus and m.nexus_id == nexus.mod_id))
@@ -386,6 +388,10 @@ def unretire(folder: Path) -> None:
 
 
 def is_retired(folder: Path) -> bool:
+    """Whether *folder* is one the app no longer needs: marked retired, or
+    left by an interrupted deletion."""
+    if folder.name.endswith(DELETING_SUFFIX):
+        return True
     return (folder / RETIRED_MARKER).is_file() and not (folder / RETIRED_MARKER).is_symlink()
 
 
@@ -562,9 +568,26 @@ def discard(prepared: Prepared) -> None:
         log.error("could not remove the temporary folder %s: %s", prepared.workdir, exc)
 
 
+#: A staging folder being deleted is renamed to ".<name>" + this first, so a
+#: deletion that is interrupted leaves a folder the app knows is its own.
+DELETING_SUFFIX = ".bethmm-deleting"
+
+
 def remove_staging(folder: str | Path) -> None:
     """Delete a mod's staging folder -- only ever inside ``paths.mods_dir()``."""
-    _remove_tree(Path(folder), paths.mods_dir(), 2, "a game's mods folder")
+    folder = Path(folder)
+    base = paths.mods_dir()
+    _check_location(folder, base, 2, "a game's mods folder")
+    if folder.is_dir() and not folder.is_symlink() and not folder.name.endswith(DELETING_SUFFIX):
+        doomed = folder.with_name(f".{folder.name}{DELETING_SUFFIX}")
+        n = 1
+        while os.path.lexists(doomed):
+            doomed = folder.with_name(f".{folder.name}.{n}{DELETING_SUFFIX}")
+            n += 1
+        os.rename(folder, doomed)
+        log.info("RENAME %s -> %s (to delete it)", folder, doomed)
+        folder = doomed
+    _remove_tree(folder, base, 2, "a game's mods folder")
 
 
 def _check_location(path: Path, base: Path, depth: int, what: str, action: str = "delete") -> str:

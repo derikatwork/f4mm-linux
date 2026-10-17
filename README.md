@@ -158,9 +158,10 @@ If you moved the game to another folder (and pointed the app there with
 `bethmm override --root`), `purge` cleans up the new folder; deploy again
 afterwards (the app checks that its links really are in the new folder). If you
 installed the game again somewhere else, `purge` cleans up the old folder first.
-If the folder the mods were deployed into is missing or empty, `purge` refuses
-and changes nothing — it may only be on a drive that isn't mounted, even if
-another copy of the game is found. When that install is really gone,
+If the folder the mods were deployed into is missing, empty, or its Data folder is
+empty or links to nowhere, `purge` refuses and changes nothing — it may only be on
+a drive that isn't mounted, even if another copy of the game is found (`verify`
+also lists the app's links it finds in such a copy, without touching them). When that install is really gone,
 `purge --forget-missing` forgets the app's links there and moves the originals it
 had backed up to `backups/<game>/.superseded/` (nothing is deleted); this works
 for a game that is no longer found, too.

@@ -91,8 +91,12 @@ confirm() {
 
 if [ "$UNINSTALL" -eq 1 ]; then
     step "Uninstalling $APP_NAME"
-    if [ ! -e "$VENV" ] && [ ! -L "$LAUNCHER" ]; then
-        die "no installation found in $DATA_DIR (for this user: $HOME)"
+    if [ ! -e "$VENV" ]; then
+        if [ -L "$LAUNCHER" ] && [ "$(readlink "$LAUNCHER")" != "$VENV/bin/bethmm" ]; then
+            die "no installation in $DATA_DIR; the bethmm command points at $(readlink "$LAUNCHER") -- run this with the XDG_DATA_HOME you installed with"
+        elif [ ! -L "$LAUNCHER" ]; then
+            die "no installation found in $DATA_DIR (for this user: $HOME)"
+        fi
     fi
     if [ -e "$VENV" ] && [ "$FORCE" -eq 0 ]; then
         # The installed app answers, or (if its Python is gone) the app in this
@@ -231,7 +235,7 @@ if [ -e "$VENV" ] && ! "$VENV/bin/python" -I -c 'import sys, pip; sys.exit(sys.v
 fi
 if [ ! -x "$VENV/bin/python" ]; then
     mkdir -p "$DATA_DIR"
-    "$(readlink -f "$PY")" -m venv "$VENV"  # the versioned binary: an upgrade can't swap it silently
+    "$PY" -m venv "$VENV"
 fi
 EXTRAS=""
 [ "$DEV" -eq 1 ] && EXTRAS="[dev]"
