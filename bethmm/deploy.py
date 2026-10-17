@@ -331,7 +331,7 @@ def _check_root(manifest: Manifest, target: GameTarget, *, purge: bool = False) 
                 f"'bethmm purge --game {game_id}' (it uses the old folder) before deploying to the new one."
             )
     if not root.is_dir():
-        if purge and not manifest.has_footprint(game_id):
+        if purge:
             raise GameFolderGone(f"game folder {root} does not exist")
         raise DeployError(f"game folder {root} does not exist")
     return root, warnings
@@ -526,8 +526,9 @@ def plan_sync(manifest: Manifest, target: GameTarget, *, purge: bool = False) ->
         parent = PurePosixPath(p).parent
         if parent.parts:  # not a file directly in the game root
             needed.update(_prefixes(fold_path(parent)))
+    # (A folder renamed in another case since is removed under its new spelling.)
     rmdirs = [
-        Op("rmdir", path)
+        Op("rmdir", path if os.path.lexists(root / path) else (_case_variant(resolver, path) or path))
         for dkey, path in sorted(created.items(), key=lambda item: (-item[0].count("/"), item[0]))
         if dkey not in needed
     ]
@@ -1110,8 +1111,10 @@ def verify(manifest: Manifest, target: GameTarget) -> VerifyReport:
                 elif os.path.realpath(full) not in recorded:
                     report.orphan_backups.append(full)
 
+    resolver = CaseResolver(root) if root.is_dir() else None
     for path in manifest.created_dirs(game_id).values():
-        if not (root / path).is_dir():
+        here = path if (root / path).is_dir() or resolver is None else (_case_variant(resolver, path) or path)
+        if not (root / here).is_dir():
             report.missing_dirs.append(path)
 
     report.left_alone = sorted(path for path in manifest.left_alone(game_id).values()
@@ -1185,8 +1188,9 @@ def repair(manifest: Manifest, target: GameTarget, report: VerifyReport, *, dry_
             _makedirs_logged(original.parent, root)
             _move(Path(full), original)
             _prune_empty_dirs(Path(full).parent, backup_root)
+    resolver = CaseResolver(root) if root.is_dir() else None
     for path in report.missing_dirs:
-        if (root / path).is_dir():
+        if (root / path).is_dir() or (resolver is not None and _case_variant(resolver, path)):
             changed(path)
         elif act(f"forget missing folder {path}"):
             manifest.forget_dir(game_id, path)
