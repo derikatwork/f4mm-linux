@@ -22,44 +22,46 @@ The project is built in phases:
 
 ## Install (Ubuntu and Ubuntu-based: Mint, Pop!_OS, Zorin, ...)
 
-### 1. System packages
-
-You need Python 3.11 or newer and the `7z` program.
-
-Ubuntu 24.04 / Linux Mint 22 / Pop!_OS 24.04 and newer (Python 3.12 included):
-
 ```bash
-sudo add-apt-repository multiverse     # 7zip-rar lives here; harmless if already enabled
-sudo apt update
-sudo apt install python3-venv git 7zip 7zip-rar
-```
-
-Ubuntu 22.04 / Linux Mint 21 / Pop!_OS 22.04 ship Python 3.10, so also install 3.11:
-
-```bash
-sudo apt update
-sudo apt install python3.11 python3.11-venv git p7zip-full p7zip-rar
-```
-
-(`7zip-rar` / `p7zip-rar` add `.rar` support. `.zip` and `.7z` work without them.)
-
-Check with `python3 --version` (or `python3.11 --version`) and `7z | head -2`.
-
-### 2. The app
-
-```bash
+sudo apt install git                      # if you don't have it yet
 git clone https://github.com/derikatwork/f4mm-linux.git
 cd f4mm-linux
-python3 -m venv .venv            # on 22.04-based systems: python3.11 -m venv .venv
-.venv/bin/pip install -e '.[dev]'
+./install.sh
 ```
 
-Run it with `.venv/bin/bethmm ...`, or make it available everywhere:
+`install.sh` (run it as your normal user, not with sudo):
+
+1. checks for Python 3.11+ and the `7z` program and offers to install what is
+   missing with `apt` — the Python venv module, `7zip` and `7zip-rar` for `.rar`
+   files (`p7zip-full`/`p7zip-rar` on 22.04-based releases, plus `python3.11` there
+   because they ship Python 3.10). It asks before running `sudo apt`;
+2. creates a private Python environment in `~/.local/share/beth-mod-manager/venv`
+   with the app installed from this folder;
+3. puts a `bethmm` command in `~/.local/bin` (Ubuntu adds that folder to your
+   `PATH` at login once it exists — log out and back in after the first install).
+
+Keep the cloned folder: the app runs from it. To update, `git pull && ./install.sh`.
+
+Options: `--yes` (don't ask), `--dev` (also install the test tools and run the
+tests), `--no-system-packages` (never call apt), `--uninstall` (removes the app
+and the `bethmm` command; your mods, backups and settings stay — it refuses while
+mods are still deployed in a game folder).
+
+`.rar` support comes from `7zip-rar`, which lives in Ubuntu's multiverse repository.
+If the script says it isn't available: `sudo add-apt-repository multiverse` and run
+it again. `.zip` and `.7z` work without it.
+
+<details>
+<summary>Manual install (what the script does)</summary>
 
 ```bash
+sudo apt install python3-venv 7zip 7zip-rar          # 22.04-based: python3.11 python3.11-venv p7zip-full p7zip-rar
+python3 -m venv ~/.local/share/beth-mod-manager/venv  # 22.04-based: python3.11 -m venv ...
+~/.local/share/beth-mod-manager/venv/bin/pip install -e .
 mkdir -p ~/.local/bin
-ln -s "$PWD/.venv/bin/bethmm" ~/.local/bin/bethmm   # ~/.local/bin is on PATH on Ubuntu after re-login
+ln -s ~/.local/share/beth-mod-manager/venv/bin/bethmm ~/.local/bin/bethmm
 ```
+</details>
 
 ## Using phase 1
 
@@ -151,7 +153,9 @@ Prints the plugin's masters, header version and the game it was made for.
 ## Running the tests
 
 ```bash
-.venv/bin/python -m pytest
+./install.sh --dev        # installs pytest into the app's environment and runs the tests
+# or, afterwards:
+~/.local/share/beth-mod-manager/venv/bin/python -m pytest
 ```
 
 The tests build fake game folders, fake Lutris configs and fake mod layouts in
