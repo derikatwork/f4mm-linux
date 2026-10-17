@@ -345,6 +345,13 @@ class CaseResolver:
         return listing
 
 
+def fold_path(rel: str | PurePosixPath) -> str:
+    """Case-folded key for a relative path, using the same rules as the
+    resolver (separators normalised, ``.`` dropped). Two paths that Windows
+    would treat as the same file get the same key."""
+    return "/".join(_fold_key(_split(rel)))
+
+
 def resolve_case_insensitive(base: str | Path, rel: str | PurePosixPath, *, is_dir: bool = False) -> ResolvedPath:
     """One-off convenience wrapper: ``CaseResolver(base).resolve(rel, is_dir=is_dir)``."""
     return CaseResolver(base).resolve(rel, is_dir=is_dir)
