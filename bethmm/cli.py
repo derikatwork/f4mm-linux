@@ -31,15 +31,15 @@ import tempfile
 import time
 from pathlib import Path
 
-from bethmm import APP_NAME, __version__, paths
+from bethmm import APP_NAME, __version__, deploy, paths
 from bethmm.archive import ArchiveError, extract_archive
 from bethmm.deploy import DeployError
-from bethmm.manifest import ManifestError
+from bethmm.manifest import Manifest, ManifestError
 from bethmm.staging import StagingError
 from bethmm.discovery import DiscoveredGame, cache_is_current, get_games
 from bethmm.games import GAMES
 from bethmm.log import setup_logging
-from bethmm.pathresolve import CaseResolver
+from bethmm.pathresolve import CaseResolver, fold_path
 from bethmm.placement import (
     Confidence,
     PlacementPlan,
@@ -214,7 +214,7 @@ def cmd_analyze(args) -> int:
 
     game_id = args.game or plan.game.game_id
     game = next((g for g in games if g.game_id == game_id), None)
-    resolved = _resolve_against_game(plan, game) if game else []
+    resolved = _resolve_against_game(plan, game, link_owners(game.game_id)) if game else []
 
     if args.json:
         data = plan.to_dict()
@@ -284,16 +284,35 @@ def _remove_stale_extractions(tmp: Path) -> None:
             _remove_tree(Path(entry.path))
 
 
-def _resolve_against_game(plan: PlacementPlan, game: DiscoveredGame) -> list[dict]:
-    """Where each mapping would land in the real game folder (read-only)."""
+def link_owners(game_id: str) -> dict[str, str]:
+    """Folded path -> name of the installed mod whose link the app put there
+    (read-only; empty when nothing was ever installed)."""
+    if not paths.manifest_path().exists():
+        return {}
+    try:
+        with Manifest() as manifest:
+            names = {m.id: m.name for m in manifest.mods(game_id)}
+            return {key: names.get(d.mod_id, "another mod") for key, d in manifest.deployed(game_id).items()}
+    except ManifestError:
+        return {}
+
+
+def _resolve_against_game(plan: PlacementPlan, game: DiscoveredGame,
+                          owners: dict[str, str] | None = None) -> list[dict]:
+    """Where each mapping would land in the real game folder (read-only).
+    *owners* (from :func:`link_owners`) tells the app's links from game files."""
     if not game.root.is_dir():
         return []
     resolver = CaseResolver(game.root)
+    owners = owners or {}
     out = []
     for m in plan.mappings:
         r = resolver.resolve(m.dest, plan=True)
+        owner = owners.get(fold_path(str(r.rel)))
         if r.type_conflict:
             status = "conflict: a folder/file of the other type already exists there"
+        elif r.exists_on_disk and owner is not None:
+            status = f"overrides {owner} (its file stays installed)"
         elif r.exists_on_disk:
             status = "replaces an existing game file (it would be backed up)"
         elif r.exists:
@@ -346,6 +365,7 @@ def format_plan(
     *,
     installed: list[str] | None = None,
     source: str = "<archive>",
+    requested: bool = True,
 ) -> str:
     out: list[str] = []
     if plan.nexus is not None:
@@ -368,7 +388,8 @@ def format_plan(
     for reason in guess.reasons:
         out.append(f"           - {reason}")
     if game_id and game_id != guess.game_id:
-        out.append(f"           checking against {GAMES[game_id].name} as requested")
+        why = "as requested" if requested else "(your current game)"
+        out.append(f"           checking against {GAMES[game_id].name} {why}")
 
     rule = _RULE_TEXT[plan.rule]
     if plan.target is Target.UNKNOWN:
@@ -514,7 +535,8 @@ def cmd_config(args) -> int:
         changed = True
     if changed:
         save_settings(settings)
-        print(f"Saved {paths.settings_path()}. Run 'bethmm games --rescan' to search again.")
+        rescan = args.games_dir is not None or args.scan_depth is not None
+        print(f"Saved {paths.settings_path()}." + (" Run 'bethmm games --rescan' to search again." if rescan else ""))
     print(json.dumps(settings.to_dict(), indent=2))
     print(f"\nsettings : {paths.settings_path()}\ndata     : {paths.data_dir()}\nlog      : {paths.log_path()}")
     return 0
@@ -542,6 +564,13 @@ def cmd_override(args) -> int:
     match = next((g for g in games if g.game_id == args.game), None)
     if match:
         print(_describe_game(match))
+        mode = settings.override(args.game).link_mode
+        print(f"  links  : {mode}s")
+        if mode == "hardlink":
+            try:
+                deploy.check_link_mode(deploy.GameTarget(args.game, match.root, mode))
+            except deploy.DeployError as exc:
+                print(f"warning: {exc}", file=sys.stderr)
     else:
         print(f"{GAMES[args.game].name} is not currently listed (not found, or ignored).")
     for w in warnings:

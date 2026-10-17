@@ -279,31 +279,75 @@ def folder_name(name: str, existing: Sequence[str] = ()) -> str:
 def find_existing(manifest: Manifest, game_id: str, prepared: Prepared, name: str | None = None) -> ModRecord | None:
     """An installed mod this one would update, or None:
 
-    * a mod with the same name (case-insensitive) -- with several, the one with
-      the same Nexus mod ID;
-    * else a mod with the same Nexus mod ID whose original download had the same
-      Nexus file name. A mod the user renamed still gets updated, while another
-      file from the same Nexus page (an optional patch, an add-on) is installed
-      as a mod of its own.
+    * a mod with the same name (case-insensitive), unless both have a Nexus
+      mod ID and they differ ("2K" or "Main File" of two unrelated mods) --
+      with several, the one with the same Nexus mod ID;
+    * else a mod with the same Nexus mod ID whose original download had the
+      same Nexus file name, ignoring version numbers in it ("Cool Mod 1.2" ->
+      "Cool Mod 1.3"). A mod the user renamed still gets updated, while
+      another file from the same Nexus page (an optional patch, an add-on,
+      "PART 2") is installed as a mod of its own.
     """
     mods = manifest.mods(game_id)
     wanted = _clean_text(name if name is not None else suggested_name(prepared)).casefold()
     same_name = [m for m in mods if _clean_text(m.name).casefold() == wanted]
     nexus = prepared.plan.nexus
     is_nexus = nexus is not None and nexus.is_nexus
+    if is_nexus:
+        same_name = sorted((m for m in same_name if m.nexus_id in (nexus.mod_id, None)),
+                           key=lambda m: m.nexus_id != nexus.mod_id)
     if same_name:
-        if is_nexus:
-            return next((m for m in same_name if m.nexus_id == nexus.mod_id), same_name[0])
         return same_name[0]
     if is_nexus:
-        file_name = _clean_text(nexus.display_name).casefold()
         for m in mods:
             if m.nexus_id != nexus.mod_id or not m.source_archive:
                 continue
             original = parse_nexus_filename(Path(m.source_archive).name)
-            if original.mod_id == nexus.mod_id and _clean_text(original.display_name).casefold() == file_name:
+            versions = (nexus.version, original.version)
+            if original.mod_id == nexus.mod_id and \
+                    base_name(original.display_name, *versions) == base_name(nexus.display_name, *versions):
                 return m
     return None
+
+
+#: A version number in a Nexus file name: "1.2", "10.0.1", "5_2", "v3", "v1.4b".
+_VERSION_IN_NAME = re.compile(r"(?<![A-Za-z0-9])(?:v\d+(?:[._]\d+)*|\d+(?:[._]\d+)+)[a-z]?(?![A-Za-z0-9])", re.I)
+
+
+def base_name(name: str, *versions: str | None) -> str:
+    """*name* without version numbers (also the given *versions*, however
+    they are written in it), folded: what stays the same from one version of
+    a Nexus file to the next. Plain numbers ("PART 2") are kept."""
+    text = _clean_text(name)
+    for version in versions:
+        m = re.fullmatch(r"v?(\d+(?:[._-]\d+)+)([A-Za-z]*)", (version or "").strip())
+        if m is None:
+            continue
+        digits = r"[ ._-]".join(re.escape(p) for p in re.split(r"[._-]", m.group(1)))
+        suffix = rf"(?:[ ._-]?{re.escape(m.group(2))})?" if m.group(2) else ""
+        text = re.sub(rf"(?<![A-Za-z0-9])v?{digits}{suffix}(?![A-Za-z0-9])", " ", text, flags=re.I)
+    text = _VERSION_IN_NAME.sub(" ", text)
+    return " ".join(w for w in re.split(r"[\s_]+|\s-\s|-$|^-", text) if w and w != "-").casefold()
+
+
+# ---------------------------------------------------------------- retired folders
+
+#: Marks a staging folder an update replaced while links still pointed into
+#: it; 'verify --repair' deletes such folders once nothing uses them. Folders
+#: in the mods folder without it are never deleted by the app.
+RETIRED_MARKER = ".bethmm-retired"
+
+
+def retire(folder: Path) -> None:
+    """Mark *folder*, a mod's previous staging folder, as no longer needed."""
+    _check_location(folder, paths.mods_dir(), 2, "a game's mods folder", "retire")
+    marker = folder / RETIRED_MARKER
+    marker.write_text("This folder held a previous version of a mod. The app deletes it once no link uses it.\n")
+    log.info("WRITE %s", marker)
+
+
+def is_retired(folder: Path) -> bool:
+    return (folder / RETIRED_MARKER).is_file() and not (folder / RETIRED_MARKER).is_symlink()
 
 
 # ---------------------------------------------------------------- commit
@@ -316,6 +360,7 @@ def commit(
     *,
     name: str | None = None,
     replace: ModRecord | None = None,
+    enabled: bool | None = None,
 ) -> CommitResult:
     """Move the extracted files into the mods folder and record the mod.
 
@@ -328,7 +373,8 @@ def commit(
     "wrapper_dirs", "skipped": <count>}`` from the PlacementPlan.
 
     Without *name* a new mod is called ``suggested_name(prepared)`` and a
-    replaced mod keeps its name.
+    replaced mod keeps its name. Without *enabled* a new mod is enabled and a
+    replaced mod keeps its state.
     """
     plan = prepared.plan
     if not plan.mappings:
@@ -394,9 +440,11 @@ def commit(
         # anywhere before it is saved rolls it back, and the files go back too.
         with manifest.transaction():
             if current is None:
-                mod = manifest.add_mod(game_id, mod_name, folder, files, **details)
+                mod = manifest.add_mod(game_id, mod_name, folder, files, enabled=enabled is not False, **details)
                 result = CommitResult(mod)
             else:
+                if enabled is not None:
+                    manifest.set_enabled(current.id, enabled)
                 mod = manifest.update_mod(current.id, folder=folder, files=files, name=mod_name, **details)
                 result = CommitResult(mod, old_folder=mods_root / current.folder, replaced=True)
     except BaseException:

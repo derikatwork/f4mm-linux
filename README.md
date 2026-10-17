@@ -46,7 +46,9 @@ Keep the cloned folder: the app runs from it. To update, `git pull && ./install.
 Options: `--yes` (don't ask), `--dev` (also install the test tools and run the
 tests), `--no-system-packages` (never call apt), `--uninstall` (removes the app
 and the `bethmm` command; your mods, backups and settings stay — it refuses while
-mods are still deployed in a game folder).
+mods are still deployed in a game folder and shows what is left; run
+`bethmm purge --all` first), `--force` (install even as root, or uninstall even
+though mods are still deployed).
 
 `.rar` support comes from `7zip-rar`, which lives in Ubuntu's multiverse repository.
 If the script says it isn't available: `sudo add-apt-repository multiverse` and run
@@ -77,6 +79,12 @@ bethmm conflicts --files
 bethmm uninstall "Some Mod"
 ```
 
+`install` options: `--dry-run` (show exactly what would change in the game folder),
+`--no-deploy` (add the mod disabled: nothing of it is linked until you `enable` it),
+`--new` (install separately even if it looks like an update), `--replace MOD`
+(install as the new version of that mod), `--name NAME` (the name in the list; on
+an update it renames the mod), `--root`/`--target` (choose what goes where).
+
 What `install` does:
 
 1. extracts the archive into a temporary folder and works out the game and where
@@ -91,9 +99,20 @@ What `install` does:
 
 If a mod replaces an original game file, the original is moved to
 `~/.local/share/beth-mod-manager/backups/<game>/` first and moved back when no
-enabled mod provides that file any more. Installing a newer version of a mod you
-already have (same Nexus mod ID or name) updates it in place, keeping its position
-(`--new` installs it separately instead).
+enabled mod provides that file any more.
+
+Installing a newer version of a mod you already have updates it in place, keeping
+its position and enabled state. An archive counts as a newer version when
+
+* it has the same name as an installed mod (unless both come from Nexus with
+  different mod IDs — two unrelated mods may both call their file "2K"), or
+* it comes from the same Nexus mod page and its Nexus file name is the same apart
+  from version numbers ("Cool Mod 1.2" → "Cool Mod 1.3"). Other files of the same
+  page — an optional patch, "PART 2" — are separate mods.
+
+The plan says "This updates ..." before you confirm. `--new` installs it
+separately instead; `--replace MOD` makes it the new version of a mod the rules
+didn't match.
 
 **The app never deletes or edits a file it didn't create.** If you (or a tool such as
 xEdit or BethINI) replace one of its links with a real file, that file is left alone
@@ -106,22 +125,42 @@ bethmm purge              # remove every link, restore every original, remove th
 bethmm purge --all        # every game
 bethmm deploy             # put the enabled mods back (also re-creates links that went missing)
 bethmm verify             # compare the game folder with what the app recorded
-bethmm verify --repair    # fix what is safe to fix (stray links, interrupted runs), then redeploy
+bethmm verify --repair    # fix what is safe to fix, then redeploy (or purge again if purged)
 bethmm status             # per game: mods, links, backups
+bethmm status --deployed-only   # what the app still has in game folders
 bethmm history            # the latest file operations
 ```
 
 `purge` keeps your mods installed; after a purge nothing is linked until you run
 `bethmm deploy` again. Every operation is recorded in
 `~/.local/share/beth-mod-manager/manifest.db` *before* it happens, so even if the app
-is killed halfway, `verify --repair` can clean up.
+is killed halfway, the next `deploy`/`purge` or `verify --repair` cleans up.
+
+`verify --repair` removes stray links into the app's mods folder and half-made
+links or half-copied files of an interrupted run, puts back unrecorded originals
+from the backups folder, forgets records of things that are gone, and deletes the
+previous version of an updated mod once no link uses it. It never deletes a folder
+in the mods folder that the app didn't mark as its own — it only reports it.
+
+When a game update (or anything else) puts a new file where a mod had replaced the
+original, that file is left alone and the old original stays in the backups.
+`verify` reports it; deleting the new file and running `purge` brings the old
+original back, or `verify --repair --release-held` stops tracking the old original
+(it is moved to `backups/<game>/.superseded/`, never deleted).
+
+If you moved the game to another folder (and pointed the app there with
+`bethmm override --root`), `purge` cleans up the new folder; deploy again
+afterwards. If the game folder is gone altogether, `purge` forgets the app's links
+there and moves the originals it had backed up to `backups/<game>/.superseded/`.
 
 ### Dry run
 
 Add `--dry-run` to `install`, `enable`, `disable`, `move`, `uninstall`, `deploy`,
-`purge` or `verify --repair` to see exactly which files would be linked, backed up or
-restored without changing anything. `bethmm config --dry-run on` makes that the
-default for everything until you switch it off.
+`purge`, `verify --repair` or `check-links` to see exactly which files would be
+linked, backed up or restored without changing anything. (`verify --repair
+--dry-run` lists the repairs; run `deploy --dry-run` after the repair for the links.)
+`bethmm config --dry-run on` makes that the default for everything until you switch
+it off.
 
 ### Does the game see the links?
 
@@ -141,7 +180,7 @@ bethmm deploy
 
 Hardlinks are real directory entries inside the game folder, so sandboxes see them,
 but they only work when the game and `~/.local/share` are on the same disk; the app
-checks this and tells you if they aren't.
+checks this when you switch (and before every change) and tells you if they aren't.
 
 ## Using phase 1 commands
 
@@ -226,7 +265,7 @@ Prints the plugin's masters, header version and the game it was made for.
 |---|---|
 | Settings | `~/.config/beth-mod-manager/settings.json` |
 | Game discovery cache | `~/.local/share/beth-mod-manager/games.json` |
-| Log of every file operation (settings/cache writes, extractions, temp folders) | `~/.local/share/beth-mod-manager/logs/bethmm.log` |
+| Log of every file operation (links, backups, restores, folders, installs, settings/cache writes, extractions) | `~/.local/share/beth-mod-manager/logs/bethmm.log` |
 | Installed mods (staged files) | `~/.local/share/beth-mod-manager/mods/<game>/<mod>/` |
 | Originals of game files replaced by mods | `~/.local/share/beth-mod-manager/backups/<game>/` |
 | Manifest (mod list, every link/backup/folder the app made, history) | `~/.local/share/beth-mod-manager/manifest.db` |

@@ -408,6 +408,57 @@ def test_find_existing_by_name_then_nexus_file(tmp_path, manifest):
     assert find_existing(manifest, "skyrimse", prepared) is None
 
 
+def test_find_existing_same_name_of_another_nexus_mod_is_not_an_update(tmp_path, manifest):
+    """'2K' of mod 2222 doesn't replace '2K' of mod 1111."""
+    other = manifest.add_mod("fallout4", "2K", "2K", [], nexus_id=1111,
+                             source_archive="/dl/2K-1111-1-0-1600000000.zip")
+    prepared = _fake_prepared(tmp_path, "2K-2222-3-1-1700000000.zip")
+    assert find_existing(manifest, "fallout4", prepared) is None
+    # Same name and no known Nexus ID on one side: still an update.
+    unknown = manifest.add_mod("fallout4", "2k", "2k b", [])
+    assert find_existing(manifest, "fallout4", prepared).id == unknown.id
+    plain = _fake_prepared(tmp_path, "2K.zip")
+    assert find_existing(manifest, "fallout4", plain).id in (other.id, unknown.id)
+
+
+@pytest.mark.parametrize("old,new,update", [
+    ("Skyrim 202X 10.0 - Architecture PART 1-2347-10-0-1700000000.7z",
+     "Skyrim 202X 10.0.1 - Architecture PART 1-2347-10-0-1-1700000001.7z", True),
+    ("Skyrim 202X 10.0 - Architecture PART 1-2347-10-0-1700000000.7z",
+     "Skyrim 202X 10.0.1 - Architecture PART 2-2347-10-0-1-1700000001.7z", False),
+    ("SkyUI_5_2_SE-12604-5-2SE.7z", "SkyUI_5_3_SE-12604-5-3SE.7z", True),
+    ("SKSE64 2.2.6-30379-2-2-6-1700000000.7z", "SKSE64 2.2.7-30379-2-2-7-1700000001.7z", True),
+    ("Cool Mod v1.2-1234-1-2-1600000000.zip", "Cool Mod v1.3b-1234-1-3b-1700000000.zip", True),
+    ("Cool Mod 1.2-1234-1-2-1600000000.zip", "Cool Mod DLC Patch 1.3-1234-1-3-1700000000.zip", False),
+    ("Cool Mod 1.2-1234-1-2-1600000000.zip", "Cool Mod 1.3-9999-1-3-1700000000.zip", False),
+])
+def test_find_existing_ignores_versions_in_nexus_file_names(tmp_path, manifest, old, new, update):
+    from bethmm.nexus import parse_nexus_filename
+    installed = manifest.add_mod("fallout4", "Whatever the user called it", "w", [],
+                                 nexus_id=parse_nexus_filename(old).mod_id, source_archive=f"/dl/{old}")
+    found = find_existing(manifest, "fallout4", _fake_prepared(tmp_path, new))
+    assert (found is not None and found.id == installed.id) is update
+
+
+def test_base_name_keeps_plain_numbers():
+    from bethmm.staging import base_name
+    assert base_name("Architecture PART 1", "10.0") != base_name("Architecture PART 2", "10.0")
+    assert base_name("SkyUI 5 2 SE", "5.2SE") == base_name("SkyUI 5 3 SE", "5.3SE") == "skyui"
+    assert base_name("Mod 1.2", "1.2") == base_name("Mod v2", None) == "mod"
+    assert base_name("Fallout 4 Mod", None) == "fallout 4 mod"
+
+
+def test_retire_marks_only_staging_folders(tmp_path):
+    from bethmm.staging import is_retired, retire
+    folder = paths.mods_dir("fallout4") / "Old"
+    folder.mkdir(parents=True)
+    assert not is_retired(folder)
+    retire(folder)
+    assert is_retired(folder)
+    with pytest.raises(StagingError):
+        retire(tmp_path)
+
+
 def test_find_existing_plain_name(tmp_path, manifest):
     prepared = _fake_prepared(tmp_path, "my_mod.zip")
     other = manifest.add_mod("fallout4", "Something", "s", [], nexus_id=99)

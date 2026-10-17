@@ -7,7 +7,10 @@
 #   ./install.sh --dev           also install the test tools and run the tests
 #   ./install.sh --no-system-packages
 #                                never call apt; only check what is there
-#   ./install.sh --uninstall     remove the app (keeps your mods, backups and settings)
+#   ./install.sh --uninstall     remove the app (keeps your mods, backups and settings);
+#                                refuses while mods are still deployed in a game folder
+#   ./install.sh --force         install even when run as root / uninstall even
+#                                though mods are still deployed
 #
 # What it does:
 #   1. checks for Python 3.11+ and the 7z program, offering to install what is
@@ -16,6 +19,9 @@
 #      with the app installed from this folder (keep this folder: updates are a
 #      'git pull' away);
 #   3. puts a 'bethmm' command in ~/.local/bin.
+
+# 'sh install.sh' runs dash on Ubuntu: start again with bash.
+[ -n "${BASH_VERSION:-}" ] || exec bash "$0" "$@"
 set -euo pipefail
 
 APP_NAME="BETH Mod Manager"
@@ -38,7 +44,8 @@ step() { printf '\n==> %s\n' "$*"; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
 die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
 
-usage() { sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+# The comment block at the top of this file.
+usage() { awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "${BASH_SOURCE[0]}"; }
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -53,7 +60,8 @@ while [ $# -gt 0 ]; do
     shift
 done
 
-[ "$(id -u)" -ne 0 ] || [ "$FORCE" -eq 1 ] || die "run this as your normal user, not with sudo (it asks for sudo itself when needed)"
+[ "$UNINSTALL" -eq 1 ] || [ "$(id -u)" -ne 0 ] || [ "$FORCE" -eq 1 ] \
+    || die "run this as your normal user, not with sudo (it asks for sudo itself when needed)"
 
 confirm() {
     # confirm "question" -> 0 for yes. Defaults to yes; --yes answers for you.
@@ -69,9 +77,11 @@ confirm() {
 if [ "$UNINSTALL" -eq 1 ]; then
     step "Uninstalling $APP_NAME"
     if [ -x "$VENV/bin/bethmm" ] && [ "$FORCE" -eq 0 ]; then
-        if ! "$VENV/bin/bethmm" status --deployed-only >/dev/null 2>&1; then
-            die "mods are still deployed into a game folder. Run 'bethmm purge --all' first (or --force to skip this check)"
+        if ! status="$("$VENV/bin/bethmm" status --deployed-only 2>&1)"; then
+            printf '%s\n' "$status" >&2
+            die "the app still has files in a game folder (see above). Run 'bethmm purge --all' first, or --force to uninstall anyway"
         fi
+        [ -z "$status" ] || say "$status"
     fi
     if [ -L "$LAUNCHER" ] && [ "$(readlink "$LAUNCHER")" = "$VENV/bin/bethmm" ]; then
         rm "$LAUNCHER"
@@ -200,7 +210,7 @@ if [ ! -x "$VENV/bin/python" ]; then
 fi
 EXTRAS=""
 [ "$DEV" -eq 1 ] && EXTRAS="[dev]"
-"$VENV/bin/python" -m pip install --quiet --disable-pip-version-check --editable "$REPO_DIR$EXTRAS"
+"$VENV/bin/python" -m pip install --quiet --disable-pip-version-check --no-cache-dir --editable "$REPO_DIR$EXTRAS"
 
 mkdir -p "$BIN_DIR"
 if [ -e "$LAUNCHER" ] && [ ! -L "$LAUNCHER" ]; then

@@ -16,8 +16,12 @@ from bethmm import deploy, paths
 from bethmm.deploy import GameTarget
 from bethmm.manifest import Manifest
 
+import test_deploy_adversarial as adv
 from test_deploy import GAME, add_mod, assert_deployed, assert_vanilla, snapshot, staged
-from test_deploy_adversarial import Boom, Killed, _fast_sqlite, fail_once, manifest, verify_and_repair, world  # noqa: F401
+from test_deploy_adversarial import Boom, Killed, fail_once, verify_and_repair
+
+# The adversarial suite's fixtures: a fast manifest and a fake game folder.
+_fast_sqlite, manifest, world = adv._fast_sqlite, adv.manifest, adv.world
 
 
 def contents(root: Path) -> dict[str, tuple]:
