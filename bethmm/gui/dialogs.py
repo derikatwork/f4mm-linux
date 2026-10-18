@@ -502,9 +502,9 @@ class InstallDialog(QDialog):
             if choice.existing is None and same_name is None:
                 same_name = next((m.name for m in manifest.mods(game.game_id)
                                   if m.name.casefold() == choice.name.casefold()), None)
-                # "Install as a new mod" picked although the update rules matched.
-                looks_same = same_name is not None and \
-                    staging.find_existing(manifest, game.game_id, self.prepared) is not None
+                # "Install as a new mod" picked although the update rules matched that mod.
+                found = staging.find_existing(manifest, game.game_id, self.prepared) if same_name else None
+                looks_same = found is not None and found.name.casefold() == same_name.casefold()
             owners = service.link_owners(game.game_id, manifest)
             resolved = service.resolve_against_game(self.prepared.plan, game, owners,
                                                     replacing=choice.existing.id if choice.existing else None)

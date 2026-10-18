@@ -351,8 +351,10 @@ class MainWindow(QMainWindow):
         # The row the keyboard is on (Space toggles it), as before the reload.
         row = self.model.row_of(current[0]) if current is not None else None
         if row is not None:
+            self.table.setAutoScroll(False)  # the list stays where the user scrolled it
             self.table.selectionModel().setCurrentIndex(self.model.index(row, current[1]),
                                                         QItemSelectionModel.SelectionFlag.NoUpdate)
+            self.table.setAutoScroll(True)
         self.state_label.setText(state_text)
         self.dry_label.setText("<b>DRY-RUN MODE</b>" if self.settings.dry_run else "")
         self.history.clear()

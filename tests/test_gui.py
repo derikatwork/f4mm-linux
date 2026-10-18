@@ -534,16 +534,19 @@ def test_update_from_archive_of_a_mod_changed_elsewhere_is_refused(qtbot, window
 
 
 def test_the_dialog_starts_on_the_windows_game(qtbot, window, answers, home, tmp_path, fo4):
+    """Two games and no current game saved (first start): the window shows
+    the first one, and a mod that doesn't tell its game goes there."""
     from bethmm.settings import save_settings
     make_tree(home / "Games" / "skyrim" / "drive_c" / "GOG Games" / "Skyrim", ["SkyrimSE.exe", "Data/"])
     window.settings.current_game = None
     save_settings(window.settings)
     window.reload_games(rescan=True)
-    window.game_combo.setCurrentIndex(window.game_combo.findData("skyrimse"))
+    assert window.game_combo.count() == 2 and window.game is not None
+    assert window.settings.current_game is None
     window.install_paths([str(mod_zip(tmp_path, "Tex-1-1-0.zip", {"textures/x.dds": b"x"}))])
     idle(qtbot, window)
     (dialog,) = [d for d in answers.dialogs if isinstance(d, InstallDialog)]
-    assert dialog.game is not None and dialog.game.game_id == "skyrimse"
+    assert dialog.game is not None and dialog.game.game_id == window.game.game_id
 
 
 def test_the_keyboard_row_survives_an_operation(qtbot, window, tmp_path, fo4):
@@ -567,3 +570,38 @@ def test_the_same_name_hint_when_the_update_was_turned_down(qtbot, home, fo4, tm
         assert "looks like an earlier version" in dialog.update_info.text()
     finally:
         staging.discard(dialog.prepared)
+
+
+def test_the_hint_names_only_the_mod_the_rules_matched(qtbot, home, fo4, tmp_path):
+    """'Cool Mod' (another Nexus page) is not the earlier version; the renamed
+    'Cool Mod Classic' is."""
+    from bethmm import staging
+    (tmp_path / "a").mkdir()
+    other = mod_zip(tmp_path / "a", "Cool Mod-999-1-0-1700000000.zip", {"Other.esp": esp()})
+    assert main(["install", str(other), "--yes"]) == 0
+    first = mod_zip(tmp_path, "Cool Mod-555-1-0-1700000000.zip", {"Cool.esp": esp()})
+    assert main(["install", str(first), "--yes", "--name", "Cool Mod Classic"]) == 0
+    dialog = _dialog(qtbot, tmp_path, "Cool Mod-555-2-0-1700000100.zip", {"Cool.esp": esp()})
+    try:
+        assert dialog.update_combo.currentText() == "Cool Mod Classic"
+        dialog.as_new.setChecked(True)
+        text = dialog.update_info.text()
+        assert "doesn't look like the same mod" in text and "earlier version" not in text
+    finally:
+        staging.discard(dialog.prepared)
+
+
+def test_an_operation_keeps_the_list_where_it_was_scrolled(qtbot, window, tmp_path, fo4):
+    for i in range(60):
+        assert main(["install", str(mod_zip(tmp_path, f"Mod {i:02}.zip", {f"M{i:02}.esp": esp()})),
+                     "--yes", "--no-deploy"]) == 0
+    window.resize(900, 400)
+    window.show()
+    window.refresh()
+    window.table.selectRow(2)
+    bar = window.table.verticalScrollBar()
+    bar.setValue(bar.maximum())
+    scrolled = bar.value()
+    assert scrolled > 0
+    window.refresh()
+    assert bar.value() == scrolled and window.table.currentIndex().row() == 2
