@@ -5,6 +5,8 @@
 #   ./install.sh                 install or update (run again after 'git pull')
 #   ./install.sh --yes           don't ask before installing system packages
 #   ./install.sh --dev           also install the test tools and run the tests
+#   ./install.sh --no-gui        command line only: no Qt, no menu entry (removes
+#                                the menu entry and bethmm-gui of an earlier install)
 #   ./install.sh --no-system-packages
 #                                never call apt; only check what is there
 #   ./install.sh --uninstall     remove the app (keeps your mods, backups and settings);
@@ -13,12 +15,14 @@
 #                                though mods are still deployed
 #
 # What it does:
-#   1. checks for Python 3.11+ and the 7z program, offering to install what is
-#      missing with apt (python3-venv, 7zip, 7zip-rar or the p7zip equivalents);
+#   1. checks for Python 3.11+, the 7z program and the system libraries Qt needs,
+#      offering to install what is missing with apt (python3-venv, 7zip, 7zip-rar
+#      or the p7zip equivalents, libxcb-cursor0 ...);
 #   2. creates a private Python environment in ~/.local/share/beth-mod-manager/venv
-#      with the app installed from this folder (keep this folder: updates are a
-#      'git pull' away);
-#   3. puts a 'bethmm' command in ~/.local/bin.
+#      with the app (and the Qt toolkit for its GUI) installed from this folder
+#      (keep this folder: updates are a 'git pull' away);
+#   3. puts the 'bethmm' and 'bethmm-gui' commands in ~/.local/bin and a
+#      "BETH Mod Manager" entry in your applications menu.
 
 # 'sh install.sh' runs dash on Ubuntu: start again with bash.
 [ -n "${BASH_VERSION:-}" ] || exec bash "$0" "$@"
@@ -32,9 +36,14 @@ CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/$APP_SLUG"
 VENV="$DATA_DIR/venv"
 BIN_DIR="$HOME/.local/bin"
 LAUNCHER="$BIN_DIR/bethmm"
+GUI_LAUNCHER="$BIN_DIR/bethmm-gui"
+DESKTOP_FILE="${XDG_DATA_HOME:-$HOME/.local/share}/applications/$APP_SLUG.desktop"
+DESKTOP_MARKER="X-BethMM-Installed-By=install.sh"  # = bethmm.gui.desktop.MARKER
+ICON="$REPO_DIR/bethmm/gui/icon.svg"
 
 ASSUME_YES=0
 DEV=0
+GUI=1
 SYSTEM_PACKAGES=1
 UNINSTALL=0
 FORCE=0
@@ -51,6 +60,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         -y|--yes) ASSUME_YES=1 ;;
         --dev) DEV=1 ;;
+        --no-gui) GUI=0 ;;
         --no-system-packages) SYSTEM_PACKAGES=0 ;;
         --uninstall) UNINSTALL=1 ;;
         --force) FORCE=1 ;;
@@ -78,6 +88,21 @@ find_python() {
     return 1
 }
 
+# Links and menu entries this script made (anything else there is left alone).
+our_link() { [ -L "$1" ] && [ "$(readlink -m "$1")" = "$(readlink -m "$2")" ]; }
+our_desktop_file() { [ -f "$DESKTOP_FILE" ] && [ ! -L "$DESKTOP_FILE" ] && grep -qxF "$DESKTOP_MARKER" "$DESKTOP_FILE"; }
+
+remove_gui_entries() {
+    if our_link "$GUI_LAUNCHER" "$VENV/bin/bethmm-gui"; then
+        rm "$GUI_LAUNCHER"
+        say "removed $GUI_LAUNCHER"
+    fi
+    if our_desktop_file; then
+        rm "$DESKTOP_FILE"
+        say "removed $DESKTOP_FILE"
+    fi
+}
+
 confirm() {
     # confirm "question" -> 0 for yes. Defaults to yes; --yes answers for you.
     [ "$ASSUME_YES" -eq 1 ] && return 0
@@ -94,7 +119,7 @@ if [ "$UNINSTALL" -eq 1 ]; then
     if [ -L "$LAUNCHER" ] && [ "$(readlink -m "$LAUNCHER")" != "$(readlink -m "$VENV/bin/bethmm")" ]; then
         die "the bethmm command points at $(readlink "$LAUNCHER"), not at $VENV -- run this with the XDG_DATA_HOME you installed with"
     fi
-    if [ ! -e "$VENV" ] && [ ! -L "$LAUNCHER" ]; then
+    if [ ! -e "$VENV" ] && [ ! -L "$LAUNCHER" ] && ! our_link "$GUI_LAUNCHER" "$VENV/bin/bethmm-gui" && ! our_desktop_file; then
         die "no installation found in $DATA_DIR (for this user: $HOME)"
     fi
     if [ -e "$VENV" ] && [ "$FORCE" -eq 0 ]; then
@@ -122,10 +147,11 @@ if [ "$UNINSTALL" -eq 1 ]; then
         fi
         [ -z "$status" ] || say "$status"
     fi
-    if [ -L "$LAUNCHER" ] && [ "$(readlink -m "$LAUNCHER")" = "$(readlink -m "$VENV/bin/bethmm")" ]; then
+    if our_link "$LAUNCHER" "$VENV/bin/bethmm"; then
         rm "$LAUNCHER"
         say "removed $LAUNCHER"
     fi
+    remove_gui_entries
     if [ -d "$VENV" ]; then
         rm -rf "$VENV"
         say "removed $VENV"
@@ -204,6 +230,25 @@ if [ "$SYSTEM_PACKAGES" -eq 1 ]; then
     fi
 fi
 
+# The libraries Qt's X11 support needs that a desktop install may lack (most
+# often libxcb-cursor0). Names a release doesn't have are skipped: the check
+# after installing reports anything still missing.
+GUI_LIBS=(libxcb-cursor0 libxkbcommon-x11-0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1
+          libxcb-render-util0 libxcb-shape0 libxcb-util1 libxcb-xinerama0 libxcb-xkb1 libegl1 libgl1
+          libfontconfig1 libdbus-1-3)
+if [ "$GUI" -eq 1 ] && [ "$SYSTEM_PACKAGES" -eq 1 ]; then
+    missing_libs=()
+    for lib in "${GUI_LIBS[@]}"; do
+        if ! pkg_installed "$lib" && pkg_available "$lib"; then missing_libs+=("$lib"); fi
+    done
+    if [ "${#missing_libs[@]}" -gt 0 ]; then
+        say "libraries for the GUI: missing ${missing_libs[*]}"
+        PACKAGES+=("${missing_libs[@]}")
+    else
+        say "libraries for the GUI: present"
+    fi
+fi
+
 if [ "${#PACKAGES[@]}" -gt 0 ]; then
     if [ "$SYSTEM_PACKAGES" -eq 0 ]; then
         die "missing: ${PACKAGES[*]} -- install them and run this again"
@@ -226,6 +271,7 @@ command -v 7z >/dev/null 2>&1 || command -v 7zz >/dev/null 2>&1 || die "7z is st
 # ------------------------------------------------------------------ app
 
 step "Installing $APP_NAME into $VENV"
+[ "$GUI" -eq 1 ] && say "(the first time this downloads the Qt toolkit for the GUI, about 100 MB)"
 # A distro upgrade can leave the environment's Python gone, too old, or a new
 # version that doesn't see the packages installed for the old one.
 if [ -e "$VENV" ] && ! "$VENV/bin/python" -I -c 'import sys, pip; sys.exit(sys.version_info < (3, 11))' >/dev/null 2>&1; then
@@ -236,8 +282,11 @@ if [ ! -x "$VENV/bin/python" ]; then
     mkdir -p "$DATA_DIR"
     "$PY" -m venv "$VENV"
 fi
+EXTRA_NAMES=()
+[ "$GUI" -eq 1 ] && EXTRA_NAMES+=(gui)
+[ "$DEV" -eq 1 ] && EXTRA_NAMES+=(dev)
 EXTRAS=""
-[ "$DEV" -eq 1 ] && EXTRAS="[dev]"
+[ "${#EXTRA_NAMES[@]}" -eq 0 ] || EXTRAS="[$(IFS=,; echo "${EXTRA_NAMES[*]}")]"
 "$VENV/bin/python" -m pip install --quiet --disable-pip-version-check --no-cache-dir --editable "$REPO_DIR$EXTRAS"
 
 mkdir -p "$BIN_DIR"
@@ -247,6 +296,37 @@ fi
 ln -sfn "$VENV/bin/bethmm" "$LAUNCHER"
 say "command: $LAUNCHER -> $VENV/bin/bethmm"
 "$LAUNCHER" --version
+
+if [ "$GUI" -eq 1 ]; then
+    step "Adding the GUI to your applications menu"
+    if [ -e "$GUI_LAUNCHER" ] && [ ! -L "$GUI_LAUNCHER" ]; then
+        die "$GUI_LAUNCHER exists and is not a link made by this script; move it away and run this again"
+    fi
+    ln -sfn "$VENV/bin/bethmm-gui" "$GUI_LAUNCHER"
+    say "command: $GUI_LAUNCHER -> $VENV/bin/bethmm-gui"
+    if [ -e "$DESKTOP_FILE" ] && ! our_desktop_file; then
+        warn "$DESKTOP_FILE exists and was not made by this script; left as it is (no menu entry added)"
+    else
+        mkdir -p "$(dirname "$DESKTOP_FILE")"
+        "$VENV/bin/python" -I -m bethmm.gui.desktop "$VENV/bin/bethmm-gui" "$ICON" > "$DESKTOP_FILE.tmp"
+        mv -f "$DESKTOP_FILE.tmp" "$DESKTOP_FILE"
+        say "menu entry: $DESKTOP_FILE"
+    fi
+    # Can Qt start? Offscreen first (the toolkit itself), then what its X11 plugin links to.
+    if ! qt_error="$(QT_QPA_PLATFORM=offscreen "$VENV/bin/python" -I -c 'from PySide6 import QtWidgets' 2>&1)"; then
+        warn "the GUI can't load Qt: ${qt_error##*$'\n'}"
+        warn "the command line works; see \"If the GUI doesn't start\" in the README"
+    else
+        qt_dir="$("$VENV/bin/python" -I -c 'import os, PySide6; print(os.path.join(os.path.dirname(PySide6.__file__), "Qt"))')"
+        xcb_missing="$(ldd "$qt_dir/plugins/platforms/libqxcb.so" 2>/dev/null | awk '/not found/ { print $1 }' | sort -u | tr '\n' ' ')"
+        if [ -n "$xcb_missing" ]; then
+            warn "the GUI may not start in an X11 session: missing ${xcb_missing% }"
+            warn "on Ubuntu:  sudo apt install ${GUI_LIBS[*]}"
+        fi
+    fi
+else
+    remove_gui_entries
+fi
 
 if [ "$DEV" -eq 1 ]; then
     step "Running the tests"
@@ -265,6 +345,10 @@ case ":$PATH:" in
 esac
 say "Keep this folder ($REPO_DIR): the app runs from it. To update:  git pull && ./install.sh"
 say ""
-say "Try:"
+if [ "$GUI" -eq 1 ]; then
+    say "Open \"$APP_NAME\" from your applications menu, or run:  ${RUN}-gui"
+    say ""
+fi
+say "On the command line, try:"
 say "  $RUN games"
 say "  $RUN analyze ~/Downloads/<some mod>.7z"

@@ -15,8 +15,8 @@ The project is built in phases:
 |---|---|---|
 | 1 | Game discovery, placement rules, tests, read-only CLI | **done** |
 | 2 | Staging, deploy/undeploy with symlinks, manifest, CLI | **done** |
-| 3 | Desktop GUI (PySide6) | next |
-| 4 | FOMOD installer, plugins.txt management | |
+| 3 | Desktop GUI (PySide6) | **done** |
+| 4 | FOMOD installer, plugins.txt management | next |
 
 Until phase 4, plugins (`.esp/.esm/.esl`) are linked into `Data` but **not** added to
 `plugins.txt` — enable them in the game's launcher or edit `plugins.txt` by hand.
@@ -32,20 +32,24 @@ cd f4mm-linux
 
 `install.sh` (run it as your normal user, not with sudo):
 
-1. checks for Python 3.11+ and the `7z` program and offers to install what is
-   missing with `apt` — the Python venv module, `7zip` and `7zip-rar` for `.rar`
-   files (`p7zip-full`/`p7zip-rar` on 22.04-based releases, plus `python3.11` there
-   because they ship Python 3.10). It asks before running `sudo apt`;
+1. checks for Python 3.11+, the `7z` program and the libraries the GUI's Qt
+   toolkit needs, and offers to install what is missing with `apt` — the Python
+   venv module, `7zip` and `7zip-rar` for `.rar` files (`p7zip-full`/`p7zip-rar` on
+   22.04-based releases, plus `python3.11` there because they ship Python 3.10),
+   and usually `libxcb-cursor0`. It asks before running `sudo apt`;
 2. creates a private Python environment in `~/.local/share/beth-mod-manager/venv`
-   with the app installed from this folder;
-3. puts a `bethmm` command in `~/.local/bin` (Ubuntu adds that folder to your
-   `PATH` at login once it exists — log out and back in after the first install).
+   with the app and Qt (PySide6, about 100 MB to download the first time)
+   installed from this folder;
+3. puts the `bethmm` and `bethmm-gui` commands in `~/.local/bin` (Ubuntu adds that
+   folder to your `PATH` at login once it exists — log out and back in after the
+   first install) and a **BETH Mod Manager** entry in your applications menu.
 
 Keep the cloned folder: the app runs from it. To update, `git pull && ./install.sh`.
 
 Options: `--yes` (don't ask), `--dev` (also install the test tools and run the
-tests), `--no-system-packages` (never call apt), `--uninstall` (removes the app
-and the `bethmm` command; your mods, backups and settings stay — it refuses while
+tests), `--no-gui` (command line only: no Qt, no menu entry), `--no-system-packages`
+(never call apt), `--uninstall` (removes the app, its commands and its menu entry;
+your mods, backups and settings stay — it refuses while
 mods are still deployed in a game folder and shows what is left; run
 `bethmm purge --all` first), `--force` (install even as root, or uninstall even
 though mods are still deployed). If an update of your distro broke the app's
@@ -60,14 +64,59 @@ it again. `.zip` and `.7z` work without it.
 
 ```bash
 sudo apt install python3-venv 7zip 7zip-rar          # 22.04-based: python3.11 python3.11-venv p7zip-full p7zip-rar
+sudo apt install libxcb-cursor0                      # for the GUI
 python3 -m venv ~/.local/share/beth-mod-manager/venv  # 22.04-based: python3.11 -m venv ...
-~/.local/share/beth-mod-manager/venv/bin/pip install -e .
+~/.local/share/beth-mod-manager/venv/bin/pip install -e '.[gui]'   # '.' alone: command line only
 mkdir -p ~/.local/bin
 ln -s ~/.local/share/beth-mod-manager/venv/bin/bethmm ~/.local/bin/bethmm
+ln -s ~/.local/share/beth-mod-manager/venv/bin/bethmm-gui ~/.local/bin/bethmm-gui
 ```
 </details>
 
-## Managing mods
+## The desktop app
+
+Open **BETH Mod Manager** from your applications menu (or run `bethmm-gui`, or
+`bethmm gui`). Pick the game at the top; the list shows its mods in order, and
+**the lower a mod is in the list, the more conflicts it wins**.
+
+* **Install**: *File ▸ Install...* (Ctrl+O), or drag archives from your file
+  manager onto the window (`bethmm-gui ~/Downloads/mod.7z` opens straight into
+  the install dialog). The dialog shows where every file would go — new, replacing
+  an original game file (which is backed up), or overriding another mod — and, on
+  its *Changes in the game folder* tab, exactly what would be linked and backed
+  up. When the archive looks like a new version of a mod you have, the button says
+  **Update**; you can install it as a new mod instead, or pick which mod it
+  updates. If the app can't tell where an archive's files belong, tick *Choose the
+  folders myself*, tick the folders to install and where they go, and click *Use
+  this choice*.
+* **Enable / disable**: tick or untick the box in front of a mod.
+* **Order**: drag mods up and down (or Ctrl+Up / Ctrl+Down, or the *Mod* menu).
+* Every change is applied to the game folder right away. If the game folder is
+  missing or something is in the way, nothing is changed and the reason is shown.
+* Select a mod to see its files (and which of them another mod overrides), its
+  conflicts, and where it came from, with a link to its Nexus page. Right-click
+  it to rename (F2), update it from an archive, open its folder or uninstall it (Del).
+* *Game* menu: **Deploy** (Ctrl+D), **Purge** (back to vanilla, mods stay
+  installed), **Verify** (shows what doesn't match the records, with a *Repair*
+  button), **Check links** (does Wine see the links?) and *Game settings* (game
+  folder, Wine prefix, link mode, hide the game).
+* *Settings*: where your Lutris games are, the `7z` program, and **dry-run mode**:
+  every change then opens a preview of exactly what it would do in the game
+  folder, and nothing is changed.
+* The *Messages* tab at the bottom says what each action did; *History* lists the
+  latest file operations.
+
+The desktop app and the `bethmm` command use the same code and the same records,
+so you can switch between them freely. Only one change runs at a time: while one
+is running, another (from the command line or a second window) stops at once
+with "another bethmm command is using the manifest right now" and changes nothing.
+
+If the GUI doesn't start, run `bethmm-gui` in a terminal to see why. An error
+about the `xcb` platform plugin means a system library is missing:
+`sudo apt install libxcb-cursor0` (or run `./install.sh` again, which checks for
+the others too).
+
+## Managing mods on the command line
 
 ```bash
 bethmm use fallout4                                   # pick the game once (or add --game to each command)

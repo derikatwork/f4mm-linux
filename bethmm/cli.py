@@ -111,6 +111,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(metavar="command")
 
     p = sub.add_parser("gui", help="open the desktop GUI")
+    p.add_argument("archives", nargs="*", help="archives or folders to install once it is open")
     p.set_defaults(func=cmd_gui)
 
     p = sub.add_parser("games", help="list the Bethesda games found under Lutris")
@@ -470,7 +471,7 @@ def cmd_plugin_info(args) -> int:
 def cmd_gui(args) -> int:
     from bethmm.gui import main as gui_main
 
-    return gui_main([])
+    return gui_main(list(args.archives))
 
 
 def cmd_config(args) -> int:
