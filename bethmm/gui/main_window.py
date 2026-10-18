@@ -77,7 +77,7 @@ class MainWindow(QMainWindow):
         self.games: list[DiscoveredGame] = []
         self.tasks = TaskRunner(self)
         self.tasks.busyChanged.connect(self._busy_changed)
-        self._install_queue: list[tuple[str, int | None]] = []
+        self._install_queue: list[tuple[str, ModRecord | None]] = []
         self._installing = False
         # Once the window is closing, queued installs are dropped and results
         # that would open a dialog only clean up.
@@ -318,6 +318,9 @@ class MainWindow(QMainWindow):
         """Reload the mod list, the details and the history from the manifest."""
         game = self.game
         selected = [m.id for m in self.selected_mods()]
+        current_row = self.table.currentIndex()
+        current = (self.model.rows[current_row.row()].mod.id, current_row.column()) \
+            if current_row.isValid() and current_row.row() < len(self.model.rows) else None
         rows: list[service.ModRow] = []
         state_text = "No game selected."
         history = []
@@ -345,6 +348,11 @@ class MainWindow(QMainWindow):
         if not keep.isEmpty():
             self.table.selectionModel().select(keep, QItemSelectionModel.SelectionFlag.ClearAndSelect
                                                | QItemSelectionModel.SelectionFlag.Rows)
+        # The row the keyboard is on (Space toggles it), as before the reload.
+        row = self.model.row_of(current[0]) if current is not None else None
+        if row is not None:
+            self.table.selectionModel().setCurrentIndex(self.model.index(row, current[1]),
+                                                        QItemSelectionModel.SelectionFlag.NoUpdate)
         self.state_label.setText(state_text)
         self.dry_label.setText("<b>DRY-RUN MODE</b>" if self.settings.dry_run else "")
         self.history.clear()
@@ -579,10 +587,11 @@ class MainWindow(QMainWindow):
         files, _ = QFileDialog.getOpenFileNames(self, f"Update '{mods[0].name}' from", str(Path.home() / "Downloads"),
                                                 ARCHIVE_FILTER)
         if files:
-            self.install_paths(files[:1], replace=mods[0].id)
+            self.install_paths(files[:1], replace=mods[0])
 
-    def install_paths(self, sources: list[str], replace: int | None = None) -> None:
-        """Install each archive or folder in turn (each through the install dialog)."""
+    def install_paths(self, sources: list[str], replace: ModRecord | None = None) -> None:
+        """Install each archive or folder in turn (each through the install
+        dialog); with *replace*, as the new version of that mod."""
         self._install_queue += [(s, replace) for s in sources if s]
         if not self._installing and not self.tasks.busy:
             self._next_install()
@@ -607,20 +616,17 @@ class MainWindow(QMainWindow):
 
         self.tasks.run(prepare, lambda prepared: self._show_install(prepared, replace), failed)
 
-    def _show_install(self, prepared: staging.Prepared, replace_id: int | None) -> None:
+    def _show_install(self, prepared: staging.Prepared, replace: ModRecord | None) -> None:
         if self._closing:
             staging.discard(prepared)
             self._installing = False
             return
-        replace = None
-        if replace_id is not None:
-            try:
-                with Manifest() as manifest:
-                    replace = manifest.mod(replace_id)
-            except ManifestError:
-                replace = None
         try:
+            if replace is not None:  # the mod that was selected, if it is still that mod
+                with Manifest() as manifest:
+                    replace = service.current(manifest, [replace])[0]
             dialog = InstallDialog(prepared, self.games, self.settings, replace=replace,
+                                   current=self.game.game_id if self.game is not None else None,
                                    can_install=not self.settings.dry_run, why_not=DRY_RUN_NOTE, parent=self)
         except Exception as exc:
             staging.discard(prepared)

@@ -43,6 +43,7 @@ Every file operation is logged.
 from __future__ import annotations
 
 import errno
+import fcntl
 import logging
 import os
 import re
@@ -89,6 +90,35 @@ class StagingError(Exception):
 
 
 @dataclass
+class InUse:
+    """A shared lock on an extraction folder for as long as this process uses
+    it: ``remove_stale_extractions`` (in any process) leaves it alone, however
+    long an install dialog or prompt stays open. Without file locking (some
+    network filesystems) only the folder's age protects it."""
+
+    def __init__(self, folder: Path) -> None:
+        self._fd: int | None = None
+        try:
+            fd = os.open(folder, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        except OSError as exc:
+            log.debug("can't lock %s: %s", folder, exc)
+            return
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH)
+        except OSError as exc:
+            log.debug("can't lock %s: %s", folder, exc)
+            os.close(fd)
+            return
+        self._fd = fd
+
+    def release(self) -> None:
+        """Safe to call twice (several Prepared share one after replan)."""
+        fd, self._fd = self._fd, None
+        if fd is not None:
+            os.close(fd)
+
+
+@dataclass
 class Prepared:
     #: The archive or folder the user picked.
     source: Path
@@ -100,6 +130,8 @@ class Prepared:
     files: list[str]
     plan: PlacementPlan
     warnings: list[str] = field(default_factory=list)
+    #: Held until ``discard``.
+    in_use: InUse | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass
@@ -114,8 +146,8 @@ class CommitResult:
 # ---------------------------------------------------------------- prepare
 
 
-#: A temporary extraction untouched this long belongs to a run that was killed
-#: (or a window closed in the middle of an install); newer ones may be in use.
+#: A temporary extraction untouched this long, and not locked by a running
+#: copy of the app (see ``InUse``), was left by a run that was killed.
 STALE_SECONDS = 6 * 3600
 
 
@@ -134,11 +166,24 @@ def remove_stale_extractions(tmp: Path | None = None) -> None:
                 and entry.stat(follow_symlinks=False).st_mtime < cutoff
         except OSError:
             continue
-        if stale:
+        if not stale:
+            continue
+        try:
+            fd = os.open(entry.path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        except OSError:
+            continue
+        try:
             try:
-                _remove_tree(Path(entry.path), tmp, 1, "the app's temporary folder")
-            except (OSError, StagingError) as exc:
-                log.warning("could not delete %s: %s", entry.path, exc)
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                continue  # a running install is still using it
+            except OSError:
+                pass  # no file locking here: the age decides
+            _remove_tree(Path(entry.path), tmp, 1, "the app's temporary folder")
+        except (OSError, StagingError) as exc:
+            log.warning("could not delete %s: %s", entry.path, exc)
+        finally:
+            os.close(fd)
 
 
 def prepare(
@@ -173,6 +218,7 @@ def prepare(
         raise StagingError(f"can't install {source}: it contains the app's own data folder")
     workdir = Path(tempfile.mkdtemp(prefix=_WORKDIR_PREFIX, dir=tmp))
     log.info("MKDIR %s", workdir)
+    in_use = InUse(workdir)
     files_dir = workdir / "x"
     try:
         warnings: list[str] = []
@@ -196,8 +242,9 @@ def prepare(
             _remove_tree(workdir, paths.tmp_dir(), 1, "the app's temporary folder")
         except (OSError, StagingError) as exc:
             log.error("could not remove the temporary folder %s: %s", workdir, exc)
+        in_use.release()
         raise
-    return Prepared(source, workdir, files_dir, sorted(files), plan, warnings)
+    return Prepared(source, workdir, files_dir, sorted(files), plan, warnings, in_use)
 
 
 def replan(prepared: Prepared, roots: Sequence[str] | None, target: Target | None, *,
@@ -214,7 +261,7 @@ def replan(prepared: Prepared, roots: Sequence[str] | None, target: Target | Non
             roots = [placement.analyze_files(files).root]
         plan = placement.plan_for_roots(files, roots, target, **options)
     return Prepared(prepared.source, prepared.workdir, prepared.files_dir, sorted(files), plan,
-                    list(prepared.warnings))
+                    list(prepared.warnings), prepared.in_use)
 
 
 def _copy_folder(source: Path, dest: Path) -> list[str]:
@@ -623,6 +670,8 @@ def discard(prepared: Prepared) -> None:
         _remove_tree(prepared.workdir, paths.tmp_dir(), 1, "the app's temporary folder")
     except OSError as exc:
         log.error("could not remove the temporary folder %s: %s", prepared.workdir, exc)
+    if prepared.in_use is not None:
+        prepared.in_use.release()
 
 
 #: A staging folder being deleted is renamed to ".<name>" + this first, so a

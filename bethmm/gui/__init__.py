@@ -19,6 +19,8 @@ before = sys.getrefcount(True)
 for _ in range(50):
     probe.ping.emit()
 print(before - sys.getrefcount(True), flush=True)
+import os
+os._exit(0)  # a leaking PySide would crash the interpreter's shutdown
 """
 
 
@@ -29,7 +31,8 @@ def pyside_problem() -> str | None:
     if sys.version_info >= (3, 12):
         return None
     try:
-        out = subprocess.run([sys.executable, "-I", "-c", _PROBE], capture_output=True, text=True, timeout=120)
+        # -P, not -I: the same PySide as here, wherever it comes from (PYTHONPATH, user site).
+        out = subprocess.run([sys.executable, "-P", "-c", _PROBE], capture_output=True, text=True, timeout=120)
         lost = int(out.stdout.split()[0])
     except (OSError, subprocess.SubprocessError, ValueError, IndexError):
         return None  # can't tell: don't stand in the way

@@ -5,6 +5,7 @@ import logging
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import zipfile
 from pathlib import Path
@@ -980,3 +981,23 @@ def test_prepare_removes_extractions_a_killed_run_left(tmp_path):
         assert not old.exists() and recent.exists() and other.exists()
     finally:
         staging.discard(prepared)
+
+
+def test_an_extraction_in_use_is_never_stale(tmp_path):
+    """An install dialog or prompt left open overnight: another run's sweep
+    (here: another process) must not delete the files it is about to install."""
+    prepared = staging.prepare(_zip(tmp_path / "m.zip", COOL_MOD))
+    try:
+        os.utime(prepared.workdir, (1_000_000, 1_000_000))
+        sweep = "from bethmm import staging; staging.remove_stale_extractions()"
+        subprocess.run([sys.executable, "-c", sweep], check=True, cwd=Path(__file__).resolve().parent.parent)
+        assert prepared.files_dir.is_dir()
+        again = staging.replan(prepared, None, None)
+        staging.discard(again)
+        assert not prepared.workdir.exists()
+    finally:
+        staging.discard(prepared)  # twice: the shared lock is released once
+    old = make_tree(paths.tmp_dir() / "install-left-by-a-killed-run", ["x/a.esp"])
+    os.utime(old, (1_000_000, 1_000_000))
+    staging.remove_stale_extractions()
+    assert not old.exists()

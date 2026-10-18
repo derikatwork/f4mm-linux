@@ -189,8 +189,8 @@ class InstallDialog(QDialog):
     it updates an installed mod, and exactly what changes in the game folder."""
 
     def __init__(self, prepared: staging.Prepared, games: list[DiscoveredGame], settings: Settings, *,
-                 replace: ModRecord | None = None, can_install: bool = True, why_not: str = "",
-                 parent: QWidget | None = None) -> None:
+                 replace: ModRecord | None = None, current: str | None = None, can_install: bool = True,
+                 why_not: str = "", parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.prepared = prepared
         self.games = games
@@ -288,9 +288,9 @@ class InstallDialog(QDialog):
         self._fill_folders()
         detected = service.detected_game(prepared.plan, settings, self.installed)
         # The game of the mod to update, else the one the files are for, else
-        # the current one. A game that isn't installed is never swapped for
-        # another one: the user picks the game (or cancels).
-        wanted = replace.game_id if replace is not None else detected or settings.current_game
+        # the one the window shows (*current*). A game that isn't installed is
+        # never swapped for another one: the user picks the game (or cancels).
+        wanted = replace.game_id if replace is not None else detected or current or settings.current_game
         index = self.game_combo.findData(wanted)
         if index < 0 and (detected is None or replace is not None) and len(games) == 1:
             index = 0
@@ -498,10 +498,13 @@ class InstallDialog(QDialog):
                                             disabled=self.disabled_check.isChecked())
             if not self._name_touched:
                 self.name_edit.setText(choice.name)
-            same_name = choice.same_name
+            same_name, looks_same = choice.same_name, False
             if choice.existing is None and same_name is None:
                 same_name = next((m.name for m in manifest.mods(game.game_id)
                                   if m.name.casefold() == choice.name.casefold()), None)
+                # "Install as a new mod" picked although the update rules matched.
+                looks_same = same_name is not None and \
+                    staging.find_existing(manifest, game.game_id, self.prepared) is not None
             owners = service.link_owners(game.game_id, manifest)
             resolved = service.resolve_against_game(self.prepared.plan, game, owners,
                                                     replacing=choice.existing.id if choice.existing else None)
@@ -525,7 +528,10 @@ class InstallDialog(QDialog):
                 text = f"'{choice.name}' goes to the bottom of the list, disabled."
             else:
                 text = f"'{choice.name}' goes to the bottom of the list, so it wins conflicts with mods installed."
-                if same_name:
+                if same_name and looks_same:
+                    text += (f" '{same_name}' looks like an earlier version of it; choose 'Update the installed "
+                             "mod' to update it instead.")
+                elif same_name:
                     text += (f" A mod called '{same_name}' is installed too, but it doesn't look like the same "
                              "mod; choose 'Update the installed mod' if this is its new version.")
             self.update_info.setText(text)

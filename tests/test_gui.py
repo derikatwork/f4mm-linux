@@ -16,6 +16,7 @@ pytest.importorskip("pytestqt")
 from PySide6.QtCore import QMimeData, QModelIndex, Qt  # noqa: E402
 
 import test_cli_mods as climods  # noqa: E402
+from helpers import make_tree  # noqa: E402
 from bethmm import paths  # noqa: E402
 from bethmm.cli import main  # noqa: E402
 from bethmm.gui.dialogs import InstallDialog, PlanDialog, VerifyDialog  # noqa: E402
@@ -512,5 +513,57 @@ def test_update_from_archive_stays_with_the_mods_game(qtbot, home, fo4, tmp_path
     try:
         assert dialog.game is not None and dialog.game.game_id == "fallout4"
         assert dialog.as_update.isChecked() and dialog.install_button.text() == "Update"
+    finally:
+        staging.discard(dialog.prepared)
+
+
+def test_update_from_archive_of_a_mod_changed_elsewhere_is_refused(qtbot, window, answers, tmp_path, fo4):
+    two_mods(tmp_path)
+    window.refresh()
+    stale = window.model.rows[1].mod
+    assert main(["uninstall", "Better Shared", "--yes"]) == 0
+    other = mod_zip(tmp_path, "Weapons Pack-3-1-0-1700000000.zip", {"Weapons.esp": esp()})
+    assert main(["install", str(other), "--yes"]) == 0  # gets the freed id
+    v2 = mod_zip(tmp_path, "Better Shared-2222-3-0-1700000200.zip", {"BetterShared.esp": esp()})
+    window.install_paths([str(v2)], replace=stale)
+    idle(qtbot, window)
+    assert not [d for d in answers.dialogs if isinstance(d, InstallDialog)]
+    assert any("no longer installed" in text or "changed" in text for _, text, warning in answers.told if warning)
+    assert (fo4 / "Data" / "Weapons.esp").is_symlink()
+    assert not any(p.name.startswith("install-") for p in paths.tmp_dir().iterdir())
+
+
+def test_the_dialog_starts_on_the_windows_game(qtbot, window, answers, home, tmp_path, fo4):
+    from bethmm.settings import save_settings
+    make_tree(home / "Games" / "skyrim" / "drive_c" / "GOG Games" / "Skyrim", ["SkyrimSE.exe", "Data/"])
+    window.settings.current_game = None
+    save_settings(window.settings)
+    window.reload_games(rescan=True)
+    window.game_combo.setCurrentIndex(window.game_combo.findData("skyrimse"))
+    window.install_paths([str(mod_zip(tmp_path, "Tex-1-1-0.zip", {"textures/x.dds": b"x"}))])
+    idle(qtbot, window)
+    (dialog,) = [d for d in answers.dialogs if isinstance(d, InstallDialog)]
+    assert dialog.game is not None and dialog.game.game_id == "skyrimse"
+
+
+def test_the_keyboard_row_survives_an_operation(qtbot, window, tmp_path, fo4):
+    two_mods(tmp_path)
+    window.refresh()
+    window.table.setCurrentIndex(window.model.index(1, COL_ENABLED))
+    window.set_selected_enabled(False)
+    idle(qtbot, window)
+    assert window.table.currentIndex().row() == 1
+    assert [m.name for m in window.selected_mods()] == ["Better Shared"]
+
+
+def test_the_same_name_hint_when_the_update_was_turned_down(qtbot, home, fo4, tmp_path):
+    from bethmm import staging
+    first = mod_zip(tmp_path, "Cool Mod-555-1-0-1700000000.zip", {"Cool.esp": esp()})
+    assert main(["install", str(first), "--yes"]) == 0
+    dialog = _dialog(qtbot, tmp_path, "Cool Mod-555-2-0-1700000100.zip", {"Cool.esp": esp()})
+    try:
+        assert dialog.as_update.isChecked()
+        dialog.as_new.setChecked(True)
+        assert "looks like an earlier version" in dialog.update_info.text()
     finally:
         staging.discard(dialog.prepared)
