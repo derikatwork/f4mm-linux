@@ -171,6 +171,23 @@ def prepare(
     return Prepared(source, workdir, files_dir, sorted(files), plan, warnings)
 
 
+def replan(prepared: Prepared, roots: Sequence[str] | None, target: Target | None, *,
+           installed_games: Sequence[str] = ()) -> Prepared:
+    """*prepared* with a new plan for the chosen *roots* and *target* (the
+    files stay where they were extracted; ``None`` for both: automatic).
+    Raises ``ValueError`` from ``plan_for_roots`` for an invalid choice."""
+    files, reader, _warnings = placement.scan_directory(prepared.files_dir)
+    options = dict(header_reader=reader, installed_games=installed_games, archive_name=prepared.source.name)
+    if not roots and target is None:
+        plan = placement.analyze_files(files, **options)
+    else:
+        if not roots:
+            roots = [placement.analyze_files(files).root]
+        plan = placement.plan_for_roots(files, roots, target, **options)
+    return Prepared(prepared.source, prepared.workdir, prepared.files_dir, sorted(files), plan,
+                    list(prepared.warnings))
+
+
 def _copy_folder(source: Path, dest: Path) -> list[str]:
     """Copy the folders and regular files below *source* into *dest* without
     following symlinks; symlinks and special files are skipped with a warning."""

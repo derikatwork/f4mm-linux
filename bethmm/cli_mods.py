@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 from typing import Callable
 
-from bethmm import deploy, service, staging, winecheck
+from bethmm import deploy, describe, service, staging, winecheck
 from bethmm.discovery import DiscoveredGame, get_games
 from bethmm.games import GAMES
 from bethmm.manifest import Manifest, ManifestError, ModRecord
@@ -189,35 +189,7 @@ def _mod_names(manifest: Manifest, game_id: str) -> dict[int, str]:
     return {m.id: m.name for m in manifest.mods(game_id)}
 
 
-_VERBS = {
-    "link": ("linked", "would link", "file"),
-    "unlink": ("removed", "would remove", "link"),
-    "backup": ("backed up", "would back up", "original game file"),
-    "restore": ("restored", "would restore", "original game file"),
-    "dropbackup": ("dropped", "would drop", "spare backup copy"),
-    "mkdir": ("created", "would create", "folder"),
-    "rmdir": ("removed", "would remove", "folder"),
-}
-
-
-def _describe_op(op: deploy.Op, names: dict[int, str]) -> str:
-    if op.kind == "link":
-        return f"link     {op.path}  ->  {names.get(op.mod_id or 0, '?')}"
-    if op.kind == "backup":
-        return f"backup   {op.path}  (original moved to {op.source})"
-    if op.kind == "restore":
-        return f"restore  {op.path}  (from {op.source})"
-    if op.kind == "forget":
-        return f"forget   {op.path}  ({op.note})"
-    if op.kind == "dropbackup":
-        return f"drop     {op.source}  (spare copy: the original {op.path} is back in place)"
-    if op.kind == "reclaim":
-        return f"reclaim  {op.path}  (its original, from {op.source})"
-    if op.kind == "rerecord":
-        return f"record   {op.path}  (the app's link, {op.note}: its folder was renamed)"
-    if op.kind in ("unlink", "rmdir") and op.note:
-        return f"{op.kind:<8} {op.path}  ({op.note})"
-    return f"{op.kind:<8} {op.path}"
+_describe_op = describe.describe_op
 
 
 def _report(result: deploy.SyncResult | None, manifest: Manifest, *, verbose: bool = False,
@@ -245,16 +217,8 @@ def _report(result: deploy.SyncResult | None, manifest: Manifest, *, verbose: bo
             for op in ops:
                 print(f"  {_describe_op(op, names)}")
     else:
-        counts: dict[str, int] = {}
-        for op in ops:
-            counts[op.kind] = counts.get(op.kind, 0) + 1
-        parts = []
-        for kind in ("link", "unlink", "backup", "restore", "dropbackup", "mkdir", "rmdir"):
-            if counts.get(kind):
-                done, _, noun = _VERBS[kind]
-                n = counts[kind]
-                parts.append(f"{done} {n} {noun}{'s' if n != 1 else ''}")
-        print(("Done: " + ", ".join(parts) + ".") if parts else "Nothing needed to change.")
+        done = describe.summary(ops)
+        print(f"Done: {done}." if done else "Nothing needed to change.")
         if verbose:
             for op in ops:
                 print(f"  {_describe_op(op, names)}")

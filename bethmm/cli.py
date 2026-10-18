@@ -110,6 +110,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"{APP_NAME} {__version__}")
     sub = parser.add_subparsers(metavar="command")
 
+    p = sub.add_parser("gui", help="open the desktop GUI")
+    p.set_defaults(func=cmd_gui)
+
     p = sub.add_parser("games", help="list the Bethesda games found under Lutris")
     p.add_argument("--rescan", action="store_true", help="ignore the cache and search again")
     p.add_argument("--json", action="store_true", help="machine-readable output")
@@ -462,6 +465,12 @@ def cmd_plugin_info(args) -> int:
 
 
 # ---------------------------------------------------------------- settings
+
+
+def cmd_gui(args) -> int:
+    from bethmm.gui import main as gui_main
+
+    return gui_main([])
 
 
 def cmd_config(args) -> int:
