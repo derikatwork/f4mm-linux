@@ -321,6 +321,8 @@ def find_existing(manifest: Manifest, game_id: str, prepared: Prepared, name: st
         old = {fold_path(f.dest) for f in manifest.mod_files(mod.id)}
         if any(_is_plugin(d) for d in old) and not plugins:
             return False  # a retexture, patch or preset of a mod with plugins
+        if plugins and not (dests - plugins) and any(not _is_plugin(d) for d in old):
+            return False  # a hotfix of just the plugin of a mod that has other files
         # A new version keeps most of its files (its plugin may be renamed);
         # a hotfix of one plugin or a retexture shares only a few.
         return bool(old) and 2 * len(old & dests) >= len(old)

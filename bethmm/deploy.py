@@ -76,6 +76,11 @@ TEMP_PREFIX = ".bethmm-move-"
 #: Folder under ``backups/<game>/`` where originals the app no longer needs
 #: (superseded by a game update, or of a game folder that is gone) are kept.
 SUPERSEDED_DIR = ".superseded"
+#: Under a ``.superseded/<time>/`` folder: originals the user released, and
+#: those of a game folder the app switched away from -- never tracked again.
+RELEASED_DIR = "released"
+PREVIOUS_FOLDER_DIR = "previous-folder"
+INTERRUPTED_MOVES_DIR = "interrupted-moves"
 #: Note of a ``mkdir`` op that records a folder an interrupted run made.
 ADOPT_DIR_NOTE = "made by an interrupted run; recording it"
 #: Note of an ``unlink`` op that removes an unrecorded link an interrupted run made.
@@ -338,15 +343,15 @@ def _why_gone(root: Path, game_id: str | None = None, manifest: Manifest | None 
     # Judged by the Data folder the game uses: another spelled 'data' that is
     # empty doesn't count against it.
     datas = [e for e in top if e.name.lower() == "data"]
-    usable = [e for e in datas if e.is_dir() and _holds_files(Path(e.path))]
+    usable = [e for e in datas if e.is_dir() and _holds_files(Path(e.path), skip_junk=True)]
     if datas and not usable:
         entry = datas[0]
         if entry.is_symlink() and not os.path.exists(entry.path):
             return f"its Data folder links to {os.readlink(entry.path)}, which doesn't exist (a drive that isn't mounted?)"
-        return f"its Data folder {entry.path} is empty (a drive that isn't mounted?)"
+        return f"its Data folder {entry.path} is empty, or holds only hidden or junk files (a drive that isn't mounted?)"
     master = GAMES[game_id].main_master if game_id in GAMES else None
     if usable and master and not any(_has_name(Path(e.path), master) for e in usable) \
-            and not _app_moved(manifest, game_id, f"Data/{master}"):
+            and not _master_excused(manifest, game_id, root, f"Data/{master}"):
         return (f"its Data folder has no {master} (a drive that isn't mounted? if the game lost the file, "
                 "restore it with its launcher's file check first)")
     if not _holds_files(root):
@@ -359,14 +364,22 @@ def _why_gone(root: Path, game_id: str | None = None, manifest: Manifest | None 
     return None
 
 
-def _app_moved(manifest: Manifest | None, game_id: str | None, rel: str) -> bool:
-    """Whether the app has *rel* in its backups or recorded a link there (a
-    mod replaced it, and maybe a run was interrupted half way)."""
+def _master_excused(manifest: Manifest | None, game_id: str | None, root: Path, rel: str) -> bool:
+    """Whether the game's master being absent from Data is explained: the app
+    has it (a mod replaced it; its link may have been deleted, or a run was
+    interrupted half way), or this folder holds the app's intact links under
+    Data (it is the folder the app works on, e.g. after the launcher
+    uninstalled the game). (An unmounted Data mount point is caught before
+    this: it holds no game files at all.)"""
     if manifest is None or game_id is None:
         return False
     key = fold_path(rel)
-    return key in manifest.backups(game_id) or key in manifest.deployed(game_id) or any(
-        e.path and fold_path(e.path) == key for e in manifest.unfinished_journal(game_id))
+    deployed = manifest.deployed(game_id)
+    if key in deployed or key in manifest.backups(game_id):
+        return True
+    if any(e.path and fold_path(e.path) == key for e in manifest.unfinished_journal(game_id)):
+        return True
+    return any(k.startswith("DATA/") and _inspect(root / r.path, r) == "intact" for k, r in deployed.items())
 
 
 def _has_name(folder: Path, name: str) -> bool:
@@ -378,10 +391,18 @@ def _has_name(folder: Path, name: str) -> bool:
         return False
 
 
-def _holds_files(folder: Path) -> bool:
+#: What a file manager or OS may leave on an empty mount point.
+_JUNK_NAMES = frozenset({"thumbs.db", "desktop.ini", ".ds_store", ".directory"})
+
+
+def _holds_files(folder: Path, *, skip_junk: bool = False) -> bool:
     """Whether anything but folders is below *folder* (stops at the first
-    file: a game folder has some right at the top)."""
+    file: a game folder has some right at the top). With *skip_junk*, hidden
+    entries and files like Thumbs.db don't count."""
     for dirpath, dirnames, filenames in os.walk(folder):
+        if skip_junk:
+            dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+            filenames = [f for f in filenames if not f.startswith(".") and f.lower() not in _JUNK_NAMES]
         if filenames or any(os.path.islink(os.path.join(dirpath, d)) for d in dirnames):
             return True
     return False
@@ -700,15 +721,15 @@ def plan_sync(manifest: Manifest, target: GameTarget, *, purge: bool = False) ->
                 if key not in interrupted_links:
                     # Provably the app's, but nothing says where the original went.
                     superseded = superseded_copies(path)
-                    if superseded and key not in backups:
+                    reclaim = bool(superseded) and (key not in backups or key in stale)
+                    if reclaim:
                         # Put aside earlier (e.g. purge --forget-missing while the drive
                         # was away): tracked again, so the next purge puts it back.
                         backup_op = Op("reclaim", path, None, str(superseded[-1]), "the original, put aside earlier")
                     plan.warnings.append(
                         f"{path} is already a link to {mod.name}'s file, but the app had no record of it; recording it. "
                         + (f"Its original, kept in {superseded[-1]}, is tracked again and goes back with a purge."
-                           if superseded and key not in backups else
-                           "If the game had its own file there, the app doesn't have it.")
+                           if reclaim else "If the game had its own file there, the app doesn't have it.")
                     )
                 ours_unrecorded.pop(key, None)
             elif leftover is not None and _is_our_link(abs_path, Path(leftover[1])):
@@ -899,7 +920,7 @@ def apply_plan(manifest: Manifest, plan: SyncPlan, *, dry_run: bool = False) -> 
         result.done = list(plan.ops)
         return result
     if plan.switch_from is not None:
-        result.warnings.extend(forget_game(manifest, plan.game_id))
+        result.warnings.extend(forget_game(manifest, plan.game_id, aside=PREVIOUS_FOLDER_DIR))
     deployed = manifest.deployed(plan.game_id)
     backups = manifest.backups(plan.game_id)
     # Record where the mods go before the first change, so the moved-folder
@@ -1092,19 +1113,11 @@ def _run(op: Op, plan: SyncPlan, manifest: Manifest, deployed: dict[str, Deploye
 
     if op.kind == "reclaim":
         kept = Path(op.source or "")
-        if key in backups or not kept.is_file() or kept.is_symlink():
-            raise _Skip(f"the original kept in {kept} is gone or already tracked")
-        destination = _backup_path(game_id, op.path)
-        if os.path.lexists(destination):
-            raise _Skip(f"{destination} already exists")
-        _makedirs_logged(destination.parent, paths.data_dir())
-        record = BackupRecord(game_id, op.path, str(destination))
-        with manifest.transaction():
-            manifest.record_backup(record)
-        _move(kept, destination)
-        backups[key] = record
-        log.info("RECLAIM %s -> %s (the original of %s)", kept, destination, abs_path)
-        _prune_empty_dirs(kept.parent, paths.backups_dir(game_id))
+        if key in backups and os.path.lexists(backups[key].backup):
+            raise _Skip("an original of it is already tracked")
+        if not os.path.lexists(kept) or (kept.is_dir() and not kept.is_symlink()):
+            raise _Skip(f"the original kept in {kept} is gone")
+        backups[key] = _reclaim(manifest, game_id, op.path, kept)
         return None
 
     if op.kind == "link":
@@ -1167,6 +1180,30 @@ def _run(op: Op, plan: SyncPlan, manifest: Manifest, deployed: dict[str, Deploye
         return None
 
     raise ValueError(f"unknown op kind {op.kind!r}")
+
+
+def _reclaim(manifest: Manifest, game_id: str, rel: str, kept: Path) -> BackupRecord:
+    """Track *kept*, an original put aside in ``.superseded``, as the backup
+    of *rel* again: recorded first, then moved into the backups folder (an
+    interruption leaves a record of a missing file, which is dropped later,
+    and the file still in ``.superseded``)."""
+    destination = _backup_path(game_id, rel)
+    if os.path.lexists(destination):
+        raise FileExistsError(errno.EEXIST, "the destination already exists", str(destination))
+    _makedirs_logged(destination.parent, paths.data_dir())
+    record = BackupRecord(game_id, rel, str(destination))
+    with manifest.transaction():
+        manifest.record_backup(record)
+    try:
+        _move(kept, destination)
+    except OSError:
+        if os.path.lexists(kept) and not os.path.lexists(destination):
+            with manifest.transaction():
+                manifest.forget_backup(game_id, rel)
+        raise
+    log.info("RECLAIM %s -> %s (the original of %s)", kept, destination, rel)
+    _prune_empty_dirs(kept.parent, paths.backups_dir(game_id))
+    return record
 
 
 def _undo_backup(key: str, abs_path: Path, game_id: str, manifest: Manifest,
@@ -1304,7 +1341,7 @@ def purge(manifest: Manifest, target: GameTarget, *, dry_run: bool = False,
     return apply_plan(manifest, plan, dry_run=dry_run)
 
 
-def forget_game(manifest: Manifest, game_id: str, *, dry_run: bool = False) -> list[str]:
+def forget_game(manifest: Manifest, game_id: str, *, dry_run: bool = False, aside: str | None = None) -> list[str]:
     """Drop every record of the app's links and folders in a game folder that
     no longer exists, and move the originals it backed up to
     ``backups/<game>/.superseded/<time>/`` (nothing is deleted). Returns what
@@ -1332,8 +1369,9 @@ def forget_game(manifest: Manifest, game_id: str, *, dry_run: bool = False) -> l
         manifest.forget_dir(game_id, path)
     for path in manifest.left_alone(game_id).values():
         manifest.forget_left_alone(game_id, path)
+    where_to = _superseded_dir(game_id) / aside if aside else None
     for record in backups.values():
-        _supersede(manifest, game_id, record)
+        _supersede(manifest, game_id, record, where_to)
     for entry in manifest.unfinished_journal(game_id):
         manifest.finish_journal(entry.id, "abandoned", "the game folder is gone")
     state = manifest.game_state(game_id)
@@ -1352,7 +1390,9 @@ def _superseded_index(game_id: str) -> dict[str, list[Path]]:
     if not base.is_dir():
         return index
     for run in sorted(p for p in base.iterdir() if p.is_dir()):
-        for dirpath, _dirs, files in os.walk(run):
+        for dirpath, dirs, files in os.walk(run):
+            if dirpath == str(run):  # released originals and the like are never tracked again
+                dirs[:] = [d for d in dirs if d not in (RELEASED_DIR, PREVIOUS_FOLDER_DIR, INTERRUPTED_MOVES_DIR)]
             for name in files:
                 full = Path(dirpath) / name
                 try:
@@ -1611,14 +1651,18 @@ def repair(manifest: Manifest, target: GameTarget, report: VerifyReport, *, dry_
     for rel in report.orphan_links:
         if fold_path(rel) in manifest.deployed(game_id) or not _points_into_mods(root / rel):
             changed(rel)
-        elif act(f"remove stray link {rel} (points into the app's mods folder)"):
+            continue
+        if act(f"remove stray link {rel} (points into the app's mods folder)"):
             os.unlink(root / rel)
             log.info("UNLINK %s (stray link)", root / rel)
-            kept = kept_originals.get(fold_path(rel))
-            if kept and fold_path(rel) not in manifest.backups(game_id) and \
-                    act(f"put back the original of {rel}, kept in {kept[-1]}"):
-                _move(kept[-1], root / rel)
-                log.info("RESTORE %s <- %s (original put aside earlier)", root / rel, kept[-1])
+        kept = kept_originals.get(fold_path(rel))
+        if kept and fold_path(rel) not in manifest.backups(game_id) and \
+                act(f"track the original of {rel} again (kept in {kept[-1]}); the purge or deploy that follows "
+                    "puts it back"):
+            try:
+                _reclaim(manifest, game_id, rel, kept[-1])
+            except OSError as exc:
+                actions.append(f"could not track the original of {rel} again: {exc.strerror or exc}")
     for backup in report.missing_backups:
         if os.path.lexists(backup.backup):
             changed(backup.backup)
@@ -1651,7 +1695,7 @@ def repair(manifest: Manifest, target: GameTarget, report: VerifyReport, *, dry_
                 os.path.isdir(full) and not os.path.islink(full)):
             changed(full)
         elif act(f"move {full} (left by an interrupted move) to {superseded}"):
-            destination = superseded / "interrupted-moves" / name
+            destination = superseded / INTERRUPTED_MOVES_DIR / name
             _makedirs_logged(destination.parent, paths.data_dir())
             _move(Path(full), destination)
             log.info("MOVE %s -> %s (left by an interrupted move)", full, destination)
@@ -1694,8 +1738,8 @@ def repair(manifest: Manifest, target: GameTarget, report: VerifyReport, *, dry_
             actions.append(f"keep the original of {backup.path} in {current.backup}: another file is at its path "
                            "(delete that file and purge to get the original back, or release it with "
                            "--release-held)")
-        elif act(f"move the old original of {backup.path} to {superseded} and stop tracking it"):
-            _supersede(manifest, game_id, current, superseded)
+        elif act(f"move the old original of {backup.path} to {superseded / RELEASED_DIR} and stop tracking it"):
+            _supersede(manifest, game_id, current, superseded / RELEASED_DIR)
     for backup in report.restorable:
         actions.append(f"the original {backup.path} goes back with the next purge (or deploy)")
     return actions

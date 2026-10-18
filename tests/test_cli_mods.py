@@ -845,3 +845,16 @@ def test_verify_repair_leaves_links_in_another_copy_alone(home, fo4, tmp_path, c
     assert (copy / "drive_c" / "GOG Games" / "Fallout 4" / "Data" / "A.esp").is_symlink()
     with Manifest() as m:
         assert m.game_state("fallout4").root == before
+
+
+
+def test_plugin_hotfix_of_a_two_file_mod_is_separate(home, fo4, tmp_path, capsys):
+    (tmp_path / "1").mkdir()
+    (tmp_path / "2").mkdir()
+    one = mod_zip(tmp_path / "1", "main.zip", {"ArmorMod.esp": esp(), "ArmorMod - Main.ba2": b"ba2"})
+    two = mod_zip(tmp_path / "2", "main.zip", {"ArmorMod.esp": esp("Fallout4.esm", "DLCRobot.esm")})
+    assert main(["install", str(one), "--yes"]) == 0
+    assert main(["install", str(two), "--yes"]) == 0
+    with Manifest() as m:
+        assert len(m.mods("fallout4")) == 2
+    assert (fo4 / "Data" / "ArmorMod - Main.ba2").is_file()

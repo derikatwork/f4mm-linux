@@ -1031,7 +1031,7 @@ def test_data_mount_point_with_a_stray_file(world):
     away = world.root.with_name("data drive")
     os.rename(world.path("Data"), away)
     make_tree(world.path("Data"), {".directory": "x"})
-    with pytest.raises(deploy.GameFolderGone, match="Fallout4.esm"):
+    with pytest.raises(deploy.GameFolderGone, match="junk"):
         world.purge()
     assert deploy.verify(world.manifest, world.target()).root_missing
     shutil.rmtree(world.path("Data"))
@@ -1057,9 +1057,13 @@ def test_repair_gives_back_an_original_kept_in_superseded(world):
     _remount(world, away)
     report = deploy.verify(world.manifest, world.target())
     assert report.orphan_links == ["Data/Fallout4.esm"]
+    dry = deploy.repair(world.manifest, world.target(), report, dry_run=True)
+    assert any("track the original" in a for a in dry)
     actions = deploy.repair(world.manifest, world.target(), report)
-    assert any("put back the original" in a for a in actions)
+    assert any("track the original" in a for a in actions)
+    world.purge()  # what 'verify --repair' runs next on a purged game
     assert world.path("Data/Fallout4.esm").read_text() == "vanilla esm"
+    assert not world.manifest.has_footprint(GAME)
 
 
 def test_adopted_link_gets_its_original_back_on_purge(world):
@@ -1082,3 +1086,74 @@ def test_copy_of_a_mod_file_is_backed_up_with_a_warning(world):
     assert any("copy of A's file" in w for w in result.warnings)
     world.purge()
     assert world.path("Data/A.esp").read_text() == "a"  # kept: nothing is deleted
+
+
+
+# ================================================================ sixth review round
+
+
+def test_data_mount_point_with_a_stray_file_and_a_mod_replacing_the_master(world):
+    add_mod(world.manifest, "A", {"Data/Fallout4.esm": "old-gen esm", "Data/A.esp": "a"})
+    world.deploy()
+    away = world.root.with_name("data drive")
+    os.rename(world.path("Data"), away)
+    make_tree(world.path("Data"), {".directory": "x"})
+    with pytest.raises(deploy.GameFolderGone, match="junk"):
+        world.purge()
+    shutil.rmtree(world.path("Data"))
+    os.rename(away, world.path("Data"))
+    world.purge()
+    assert_vanilla(world)
+
+
+def test_game_uninstalled_by_its_launcher_can_still_be_purged(world):
+    add_mod(world.manifest, "A", {"Data/A.esp": "a", "Data/NewMod/x.dds": "x"})
+    world.deploy()
+    for rel in VANILLA:  # the launcher removed the game's own files, not the app's links
+        os.unlink(world.path(rel))
+    world.purge()
+    assert not os.path.lexists(world.path("Data/A.esp"))
+    assert not world.manifest.has_footprint(GAME)
+
+
+def test_reclaim_interrupted_before_the_move_is_planned_again(world, monkeypatch):
+    add_mod(world.manifest, "A", {"Data/Fallout4.esm": "modded"})
+    world.deploy()
+    away = _unmount(world)
+    world.purge(forget_missing=True)
+    _remount(world, away)
+    real_move = deploy._move
+
+    def killed(src, dst):
+        if deploy.SUPERSEDED_DIR in str(src):
+            raise Killed()
+        return real_move(src, dst)
+
+    with monkeypatch.context() as mp:
+        mp.setattr(deploy, "_move", killed)
+        with pytest.raises(Killed):
+            world.deploy()
+    world.deploy()
+    world.purge()
+    assert world.path("Data/Fallout4.esm").read_text() == "vanilla esm"
+
+
+def test_released_original_is_never_tracked_again(world):
+    add_mod(world.manifest, "A", {"Data/Fallout4.esm": "modded"})
+    world.deploy()
+    os.unlink(world.path("Data/Fallout4.esm"))
+    world.path("Data/Fallout4.esm").write_text("updated esm")
+    deploy.repair(world.manifest, world.target(), deploy.verify(world.manifest, world.target()), release_held=True)
+    assert deploy._superseded_index(GAME) == {}
+    released = list((paths.backups_dir(GAME) / deploy.SUPERSEDED_DIR).rglob("Fallout4.esm"))
+    assert [r.read_text() for r in released] == ["vanilla esm"] and deploy.RELEASED_DIR in str(released[0])
+
+
+
+def test_data_folder_without_the_master_is_refused(world):
+    """A Data folder with files but without the game's master, which the app
+    never touched, isn't the game's (e.g. some other folder mounted there)."""
+    add_mod(world.manifest, "A", {"Data/A.esp": "a"})
+    os.unlink(world.path("Data/Fallout4.esm"))
+    with pytest.raises(deploy.DeployError, match="no Fallout4.esm"):
+        world.deploy()
