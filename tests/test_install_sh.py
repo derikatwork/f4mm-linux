@@ -137,3 +137,24 @@ def test_uninstall_with_the_command_pointing_elsewhere_fails(tmp_path):
     result = run("--uninstall", env=env)
     assert result.returncode == 1 and "points at /opt/other" in result.stderr
     assert (home / ".local/bin/bethmm").is_symlink()
+
+
+def test_uninstall_recognises_its_own_launcher_however_spelled(tmp_path):
+    env = fake_install(tmp_path, 0, "")
+    home = Path(env["HOME"])
+    launcher = home / ".local/bin/bethmm"
+    launcher.unlink()
+    launcher.symlink_to(f"{home}/.local/share//beth-mod-manager/venv/bin/bethmm")
+    result = run("--uninstall", env=env)
+    assert result.returncode == 0, result.stderr
+    assert not os.path.lexists(launcher)
+
+
+def test_uninstall_refuses_when_the_command_belongs_to_another_install(tmp_path):
+    env = fake_install(tmp_path, 0, "")
+    home = Path(env["HOME"])
+    (home / ".local/bin/bethmm").unlink()
+    (home / ".local/bin/bethmm").symlink_to("/opt/other/venv/bin/bethmm")
+    result = run("--uninstall", env=env)
+    assert result.returncode == 1 and "points at /opt/other" in result.stderr
+    assert (home / ".local/share/beth-mod-manager/venv").exists()

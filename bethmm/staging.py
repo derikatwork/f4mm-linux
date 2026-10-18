@@ -75,6 +75,14 @@ _WORKDIR_PREFIX = "install-"
 _PLUGIN_SUFFIXES = (".esp", ".esm", ".esl")
 
 
+def _is_plugin(folded_dest: str) -> bool:
+    """A game plugin, or a script extender plugin DLL (for telling mods apart)."""
+    low = folded_dest.lower()
+    return low.endswith(_PLUGIN_SUFFIXES) or (low.endswith(".dll") and "/plugins/" in low
+                                               and ("/f4se/" in low or "/skse/" in low or "/sfse/" in low
+                                                    or "/obse/" in low or "/nvse/" in low or "/fose/" in low))
+
+
 class StagingError(Exception):
     pass
 
@@ -303,7 +311,7 @@ def find_existing(manifest: Manifest, game_id: str, prepared: Prepared, name: st
     nexus = prepared.plan.nexus
     is_nexus = nexus is not None and nexus.is_nexus
     dests = {fold_path(m.dest) for m in prepared.plan.mappings}
-    plugins = {d for d in dests if d.lower().endswith(_PLUGIN_SUFFIXES)}
+    plugins = {d for d in dests if _is_plugin(d)}
 
     def related(mod: ModRecord) -> bool:
         if is_nexus and mod.nexus_id == nexus.mod_id:
@@ -311,9 +319,10 @@ def find_existing(manifest: Manifest, game_id: str, prepared: Prepared, name: st
         if is_nexus and mod.nexus_id is not None:
             return False  # another Nexus mod
         old = {fold_path(f.dest) for f in manifest.mod_files(mod.id)}
-        old_plugins = {d for d in old if d.lower().endswith(_PLUGIN_SUFFIXES)}
-        if old_plugins:  # a new version keeps its plugins; a retexture or patch doesn't
-            return bool(old_plugins & plugins)
+        if any(_is_plugin(d) for d in old) and not plugins:
+            return False  # a retexture, patch or preset of a mod with plugins
+        # A new version keeps most of its files (its plugin may be renamed);
+        # a hotfix of one plugin or a retexture shares only a few.
         return bool(old) and 2 * len(old & dests) >= len(old)
 
     def best(candidates: list[ModRecord]) -> ModRecord:
@@ -390,7 +399,7 @@ def unretire(folder: Path) -> None:
 def is_retired(folder: Path) -> bool:
     """Whether *folder* is one the app no longer needs: marked retired, or
     left by an interrupted deletion."""
-    if folder.name.endswith(DELETING_SUFFIX):
+    if folder.name.startswith(".") and folder.name.endswith(DELETING_SUFFIX):
         return True
     return (folder / RETIRED_MARKER).is_file() and not (folder / RETIRED_MARKER).is_symlink()
 

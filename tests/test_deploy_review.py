@@ -1020,3 +1020,65 @@ def test_forget_missing_with_only_an_interrupted_run_says_so(world, monkeypatch)
     result = world.purge(forget_missing=True)
     assert any("interrupted" in n for n in result.forgotten)
     assert not world.manifest.has_footprint(GAME)
+
+
+# ================================================================ fifth review round
+
+
+def test_data_mount_point_with_a_stray_file(world):
+    add_mod(world.manifest, "A", {"Data/Textures/Armor/a.dds": "mod a", "Data/A.esp": "a"})
+    world.deploy()
+    away = world.root.with_name("data drive")
+    os.rename(world.path("Data"), away)
+    make_tree(world.path("Data"), {".directory": "x"})
+    with pytest.raises(deploy.GameFolderGone, match="Fallout4.esm"):
+        world.purge()
+    assert deploy.verify(world.manifest, world.target()).root_missing
+    shutil.rmtree(world.path("Data"))
+    os.rename(away, world.path("Data"))
+    world.purge()
+    assert_vanilla(world)
+
+
+def test_empty_duplicate_data_folder_doesnt_block(world):
+    add_mod(world.manifest, "A", {"Data/Fallout4.esm": "modded"})
+    world.deploy()
+    world.path("data").mkdir()  # an empty one next to the real Data (case-sensitive filesystem)
+    world.vanilla = {**world.vanilla, "data": ("dir",)}
+    world.purge()
+    assert_vanilla(world)
+
+
+def test_repair_gives_back_an_original_kept_in_superseded(world):
+    add_mod(world.manifest, "A", {"Data/Fallout4.esm": "modded"})
+    world.deploy()
+    away = _unmount(world)
+    world.purge(forget_missing=True)
+    _remount(world, away)
+    report = deploy.verify(world.manifest, world.target())
+    assert report.orphan_links == ["Data/Fallout4.esm"]
+    actions = deploy.repair(world.manifest, world.target(), report)
+    assert any("put back the original" in a for a in actions)
+    assert world.path("Data/Fallout4.esm").read_text() == "vanilla esm"
+
+
+def test_adopted_link_gets_its_original_back_on_purge(world):
+    add_mod(world.manifest, "A", {"Data/Fallout4.esm": "modded"})
+    world.deploy()
+    away = _unmount(world)
+    world.purge(forget_missing=True)
+    _remount(world, away)
+    result = world.deploy()
+    assert any("tracked again" in w for w in result.warnings)
+    world.purge()
+    assert world.path("Data/Fallout4.esm").read_text() == "vanilla esm"
+    assert not world.manifest.has_footprint(GAME)
+
+
+def test_copy_of_a_mod_file_is_backed_up_with_a_warning(world):
+    mod = add_mod(world.manifest, "A", {"Data/A.esp": "a"})
+    shutil.copy2(staged(mod, "Data/A.esp"), world.path("Data/A.esp"))  # what a copy-based move leaves
+    result = world.deploy()
+    assert any("copy of A's file" in w for w in result.warnings)
+    world.purge()
+    assert world.path("Data/A.esp").read_text() == "a"  # kept: nothing is deleted

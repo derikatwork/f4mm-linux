@@ -791,3 +791,57 @@ def test_retexture_of_half_a_plugin_mod_with_the_same_name_is_separate(home, fo4
     with Manifest() as m:
         assert len(m.mods("fallout4")) == 2
     assert (fo4 / "Data" / "Armor.esp").is_file()
+
+
+# ---------------------------------------------------------------- fifth review round
+
+
+def test_update_rules_for_plugin_hotfixes_presets_and_renamed_plugins(home, fo4, tmp_path, capsys):
+    def install(folder, name, files):
+        (tmp_path / folder).mkdir()
+        assert main(["install", str(mod_zip(tmp_path / folder, name, files)), "--yes"]) == 0
+
+    install("a1", "main.zip", {"ArmorMod.esp": esp(), "textures/armor/a.dds": b"a", "textures/armor/b.dds": b"b",
+                               "meshes/armor/a.nif": b"n"})
+    install("a2", "main.zip", {"ArmorMod.esp": esp()})  # a hotfix of the plugin: a mod of its own
+    install("b1", "BetterX.zip", {"F4SE/Plugins/BetterX.dll": b"dll", "F4SE/Plugins/BetterX.ini": b"ini"})
+    install("b2", "BetterX.zip", {"F4SE/Plugins/BetterX.ini": b"preset"})  # a preset: separate too
+    install("c1", "CoolMod.zip", {"CoolMod.esp": esp(), "textures/c1.dds": b"1", "textures/c2.dds": b"2",
+                                  "textures/c3.dds": b"3"})
+    install("c2", "CoolMod.zip", {"CoolMod.esl": esp(), "textures/c1.dds": b"1", "textures/c2.dds": b"2",
+                                  "textures/c3.dds": b"3"})  # the plugin became .esl: an update
+    with Manifest() as m:
+        names = [x.name for x in m.mods("fallout4")]
+    assert names.count("main") == 2 and names.count("BetterX") == 2 and names.count("CoolMod") == 1
+    assert not os.path.lexists(fo4 / "Data" / "CoolMod.esp") and (fo4 / "Data" / "CoolMod.esl").is_file()
+
+
+def test_status_names_the_real_reason_a_folder_cant_be_used(home, fo4, tmp_path, capsys):
+    a = mod_zip(tmp_path, "A-1-1-0.zip", {"textures/vanilla.dds": b"mod", "A.esp": esp()})
+    assert main(["install", str(a), "--yes"]) == 0
+    away = fo4.with_name("data drive")
+    os.rename(fo4 / "Data", away)
+    (fo4 / "Data").mkdir()
+    capsys.readouterr()
+    assert main(["status", "--deployed-only"]) == 3
+    assert "Data folder" in capsys.readouterr().out
+    (fo4 / "Data").rmdir()
+    os.rename(away, fo4 / "Data")
+
+
+def test_verify_repair_leaves_links_in_another_copy_alone(home, fo4, tmp_path, capsys):
+    a = mod_zip(tmp_path, "A-1-1-0.zip", {"A.esp": esp()})
+    assert main(["install", str(a), "--yes"]) == 0
+    assert main(["purge", "--yes"]) == 0
+    copy = home / "Games" / "fallout-4-copy"
+    shutil.copytree(home / "Games" / "fallout-4", copy, symlinks=True)
+    (copy / "drive_c" / "GOG Games" / "Fallout 4" / "Data" / "A.esp").symlink_to(
+        paths.mods_dir("fallout4") / "A" / "A.esp")
+    assert main(["override", "fallout4", "--root", str(copy / "drive_c" / "GOG Games" / "Fallout 4")]) == 0
+    with Manifest() as m:
+        before = m.game_state("fallout4").root
+    for _ in range(2):
+        main(["verify", "--repair"])
+    assert (copy / "drive_c" / "GOG Games" / "Fallout 4" / "Data" / "A.esp").is_symlink()
+    with Manifest() as m:
+        assert m.game_state("fallout4").root == before

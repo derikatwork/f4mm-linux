@@ -14,6 +14,7 @@ import json
 import os
 import sys
 from contextlib import contextmanager, redirect_stdout
+from dataclasses import replace
 from pathlib import Path
 from typing import Callable, Iterator
 
@@ -234,6 +235,8 @@ def _describe_op(op: deploy.Op, names: dict[int, str]) -> str:
         return f"forget   {op.path}  ({op.note})"
     if op.kind == "dropbackup":
         return f"drop     {op.source}  (spare copy: the original {op.path} is back in place)"
+    if op.kind == "reclaim":
+        return f"reclaim  {op.path}  (its original, from {op.source})"
     if op.kind == "rerecord":
         return f"record   {op.path}  (the app's link, {op.note}: its folder was renamed)"
     if op.kind in ("unlink", "rmdir") and op.note:
@@ -731,7 +734,8 @@ def cmd_verify(args) -> int:
 
         report = deploy.verify(manifest, target)
         retired, unknown = _unused_staging(manifest, game_id)
-        problems = not report.ok or bool(retired)
+        # Links found in another copy of the game are only reported: --repair never touches them.
+        problems = not replace(report, links_elsewhere=[]).ok or bool(retired)
         if report.root_missing:
             print(f"{name}: the game folder can't be used ({report.missing_reason}), so nothing was checked.")
             print("  If it is on a drive that isn't mounted, mount it and run this again. If that install is gone,")
@@ -744,7 +748,9 @@ def cmd_verify(args) -> int:
         else:
             print(f"{name}: found problems:")
         if report.moved_from is not None:
-            print(f"  note: the mods were deployed into {report.moved_from}, which is gone; checked {report.root}")
+            why = deploy.why_gone(report.moved_from, game_id, manifest) or "it holds none of the app's links"
+            print(f"  note: the mods were deployed into {report.moved_from} ({why}); the app's links are in "
+                  f"{report.root}, so that was checked")
         for record in report.missing:
             print(f"  missing link: {record.path}")
         for record in report.foreign:
@@ -876,7 +882,7 @@ def _deployed_only(manifest: Manifest, game_ids: list[str]) -> int:
             parts.append(f"{len(held)} original(s) kept in the backups because a newer file is at their path "
                          "(safe to leave; 'bethmm verify --repair --release-held' stops tracking them)")
         if report is not None and report.root_missing:
-            parts.append(f"the game folder {root} is missing or empty (a drive that isn't mounted?)")
+            parts.append(f"the game folder can't be used now ({report.missing_reason})")
         print(f"{GAMES[g].name if g in GAMES else g}: " + "; ".join(parts))
         busy = busy or bool(links) or bool(unfinished) or restorable > 0
     if busy:

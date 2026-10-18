@@ -91,12 +91,11 @@ confirm() {
 
 if [ "$UNINSTALL" -eq 1 ]; then
     step "Uninstalling $APP_NAME"
-    if [ ! -e "$VENV" ]; then
-        if [ -L "$LAUNCHER" ] && [ "$(readlink "$LAUNCHER")" != "$VENV/bin/bethmm" ]; then
-            die "no installation in $DATA_DIR; the bethmm command points at $(readlink "$LAUNCHER") -- run this with the XDG_DATA_HOME you installed with"
-        elif [ ! -L "$LAUNCHER" ]; then
-            die "no installation found in $DATA_DIR (for this user: $HOME)"
-        fi
+    if [ -L "$LAUNCHER" ] && [ "$(readlink -m "$LAUNCHER")" != "$(readlink -m "$VENV/bin/bethmm")" ]; then
+        die "the bethmm command points at $(readlink "$LAUNCHER"), not at $VENV -- run this with the XDG_DATA_HOME you installed with"
+    fi
+    if [ ! -e "$VENV" ] && [ ! -L "$LAUNCHER" ]; then
+        die "no installation found in $DATA_DIR (for this user: $HOME)"
     fi
     if [ -e "$VENV" ] && [ "$FORCE" -eq 0 ]; then
         # The installed app answers, or (if its Python is gone) the app in this
@@ -123,7 +122,7 @@ if [ "$UNINSTALL" -eq 1 ]; then
         fi
         [ -z "$status" ] || say "$status"
     fi
-    if [ -L "$LAUNCHER" ] && [ "$(readlink "$LAUNCHER")" = "$VENV/bin/bethmm" ]; then
+    if [ -L "$LAUNCHER" ] && [ "$(readlink -m "$LAUNCHER")" = "$(readlink -m "$VENV/bin/bethmm")" ]; then
         rm "$LAUNCHER"
         say "removed $LAUNCHER"
     fi

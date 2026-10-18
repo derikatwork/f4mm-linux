@@ -671,7 +671,8 @@ class TamperSim(Sim):
                     if src.is_file():
                         src.unlink()
         elif kind == "delete_backup":
-            backups = list(m.backups(GAME).values())
+            # (Not the game's master: without it there is no game for the app to work on.)
+            backups = [b for b in m.backups(GAME).values() if fold_path(b.path) != fold_path("Data/Fallout4.esm")]
             if backups:
                 b = rng.choice(backups)
                 if os.path.lexists(b.backup):
@@ -1282,6 +1283,7 @@ def test_unicode_names_merge_case_insensitively(tmp_path, monkeypatch):
         "Data/Textures/Ärmor/ä.dds": "vanilla ä",
         "Data/ΣΚΥΡΙΜ/σ.txt": "vanilla sigma",
         "Data/straße/x.txt": "vanilla strasse",
+        "Data/Fallout4.esm": "esm",
         "Fallout4.exe": "exe",
     }
     world = fresh_world(tmp_path / "w", monkeypatch, vanilla=vanilla)
@@ -1383,7 +1385,8 @@ def test_very_deep_paths(world):
 
 def test_vanilla_with_case_duplicates(tmp_path, monkeypatch):
     """A folder that is already a mess (Textures and textures both exist)."""
-    vanilla = {"Data/Textures/a.dds": "upper a", "Data/textures/b.dds": "lower b", "Game.exe": "exe"}
+    vanilla = {"Data/Textures/a.dds": "upper a", "Data/textures/b.dds": "lower b", "Data/Fallout4.esm": "esm",
+               "Game.exe": "exe"}
     world = fresh_world(tmp_path / "w", monkeypatch, vanilla=vanilla)
     try:
         add_mod(world.manifest, "A", {"DATA/TEXTURES/a.dds": "mod a", "data/textures/c.dds": "mod c"})

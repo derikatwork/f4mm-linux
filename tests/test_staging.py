@@ -960,3 +960,9 @@ def test_commit_marks_the_previous_folder_retired_before_switching(tmp_path, man
     result = commit(new_prepared, manifest, "fallout4", replace=manifest.mod(old.id))
     discard(new_prepared)
     assert is_retired(result.old_folder) and not is_retired(result.mod.staging_dir())
+
+
+def test_only_the_apps_own_deleting_folders_count_as_retired():
+    from bethmm.staging import DELETING_SUFFIX, is_retired
+    assert is_retired(Path("/x/.Cool Mod" + DELETING_SUFFIX))
+    assert not is_retired(Path("/x/My Mod" + DELETING_SUFFIX))
