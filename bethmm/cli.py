@@ -35,12 +35,12 @@ from pathlib import Path
 from bethmm import APP_NAME, __version__, deploy, paths
 from bethmm.archive import ArchiveError, extract_archive
 from bethmm.deploy import DeployError
-from bethmm.manifest import BUSY_MESSAGE, Manifest, ManifestError
+from bethmm.manifest import BUSY_MESSAGE, ManifestError
+from bethmm.service import ResolvedFile, ServiceError, link_owners, resolve_against_game
 from bethmm.staging import StagingError
 from bethmm.discovery import DiscoveredGame, cache_is_current, get_games
 from bethmm.games import GAMES
 from bethmm.log import setup_logging
-from bethmm.pathresolve import CaseResolver, fold_path
 from bethmm.placement import (
     Confidence,
     PlacementPlan,
@@ -80,7 +80,7 @@ def main(argv: list[str] | None = None) -> int:
     previous = {sig: signal.signal(sig, _exit_on_signal) for sig in (signal.SIGTERM, signal.SIGHUP)}
     try:
         return args.func(args) or 0
-    except (CliError, ArchiveError, SettingsError, DeployError, ManifestError, StagingError) as exc:
+    except (CliError, ArchiveError, SettingsError, DeployError, ManifestError, StagingError, ServiceError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     except sqlite3.Error as exc:
@@ -219,12 +219,12 @@ def cmd_analyze(args) -> int:
 
     game_id = args.game or plan.game.game_id
     game = next((g for g in games if g.game_id == game_id), None)
-    resolved = _resolve_against_game(plan, game, link_owners(game.game_id)) if game else []
+    resolved = resolve_against_game(plan, game, link_owners(game.game_id)) if game else []
 
     if args.json:
         data = plan.to_dict()
         data["checked_against"] = str(game.root) if game else None
-        data["resolved"] = resolved
+        data["resolved"] = [r.to_dict() for r in resolved]
         print(json.dumps(data, indent=2))
     else:
         print(format_plan(plan, game_id, game, resolved, installed=installed, source=str(args.path)))
@@ -289,69 +289,6 @@ def _remove_stale_extractions(tmp: Path) -> None:
             _remove_tree(Path(entry.path))
 
 
-def link_owners(game_id: str, manifest: Manifest | None = None) -> dict[str, tuple[int, str]]:
-    """Folded path -> (id, name) of the installed mod whose link the app put
-    there (read-only; empty when nothing was ever installed)."""
-    if manifest is None:
-        if not paths.manifest_path().exists():
-            return {}
-        try:
-            with Manifest() as opened:
-                return link_owners(game_id, opened)
-        except ManifestError:
-            return {}
-    names = {m.id: m.name for m in manifest.mods(game_id)}
-    return {key: (d.mod_id, names.get(d.mod_id, "another mod")) for key, d in manifest.deployed(game_id).items()}
-
-
-def _resolve_against_game(plan: PlacementPlan, game: DiscoveredGame,
-                          owners: dict[str, tuple[int, str]] | None = None,
-                          replacing: int | None = None) -> list[dict]:
-    """Where each mapping would land in the real game folder (read-only).
-    *owners* (from :func:`link_owners`) tells the app's links from game
-    files; *replacing* is the mod this one updates."""
-    if not game.root.is_dir():
-        return []
-    resolver = CaseResolver(game.root)
-    owners = owners or {}
-    out = []
-    for m in plan.mappings:
-        r = resolver.resolve(m.dest, plan=True)
-        owner = owners.get(fold_path(str(r.rel)))
-        if r.type_conflict:
-            status = "conflict: a folder/file of the other type already exists there"
-        elif r.exists_on_disk and owner is not None and owner[0] == replacing:
-            status = "replaces the previous version's file"
-        elif r.exists_on_disk and owner is not None:
-            status = f"overrides {owner[1]} (its file stays installed)"
-        elif r.exists_on_disk:
-            status = "replaces an existing game file (it would be backed up)"
-        elif r.exists:
-            status = "duplicate within this mod"
-        else:
-            status = "new"
-        out.append({
-            "source": m.source,
-            "dest": str(r.rel),
-            "case_adjusted": _case_note(m.dest, r.rel, game.root),
-            "status": status,
-            "new_dirs": [str(d) for d in r.new_dirs],
-            "notes": list(r.ambiguous),
-        })
-    return out
-
-
-def _case_note(wanted: str, rel, root: Path) -> str | None:
-    """Why the resolved path is spelled differently from the mod's, if it is."""
-    wanted_parts = wanted.replace("\\", "/").split("/")
-    reasons = set()
-    for i, (mine, actual) in enumerate(zip(wanted_parts, rel.parts)):
-        if mine != actual:
-            on_disk = os.path.lexists(root.joinpath(*rel.parts[: i + 1]))
-            reasons.add("case matched to existing folder" if on_disk else "new folder spelled like the game's folders")
-    return "; ".join(sorted(reasons)) or None
-
-
 _RULE_TEXT = {
     Rule.FOMOD: "FOMOD installer",
     Rule.DATA_FOLDER: "has a Data folder",
@@ -372,7 +309,7 @@ def format_plan(
     plan: PlacementPlan,
     game_id: str | None,
     game: DiscoveredGame | None,
-    resolved: list[dict],
+    resolved: list[ResolvedFile],
     *,
     installed: list[str] | None = None,
     source: str = "<archive>",
@@ -439,13 +376,13 @@ def format_plan(
         where = f" in {game.root}" if game and resolved else ""
         out.append(f"Files ({len(plan.mappings)}){where}:")
         if resolved:
-            for note in dict.fromkeys(n for r in resolved for n in r["notes"]):
+            for note in dict.fromkeys(n for r in resolved for n in r.notes):
                 out.append(f"  ! {note}")
             for r in resolved:
-                note = "" if r["status"] == "new" else f"   [{r['status']}]"
-                if r["case_adjusted"]:
-                    note += f"   [{r['case_adjusted']}]"
-                out.append(f"  {r['source']}  ->  {r['dest']}{note}")
+                note = "" if r.status == "new" else f"   [{r.status}]"
+                if r.case_adjusted:
+                    note += f"   [{r.case_adjusted}]"
+                out.append(f"  {r.source}  ->  {r.dest}{note}")
         else:
             for m in plan.mappings:
                 out.append(f"  {m.source}  ->  {m.dest}")

@@ -9,20 +9,16 @@ which prints what would happen and changes nothing.
 from __future__ import annotations
 
 import argparse
-import io
 import json
-import os
 import sys
-from contextlib import contextmanager, redirect_stdout
-from dataclasses import replace
 from pathlib import Path
-from typing import Callable, Iterator
+from typing import Callable
 
-from bethmm import deploy, paths, staging, winecheck
+from bethmm import deploy, service, staging, winecheck
 from bethmm.discovery import DiscoveredGame, get_games
 from bethmm.games import GAMES
 from bethmm.manifest import Manifest, ManifestError, ModRecord
-from bethmm.placement import Confidence, Target
+from bethmm.placement import Target
 from bethmm.settings import Settings, load_settings, save_settings
 
 TARGETS = {"data": Target.DATA, "game": Target.GAME_ROOT}
@@ -189,26 +185,6 @@ def _confirm(question: str, args) -> bool:
     return reply in ("y", "yes")
 
 
-class _Rollback(Exception):
-    pass
-
-
-@contextmanager
-def _preview(manifest: Manifest) -> Iterator[None]:
-    """Make changes inside a transaction that is always rolled back. What is
-    printed meanwhile appears after the rollback, so a paged or suspended
-    dry run never keeps other bethmm commands waiting."""
-    output = io.StringIO()
-    try:
-        with manifest.transaction(), redirect_stdout(output):
-            yield
-            raise _Rollback
-    except _Rollback:
-        pass
-    finally:
-        sys.stdout.write(output.getvalue())
-
-
 def _mod_names(manifest: Manifest, game_id: str) -> dict[int, str]:
     return {m.id: m.name for m in manifest.mods(game_id)}
 
@@ -244,12 +220,13 @@ def _describe_op(op: deploy.Op, names: dict[int, str]) -> str:
     return f"{op.kind:<8} {op.path}"
 
 
-def _report(result: deploy.SyncResult | None, manifest: Manifest, *, verbose: bool = False) -> int:
+def _report(result: deploy.SyncResult | None, manifest: Manifest, *, verbose: bool = False,
+            names: dict[int, str] | None = None) -> int:
     """Print a deploy/purge result; returns 1 if some operations failed."""
     if result is None:
         print("The game is purged, so nothing was linked. Run 'bethmm deploy' to put the mods back.")
         return 0
-    names = _mod_names(manifest, result.plan.game_id)
+    names = names if names is not None else _mod_names(manifest, result.plan.game_id)
     ops = result.done
     if result.forgotten:
         state = manifest.game_state(result.plan.game_id)
@@ -303,7 +280,7 @@ def cmd_use(args) -> int:
 
 
 def cmd_install(args) -> int:
-    from bethmm.cli import format_plan, link_owners, _resolve_against_game
+    from bethmm.cli import format_plan
 
     settings, games = _context(args)
     installed = [g.game_id for g in games]
@@ -320,35 +297,29 @@ def cmd_install(args) -> int:
         raise CliError(f"{exc}{hint}") from exc
     try:
         plan = prepared.plan
-        if plan.target is Target.UNKNOWN or not plan.mappings:
+        problem = service.installable_problem(plan)
+        if problem is not None:
             print(format_plan(plan, None, None, [], installed=installed, source=str(args.source)))
             print()
             if plan.is_fomod:
                 raise CliError("this is a FOMOD installer; the guided installer arrives in phase 4. "
                                "For now choose the folders to install with --root (and --target).")
             if not plan.unplaced and not plan.candidate_roots:
-                skipped = f" ({len(plan.skipped)} file(s) such as readmes are never installed)" if plan.skipped else ""
-                raise CliError(f"the archive contains no files to install{skipped}")
+                raise CliError(problem)
             raise CliError("choose what to install with --root <folder> and --target data|game (see above)")
-        detected = _detected_game(plan, settings, installed)
+        detected = service.detected_game(plan, settings, installed)
         game = _choose_game(args, settings, games, detected=detected)
-        given_name = staging.clean_text(args.name) if args.name else None
-        if args.name is not None and not given_name:
-            raise CliError("the mod name is empty")
 
         dry = _dry(args, settings)
         target_ = _target(game, settings)
         with Manifest(lock=not dry) as manifest:
-            if args.replace:
-                existing: ModRecord | None = _find(manifest, game.game_id, args.replace)
-            elif args.new:
-                existing = None
-            else:
-                existing = staging.find_existing(manifest, game.game_id, prepared, given_name)
-            name = given_name or (existing.name if existing else staging.suggested_name(prepared))
+            replace_mod = _find(manifest, game.game_id, args.replace) if args.replace else None
+            choice = service.choose_install(manifest, game.game_id, prepared, name=args.name, new=args.new,
+                                            replace=replace_mod, disabled=args.no_deploy)
+            existing, name = choice.existing, choice.name
 
-            resolved = _resolve_against_game(plan, game, link_owners(game.game_id, manifest),
-                                             replacing=existing.id if existing else None)
+            resolved = service.resolve_against_game(plan, game, service.link_owners(game.game_id, manifest),
+                                                    replacing=existing.id if existing else None)
             print(format_plan(plan, game.game_id, game, resolved, installed=installed, source=str(args.source),
                               requested=bool(args.game)))
             for warning in prepared.warnings:
@@ -378,114 +349,78 @@ def cmd_install(args) -> int:
                       "until you enable it.")
             else:
                 print(f"'{name}' goes to the bottom of the list, so it wins conflicts with mods already installed.")
-                same = [m.name for m in manifest.mods(game.game_id) if m.name.casefold() == name.casefold()]
-                if same and not args.new:
-                    print(f"  (a mod called '{same[0]}' is installed too; it doesn't look like the same mod -- "
-                          f"use --replace \"{same[0]}\" if this is its new version)")
-            state = manifest.game_state(game.game_id)
-            purged = state is not None and not state.deployed
-            sync = not purged and (existing is not None or not args.no_deploy)
-            if sync:
-                deploy.preflight(manifest, target_)  # fail before installing, not after
+                if choice.same_name:
+                    print(f"  (a mod called '{choice.same_name}' is installed too; it doesn't look like the same mod "
+                          f"-- use --replace \"{choice.same_name}\" if this is its new version)")
+            if choice.sync:
+                service.preflight(manifest, target_)  # fail before installing, not after
             if dry:
-                return _preview_install(manifest, game.game_id, target_, prepared, existing, name, args, sync)
+                return _preview_install(manifest, target_, prepared, choice)
             verb = "Update" if existing else "Install"
             if not _confirm(f"{verb} '{existing.name if existing else name}' into {game.name}?", args):
                 print("Cancelled.")
                 return 1
-            result = staging.commit(prepared, manifest, game.game_id,
-                                    name=given_name if existing else name, replace=existing,
-                                    enabled=False if args.no_deploy else None)
-            print(f"{'Updated' if result.replaced else 'Installed'} '{result.mod.name}'"
+            result = service.install(manifest, target_, prepared, choice)
+            mod = result.commit.mod
+            print(f"{'Updated' if result.commit.replaced else 'Installed'} '{mod.name}'"
                   + (" (disabled)." if args.no_deploy else "."))
             status = 0
-            if sync:
-                status = _report(deploy.refresh(manifest, target_), manifest)
-            elif purged:
+            if choice.sync:
+                status = _report(result.sync, manifest)
+            elif choice.purged:
                 print("The game is purged, so nothing was linked. Run 'bethmm deploy' to put the mods back.")
             else:
-                print(f"Nothing was linked. 'bethmm enable \"{result.mod.name}\"' puts it into the game.")
-            if result.old_folder is not None:
-                still_linked = _links_into(manifest, game.game_id, result.old_folder)
-                if still_linked:  # (marked as retired by commit)
-                    print(f"  ! kept the previous files in {result.old_folder}: {len(still_linked)} link(s) still "
-                          "point there. Run 'bethmm deploy'; then 'bethmm verify --repair' deletes the folder.")
-                else:
-                    staging.remove_staging(result.old_folder)
+                print(f"Nothing was linked. 'bethmm enable \"{mod.name}\"' puts it into the game.")
+            if result.kept_old_folder is not None:
+                print(f"  ! kept the previous files in {result.kept_old_folder}: {result.still_linked} link(s) still "
+                      "point there. Run 'bethmm deploy'; then 'bethmm verify --repair' deletes the folder.")
             return status
     finally:
         staging.discard(prepared)
 
 
-def _detected_game(plan, settings: Settings, installed: list[str]) -> str | None:
-    """The game the files are for, if they tell. A weak guess (e.g. from .ba2
-    archives) still wins over a current game the files can't be for."""
-    guess = plan.game
-    if guess.game_id and guess.confidence >= Confidence.MEDIUM:
-        return guess.game_id
-    if guess.candidates and settings.current_game not in guess.candidates:
-        return next((g for g in guess.candidates if g in installed), None)
-    return None
-
-
-def _preview_install(manifest: Manifest, game_id: str, target: deploy.GameTarget, prepared: staging.Prepared,
-                     existing: ModRecord | None, name: str, args, sync: bool) -> int:
-    """Show what installing would do to the game folder: the mod is added
-    (pointing at the extracted files) inside a transaction that is rolled back."""
-    # An absolute folder: mods_dir / folder is then the extracted files themselves.
-    folder = os.path.abspath(prepared.files_dir)
-    files = staging.checked_files(prepared)  # refuses what the real install refuses
-    with _preview(manifest):
-        if existing is not None:
-            manifest.update_mod(existing.id, folder=folder, files=files, name=name)
-            if args.no_deploy:
-                manifest.set_enabled(existing.id, False)
-        else:
-            manifest.add_mod(game_id, name, folder, files, enabled=not args.no_deploy)
-        print(f"Nothing was {'updated' if existing else 'installed'} (dry run).")
-        if not sync:
-            state = manifest.game_state(game_id)
-            why = "the game is purged" if state is not None and not state.deployed else "the mod would be disabled"
-            print(f"Nothing would be linked: {why}.")
-            return 0
-        return _report(deploy.apply_plan(manifest, deploy.plan_sync(manifest, target), dry_run=True), manifest)
+def _preview_install(manifest: Manifest, target: deploy.GameTarget, prepared: staging.Prepared,
+                     choice: service.InstallChoice) -> int:
+    """Show what installing would do to the game folder."""
+    result, mod_id = service.preview_install(manifest, target, prepared, choice)
+    print(f"Nothing was {'updated' if choice.existing else 'installed'} (dry run).")
+    if result is None:
+        why = "the game is purged" if choice.purged else "the mod would be disabled"
+        print(f"Nothing would be linked: {why}.")
+        return 0
+    return _report(result, manifest, names={**_mod_names(manifest, choice.game_id), mod_id: choice.name})
 
 
 def cmd_list(args) -> int:
     settings, games = _context(args)
     game = _choose_game(args, settings, games)
     with Manifest() as manifest:
-        mods = manifest.mods(game.game_id)
-        summary = deploy.conflict_summary(manifest, game.game_id)
-        names = {m.id: m.name for m in mods}
+        rows = service.mod_rows(manifest, game.game_id)
         state = manifest.game_state(game.game_id)
-        files = {m.id: len(manifest.mod_files(m.id)) for m in mods}
     if args.json:
         print(json.dumps([{
-            "position": i, "id": m.id, "name": m.name, "enabled": m.enabled, "version": m.version,
-            "nexus_id": m.nexus_id, "files": files[m.id],
-            "overwrites": [names[o] for o in summary.get(m.id, deploy.ModConflicts()).overwrites],
-            "overwritten_by": [names[o] for o in summary.get(m.id, deploy.ModConflicts()).overwritten_by],
-        } for i, m in enumerate(mods, start=1)], indent=2))
+            "position": r.position, "id": r.mod.id, "name": r.mod.name, "enabled": r.mod.enabled,
+            "version": r.mod.version, "nexus_id": r.mod.nexus_id, "files": r.files,
+            "overwrites": r.overwrites, "overwritten_by": r.overwritten_by,
+        } for r in rows], indent=2))
         return 0
-    if not mods:
+    if not rows:
         print(f"No mods installed for {game.name}. Install one with: bethmm install <archive>")
         return 0
     deployed = state is None or state.deployed
-    print(f"{game.name} -- {len(mods)} mod(s); lower in the list wins conflicts."
+    print(f"{game.name} -- {len(rows)} mod(s); lower in the list wins conflicts."
           + ("" if deployed else "  [PURGED: run 'bethmm deploy' to put them back]"))
-    width = max(len(m.name) for m in mods)
-    for i, m in enumerate(mods, start=1):
-        c = summary.get(m.id)
+    width = max(len(r.mod.name) for r in rows)
+    for r in rows:
         notes = []
-        if c and c.overwrites:
-            notes.append("overwrites " + ", ".join(names[o] for o in c.overwrites))
-        if c and c.overwritten_by:
-            notes.append("overwritten by " + ", ".join(names[o] for o in c.overwritten_by))
-        box = "[x]" if m.enabled else "[ ]"
-        version = m.version or ""
-        count = f"{files[m.id]} file{'' if files[m.id] == 1 else 's'}"
-        print(f"{i:>3} {box} {m.name:<{width}}  {version:<10} {count:>11}  {'; '.join(notes)}".rstrip())
+        if r.overwrites:
+            notes.append("overwrites " + ", ".join(r.overwrites))
+        if r.overwritten_by:
+            notes.append("overwritten by " + ", ".join(r.overwritten_by))
+        box = "[x]" if r.mod.enabled else "[ ]"
+        version = r.mod.version or ""
+        count = f"{r.files} file{'' if r.files == 1 else 's'}"
+        print(f"{r.position:>3} {box} {r.mod.name:<{width}}  {version:<10} {count:>11}  {'; '.join(notes)}".rstrip())
     return 0
 
 
@@ -497,26 +432,16 @@ def _mutate_and_refresh(args, mutate: Callable[[Manifest, deploy.GameTarget], st
     target = _target(game, settings)
     dry = _dry(args, settings)
     with Manifest(lock=not dry) as manifest:
-        _preflight(manifest, target)
+        def change(m: Manifest) -> str:
+            return mutate(m, target)
+
         if dry:
-            with _preview(manifest):
-                describe = mutate(manifest, target)
-                state = manifest.game_state(game.game_id)
-                plan = deploy.plan_sync(manifest, target) if state is None or state.deployed else None
-                result = deploy.apply_plan(manifest, plan, dry_run=True) if plan else None
-                print(f"(dry run) {describe}")
-                return _report(result, manifest)
-        describe = mutate(manifest, target)
+            describe, result = service.preview_change(manifest, target, change)
+            print(f"(dry run) {describe}")
+            return _report(result, manifest)
+        describe, result = service.apply_change(manifest, target, change)
         print(describe)
-        return _report(deploy.refresh(manifest, target), manifest)
-
-
-def _preflight(manifest: Manifest, target: deploy.GameTarget) -> None:
-    """Fail before the mod list changes if the redeploy after it is bound to
-    fail (game folder moved, hardlinks across filesystems)."""
-    state = manifest.game_state(target.game_id)
-    if state is None or state.deployed:
-        deploy.preflight(manifest, target)
+        return _report(result, manifest)
 
 
 def cmd_enable(args) -> int:
@@ -569,53 +494,29 @@ def cmd_uninstall(args) -> int:
     with Manifest(lock=not dry) as manifest:
         mods = [_find(manifest, game.game_id, q) for q in args.mods]
         names = ", ".join(f"'{m.name}'" for m in mods)
-        _preflight(manifest, target)
+        service.preflight(manifest, target)
         if dry:
-            with _preview(manifest):
-                for mod in mods:
-                    manifest.set_enabled(mod.id, False)
-                state = manifest.game_state(game.game_id)
-                result = deploy.apply_plan(manifest, deploy.plan_sync(manifest, target), dry_run=True) \
-                    if state is None or state.deployed else None
-                print(f"Would uninstall {names} and delete their staged files.")
-                return _report(result, manifest)
+            result = service.preview_uninstall(manifest, target, mods)
+            print(f"Would uninstall {names} and delete their staged files.")
+            return _report(result, manifest)
         if not _confirm(f"Uninstall {names} from {game.name}? Their staged files are deleted.", args):
             print("Cancelled.")
             return 1
+        outcome = service.uninstall(manifest, target, mods)
+        status = _report(outcome.sync, manifest) if outcome.sync is not None else 0
+        kept = {mod.id: folder for mod, folder in outcome.kept_folders}
+        stuck = {mod.id for mod in outcome.still_linked}
         for mod in mods:
-            manifest.set_enabled(mod.id, False)
-        result = deploy.refresh(manifest, target)
-        status = _report(result, manifest) if result is not None else 0
-        for mod in mods:
-            folder = mod.staging_dir()
-            # Marked first: if the app dies while deleting a big folder,
-            # 'verify --repair' can tell the leftover is its own.
-            if folder.is_dir() and not folder.is_symlink():
-                staging.retire(folder)
-            try:
-                manifest.remove_mod(mod.id)
-            except ManifestError:
-                staging.unretire(folder)
+            if mod.id in stuck:
                 print(f"  ! '{mod.name}' still has links that could not be removed; it stays installed (disabled). "
                       "Run 'bethmm verify --repair'.")
                 status = 1
                 continue
-            if _links_into(manifest, game.game_id, folder):
-                print(f"  ! kept the files of '{mod.name}' in {folder}: an interrupted run may have linked them; "
-                      "'bethmm verify --repair' deletes the folder once nothing uses it.")
-            else:
-                staging.remove_staging(folder)
+            if mod.id in kept:
+                print(f"  ! kept the files of '{mod.name}' in {kept[mod.id]}: an interrupted run may have linked "
+                      "them; 'bethmm verify --repair' deletes the folder once nothing uses it.")
             print(f"Uninstalled '{mod.name}'.")
         return status
-
-
-def _links_into(manifest: Manifest, game_id: str, folder: Path) -> list[str]:
-    """Paths in the game folder that link (or, by the journal, may link) into *folder*."""
-    prefix = str(folder) + "/"
-    paths_ = [d.path for d in manifest.deployed(game_id).values() if d.source.startswith(prefix)]
-    paths_ += [e.path for e in manifest.unfinished_journal(game_id)
-               if e.action == "link" and e.path and (e.source or "").startswith(prefix)]
-    return paths_
 
 
 def cmd_conflicts(args) -> int:
@@ -720,22 +621,20 @@ def cmd_verify(args) -> int:
         raise CliError("--release-held goes with --repair")
     with Manifest(lock=args.repair and not dry) as manifest:
         game_id = _recorded_game(args, settings, games, manifest)
-        found = next((g for g in games if g.game_id == game_id), None)
+        found_game = next((g for g in games if g.game_id == game_id), None)
         name = GAMES[game_id].name
-        if found is not None:
-            target = _target(found, settings)
+        if found_game is not None:
+            target = _target(found_game, settings)
         else:  # no longer found: check where the mods were deployed
             target = deploy.GameTarget(game_id, Path(manifest.game_state(game_id).root),
                                        settings.override(game_id).link_mode)
 
         def remove_leftovers() -> None:
-            for line in winecheck.remove_leftovers(game_id, found.data_dir) if found is not None else ():
+            for line in winecheck.remove_leftovers(game_id, found_game.data_dir) if found_game is not None else ():
                 print(f"  {line}")
 
-        report = deploy.verify(manifest, target)
-        retired, unknown = _unused_staging(manifest, game_id)
-        # Links found in another copy of the game are only reported: --repair never touches them.
-        problems = not replace(report, links_elsewhere=[]).ok or bool(retired)
+        found = service.check(manifest, target)
+        report, retired, unknown, problems = found.report, found.retired, found.unknown, found.problems
         if report.root_missing:
             print(f"{name}: the game folder can't be used ({report.missing_reason}), so nothing was checked.")
             print("  If it is on a drive that isn't mounted, mount it and run this again. If that install is gone,")
@@ -792,50 +691,28 @@ def cmd_verify(args) -> int:
         if not args.repair:
             print("Run 'bethmm verify --repair' to fix what can be fixed safely.")
             return 1
-        for line in deploy.repair(manifest, target, report, dry_run=dry, release_held=args.release_held):
+        outcome = service.repair(manifest, target, found, release_held=args.release_held, dry_run=dry,
+                                 data_dir=found_game.data_dir if found_game is not None else None)
+        for line in outcome.actions:
             print(f"  {'would ' if dry else ''}{line}")
-        state = manifest.game_state(game_id)
-        purged = state is not None and not state.deployed
         if dry:
-            for folder in retired:
+            for folder in outcome.deleted:
                 print(f"  would delete {folder}")
+            purged = outcome.purged
             print(f"  then it would {'purge again (to restore originals)' if purged else 'redeploy'}; after the "
                   f"repair, 'bethmm {'purge' if purged else 'deploy'} --dry-run' shows exactly what that changes.")
             return 0
-        remove_leftovers()
+        for line in outcome.leftovers:
+            print(f"  {line}")
         # The repair can free originals (e.g. a half-made link is gone): a purged
         # game gets them back with a purge, a deployed one is brought up to date.
-        try:
-            result = deploy.purge(manifest, target) if purged else deploy.refresh(manifest, target)
-        except deploy.DeployError as exc:
-            print(f"  ! {exc}")
+        if outcome.sync_error is not None:
+            print(f"  ! {outcome.sync_error}")
             return 1
-        status = _report(result, manifest)
-        for folder in _unused_staging(manifest, game_id)[0]:
-            staging.remove_staging(folder)
+        status = _report(outcome.sync, manifest)
+        for folder in outcome.deleted:
             print(f"  deleted {folder}")
         return status
-
-
-def _unused_staging(manifest: Manifest, game_id: str) -> tuple[list[Path], list[Path]]:
-    """Folders in the game's mods folder that no installed mod and no deployed
-    link uses: those an update marked as retired (the app deletes them) and
-    any others (left alone: the app can't tell they are its own)."""
-    base = paths.mods_dir(game_id)
-    try:
-        entries = sorted(p for p in base.iterdir() if p.is_dir() and not p.is_symlink())
-    except OSError:
-        return [], []
-    used = {m.folder for m in manifest.mods(game_id)}
-    sources = [d.source for d in manifest.deployed(game_id).values()]
-    sources += [e.source for e in manifest.unfinished_journal(game_id) if e.action == "link" and e.source]
-    unused = [
-        p for p in entries
-        if p.name not in used and p.name != winecheck.TEST_DIR
-        and not any(src.startswith(str(p) + "/") for src in sources)
-    ]
-    retired = [p for p in unused if staging.is_retired(p)]
-    return retired, [p for p in unused if p not in retired]
 
 
 def cmd_status(args) -> int:
@@ -859,32 +736,23 @@ def cmd_status(args) -> int:
 
 
 def _deployed_only(manifest: Manifest, game_ids: list[str]) -> int:
-    """What the app still has in game folders; 1 if a purge has anything to do."""
+    """What the app still has in game folders; DEPLOYED_STATUS if a purge has anything to do."""
     busy = False
-    for g in game_ids:
-        links, backups = manifest.deployed(g), manifest.backups(g)
-        unfinished = manifest.unfinished_journal(g)
-        if not links and not backups and not unfinished:
-            continue
-        state = manifest.game_state(g)
-        root = Path(state.root) if state is not None else None
-        report = deploy.verify(manifest, deploy.GameTarget(g, root)) if root is not None else None
-        held = report.held_backups if report is not None and not report.root_missing else []
+    for fp in service.footprints(manifest):
         parts = []
-        if links:
-            parts.append(f"{len(links)} link(s) in {root or 'the game folder'}")
-        if unfinished:
-            parts.append(f"{len(unfinished)} operation(s) of an interrupted run that a purge cleans up")
-        restorable = len(backups) - len(held)
-        if restorable:
-            parts.append(f"{restorable} original game file(s) in the app's backups that a purge puts back")
-        if held:
-            parts.append(f"{len(held)} original(s) kept in the backups because a newer file is at their path "
+        if fp.links:
+            parts.append(f"{fp.links} link(s) in {fp.root or 'the game folder'}")
+        if fp.unfinished:
+            parts.append(f"{fp.unfinished} operation(s) of an interrupted run that a purge cleans up")
+        if fp.restorable:
+            parts.append(f"{fp.restorable} original game file(s) in the app's backups that a purge puts back")
+        if fp.held:
+            parts.append(f"{fp.held} original(s) kept in the backups because a newer file is at their path "
                          "(safe to leave; 'bethmm verify --repair --release-held' stops tracking them)")
-        if report is not None and report.root_missing:
-            parts.append(f"the game folder can't be used now ({report.missing_reason})")
-        print(f"{GAMES[g].name if g in GAMES else g}: " + "; ".join(parts))
-        busy = busy or bool(links) or bool(unfinished) or restorable > 0
+        if fp.unusable:
+            parts.append(f"the game folder can't be used now ({fp.unusable})")
+        print(f"{fp.name}: " + "; ".join(parts))
+        busy = busy or fp.busy
     if busy:
         print("Run 'bethmm purge --all' to put the game folders back as they were.")
     return DEPLOYED_STATUS if busy else 0
