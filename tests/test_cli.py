@@ -277,14 +277,14 @@ def test_os_errors_are_reported_without_traceback(home, tmp_path, capsys, monkey
 
 
 def test_stale_extractions_are_cleaned(home, tmp_path):
-    from bethmm import cli
+    from bethmm import staging
 
     tmp = paths.tmp_dir()
     old = make_tree(tmp / "analyze-old", ["x/a.dds"])
     new = make_tree(tmp / "analyze-new", ["x/a.dds"])
     other = make_tree(tmp / "keep-me", ["a"])
     os.utime(old, (1_000_000, 1_000_000))
-    cli._remove_stale_extractions(tmp)
+    staging.remove_stale_extractions(tmp)
     assert not old.exists() and new.exists() and other.exists()
 
 

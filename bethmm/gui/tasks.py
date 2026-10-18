@@ -24,6 +24,7 @@ class TaskRunner(QObject):
         self._pool.setMaxThreadCount(1)
         self._jobs: dict[int, tuple[Callable[[Any], None], Callable[[BaseException], None]]] = {}
         self._next = 0
+        self._held: list[tuple[int, bool, object]] | None = None
         self._finished.connect(self._deliver, Qt.ConnectionType.QueuedConnection)
 
     @property
@@ -46,8 +47,23 @@ class TaskRunner(QObject):
         through the event loop)."""
         self._pool.waitForDone()
 
+    def hold(self) -> None:
+        """Keep results of jobs that finish from now on until :meth:`release`
+        (say, while a question is open that decides what happens to them)."""
+        if self._held is None:
+            self._held = []
+
+    def release(self) -> None:
+        """Deliver the results kept since :meth:`hold`, in order."""
+        held, self._held = self._held or [], None
+        for job in held:
+            self._deliver(*job)
+
     @Slot(int, bool, object)
     def _deliver(self, job_id: int, ok: bool, result: object) -> None:
+        if self._held is not None:
+            self._held.append((job_id, ok, result))
+            return
         on_done, on_error = self._jobs.pop(job_id)
         try:
             if ok:

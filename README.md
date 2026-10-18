@@ -67,6 +67,7 @@ sudo apt install python3-venv 7zip 7zip-rar          # 22.04-based: python3.11 p
 sudo apt install libxcb-cursor0                      # for the GUI
 python3 -m venv ~/.local/share/beth-mod-manager/venv  # 22.04-based: python3.11 -m venv ...
 ~/.local/share/beth-mod-manager/venv/bin/pip install -e '.[gui]'   # '.' alone: command line only
+#   (tests: '.[gui,dev,gui-dev]', or '.[dev]' without the GUI)
 mkdir -p ~/.local/bin
 ln -s ~/.local/share/beth-mod-manager/venv/bin/bethmm ~/.local/bin/bethmm
 ln -s ~/.local/share/beth-mod-manager/venv/bin/bethmm-gui ~/.local/bin/bethmm-gui
@@ -92,14 +93,17 @@ Open **BETH Mod Manager** from your applications menu (or run `bethmm-gui`, or
 * **Enable / disable**: tick or untick the box in front of a mod.
 * **Order**: drag mods up and down (or Ctrl+Up / Ctrl+Down, or the *Mod* menu).
 * Every change is applied to the game folder right away. If the game folder is
-  missing or something is in the way, nothing is changed and the reason is shown.
+  missing or unusable, nothing is changed and the reason is shown. A file the app
+  didn't make that is in a mod's way is left alone: that one file isn't linked,
+  and the *Messages* tab says so.
 * Select a mod to see its files (and which of them another mod overrides), its
   conflicts, and where it came from, with a link to its Nexus page. Right-click
   it to rename (F2), update it from an archive, open its folder or uninstall it (Del).
 * *Game* menu: **Deploy** (Ctrl+D), **Purge** (back to vanilla, mods stay
   installed), **Verify** (shows what doesn't match the records, with a *Repair*
   button), **Check links** (does Wine see the links?) and *Game settings* (game
-  folder, Wine prefix, link mode, hide the game).
+  folder, Wine prefix, link mode, hide the game — and set up a game that wasn't
+  found, or bring back a hidden one).
 * *Settings*: where your Lutris games are, the `7z` program, and **dry-run mode**:
   every change then opens a preview of exactly what it would do in the game
   folder, and nothing is changed.
@@ -335,7 +339,7 @@ Prints the plugin's masters, header version and the game it was made for.
 ## Running the tests
 
 ```bash
-./install.sh --dev        # installs pytest into the app's environment and runs the tests
+./install.sh --dev        # installs pytest (and pytest-qt for the GUI tests) and runs the tests
 # or, afterwards:
 ~/.local/share/beth-mod-manager/venv/bin/python -m pytest
 ```

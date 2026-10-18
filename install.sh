@@ -285,6 +285,7 @@ fi
 EXTRA_NAMES=()
 [ "$GUI" -eq 1 ] && EXTRA_NAMES+=(gui)
 [ "$DEV" -eq 1 ] && EXTRA_NAMES+=(dev)
+[ "$GUI" -eq 1 ] && [ "$DEV" -eq 1 ] && EXTRA_NAMES+=(gui-dev)
 EXTRAS=""
 [ "${#EXTRA_NAMES[@]}" -eq 0 ] || EXTRAS="[$(IFS=,; echo "${EXTRA_NAMES[*]}")]"
 "$VENV/bin/python" -m pip install --quiet --disable-pip-version-check --no-cache-dir --editable "$REPO_DIR$EXTRAS"
@@ -293,17 +294,23 @@ mkdir -p "$BIN_DIR"
 if [ -e "$LAUNCHER" ] && [ ! -L "$LAUNCHER" ]; then
     die "$LAUNCHER exists and is not a link made by this script; move it away and run this again"
 fi
+# A link to something that still exists belongs to another installation (a
+# dangling one is what an earlier install of this app left behind).
+if [ -e "$LAUNCHER" ] && ! our_link "$LAUNCHER" "$VENV/bin/bethmm"; then
+    die "$LAUNCHER points at $(readlink "$LAUNCHER"), not at $VENV -- remove that link (or run this with the XDG_DATA_HOME you installed with) and run this again"
+fi
 ln -sfn "$VENV/bin/bethmm" "$LAUNCHER"
 say "command: $LAUNCHER -> $VENV/bin/bethmm"
 "$LAUNCHER" --version
 
 if [ "$GUI" -eq 1 ]; then
     step "Adding the GUI to your applications menu"
-    if [ -e "$GUI_LAUNCHER" ] && [ ! -L "$GUI_LAUNCHER" ]; then
-        die "$GUI_LAUNCHER exists and is not a link made by this script; move it away and run this again"
+    if [ -e "$GUI_LAUNCHER" ] && ! our_link "$GUI_LAUNCHER" "$VENV/bin/bethmm-gui"; then
+        warn "$GUI_LAUNCHER is not a link to this install ($(readlink "$GUI_LAUNCHER" || echo 'a file')); left as it is"
+    else
+        ln -sfn "$VENV/bin/bethmm-gui" "$GUI_LAUNCHER"
+        say "command: $GUI_LAUNCHER -> $VENV/bin/bethmm-gui"
     fi
-    ln -sfn "$VENV/bin/bethmm-gui" "$GUI_LAUNCHER"
-    say "command: $GUI_LAUNCHER -> $VENV/bin/bethmm-gui"
     if [ -e "$DESKTOP_FILE" ] && ! our_desktop_file; then
         warn "$DESKTOP_FILE exists and was not made by this script; left as it is (no menu entry added)"
     else
@@ -313,7 +320,7 @@ if [ "$GUI" -eq 1 ]; then
         say "menu entry: $DESKTOP_FILE"
     fi
     # Can Qt start? Offscreen first (the toolkit itself), then what its X11 plugin links to.
-    if ! qt_error="$(QT_QPA_PLATFORM=offscreen "$VENV/bin/python" -I -c 'from PySide6 import QtWidgets' 2>&1)"; then
+    if ! qt_error="$(QT_QPA_PLATFORM=offscreen "$VENV/bin/python" -I -c 'import sys; from PySide6 import QtWidgets; from bethmm.gui import pyside_problem; p = pyside_problem(); sys.exit(p) if p else None' 2>&1)"; then
         warn "the GUI can't load Qt: ${qt_error##*$'\n'}"
         warn "the command line works; see \"If the GUI doesn't start\" in the README"
     else
@@ -346,7 +353,9 @@ esac
 say "Keep this folder ($REPO_DIR): the app runs from it. To update:  git pull && ./install.sh"
 say ""
 if [ "$GUI" -eq 1 ]; then
-    say "Open \"$APP_NAME\" from your applications menu, or run:  ${RUN}-gui"
+    GUI_RUN="${RUN}-gui"
+    our_link "$GUI_LAUNCHER" "$VENV/bin/bethmm-gui" || GUI_RUN="$VENV/bin/bethmm-gui"
+    say "Open \"$APP_NAME\" from your applications menu, or run:  $GUI_RUN"
     say ""
 fi
 say "On the command line, try:"

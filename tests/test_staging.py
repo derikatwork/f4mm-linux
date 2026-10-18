@@ -966,3 +966,17 @@ def test_only_the_apps_own_deleting_folders_count_as_retired():
     from bethmm.staging import DELETING_SUFFIX, is_retired
     assert is_retired(Path("/x/.Cool Mod" + DELETING_SUFFIX))
     assert not is_retired(Path("/x/My Mod" + DELETING_SUFFIX))
+
+
+def test_prepare_removes_extractions_a_killed_run_left(tmp_path):
+    tmp = paths.tmp_dir()
+    old = make_tree(tmp / "install-old", ["x/a.esp"])
+    recent = make_tree(tmp / "install-recent", ["x/a.esp"])
+    other = make_tree(tmp / "not-ours", ["a"])
+    os.utime(old, (1_000_000, 1_000_000))
+    os.utime(other, (1_000_000, 1_000_000))
+    prepared = staging.prepare(_zip(tmp_path / "m.zip", COOL_MOD))
+    try:
+        assert not old.exists() and recent.exists() and other.exists()
+    finally:
+        staging.discard(prepared)

@@ -258,3 +258,13 @@ def test_menu_entry_command_line(capsys):
     assert desktop.main(["/x/bethmm-gui", "/x/icon.svg"]) == 0
     assert "Exec=\"/x/bethmm-gui\" %F" in capsys.readouterr().out
     assert desktop.main([]) == 2
+
+
+def test_the_test_tools_install_without_qt():
+    """--dev --no-gui: pytest-qt refuses to start without a Qt binding, so it
+    comes only with the GUI's test extra."""
+    import tomllib
+    extras = tomllib.loads((SCRIPT.parent / "pyproject.toml").read_text())["project"]["optional-dependencies"]
+    assert not any("pytest-qt" in r for r in extras["dev"])
+    assert any("pytest-qt" in r for r in extras["gui-dev"])
+    assert "EXTRA_NAMES+=(gui-dev)" in SCRIPT.read_text()

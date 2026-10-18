@@ -30,6 +30,40 @@ class ServiceError(Exception):
     """A request that can't be carried out as asked (nothing was changed)."""
 
 
+CHANGED_ELSEWHERE = ("the mod list was changed elsewhere (from the command line or another window) since it "
+                     "was shown; look at it again and retry")
+
+
+def _identity(mod: ModRecord) -> tuple:
+    return mod.id, mod.game_id, mod.folder, mod.installed_at
+
+
+def current(manifest: Manifest, mods: list[ModRecord]) -> list[ModRecord]:
+    """*mods* as the manifest has them now. ServiceError if one is gone or its
+    id now belongs to another mod (or a new version of it): records read
+    earlier must not decide what is uninstalled or deleted."""
+    out = []
+    for mod in mods:
+        try:
+            now = manifest.mod(mod.id)
+        except ManifestError:
+            raise ServiceError(f"'{mod.name}' is no longer installed: {CHANGED_ELSEWHERE}") from None
+        if _identity(now) != _identity(mod):
+            raise ServiceError(f"'{mod.name}' changed: {CHANGED_ELSEWHERE}")
+        out.append(now)
+    return out
+
+
+def check_unchanged(manifest: Manifest, game_id: str, shown: list[ModRecord]) -> None:
+    """ServiceError unless *game_id*'s mod list is still *shown*: the same
+    mods, in the same order, enabled the same way."""
+    def key(m: ModRecord) -> tuple:
+        return (*_identity(m), m.enabled)
+
+    if [key(m) for m in manifest.mods(game_id)] != [key(m) for m in shown]:
+        raise ServiceError(CHANGED_ELSEWHERE[0].upper() + CHANGED_ELSEWHERE[1:])
+
+
 def target_for(game: DiscoveredGame, settings: Settings) -> deploy.GameTarget:
     return deploy.GameTarget(game.game_id, game.root, settings.override(game.game_id).link_mode)
 
@@ -350,11 +384,12 @@ def _disable_all(mods: list[ModRecord]) -> Callable[[Manifest], None]:
 
 def preview_uninstall(manifest: Manifest, target: deploy.GameTarget,
                       mods: list[ModRecord]) -> deploy.SyncResult | None:
-    return preview_change(manifest, target, _disable_all(mods))[1]
+    return preview_change(manifest, target, _disable_all(current(manifest, mods)))[1]
 
 
 def uninstall(manifest: Manifest, target: deploy.GameTarget, mods: list[ModRecord]) -> UninstallResult:
     """Disable *mods*, redeploy, then remove them and delete their staged files."""
+    mods = current(manifest, mods)
     _, sync = apply_change(manifest, target, _disable_all(mods))
     out = UninstallResult(sync)
     for mod in mods:

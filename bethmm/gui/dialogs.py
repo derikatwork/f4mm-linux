@@ -6,7 +6,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QButtonGroup,
@@ -287,17 +287,32 @@ class InstallDialog(QDialog):
 
         self._fill_folders()
         detected = service.detected_game(prepared.plan, settings, self.installed)
-        wanted = detected or settings.current_game
+        # The game of the mod to update, else the one the files are for, else
+        # the current one. A game that isn't installed is never swapped for
+        # another one: the user picks the game (or cancels).
+        wanted = replace.game_id if replace is not None else detected or settings.current_game
         index = self.game_combo.findData(wanted)
-        self.game_combo.setCurrentIndex(index if index >= 0 else 0)
+        if index < 0 and (detected is None or replace is not None) and len(games) == 1:
+            index = 0
+        self.game_combo.setCurrentIndex(index)
+        self._detected = detected
         self._replace_wanted = replace
         self._name_touched = False
+        # Ticks or target changed but not applied yet: Install waits for "Use this choice".
+        self._choice_pending = False
+        # The preview is redone once typing in the name pauses, not per key.
+        self._name_timer = QTimer(self)
+        self._name_timer.setSingleShot(True)
+        self._name_timer.setInterval(300)
+        self._name_timer.timeout.connect(self._refresh)
         self.name_edit.textEdited.connect(self._name_edited)
         self.game_combo.currentIndexChanged.connect(self._game_changed)
         self.as_new.toggled.connect(self._options_changed)
         self.update_combo.currentIndexChanged.connect(self._options_changed)
         self.disabled_check.toggled.connect(self._options_changed)
         self.apply_choice.clicked.connect(self._apply_choice)
+        self.folder_tree.itemChanged.connect(self._choice_edited)
+        self.target_group.buttonToggled.connect(self._choice_edited)
         self.choose_toggle.toggled.connect(self.choose_box.setVisible)
         problem = service.installable_problem(prepared.plan)
         self.choose_toggle.setChecked(problem is not None)
@@ -313,7 +328,17 @@ class InstallDialog(QDialog):
 
     def _name_edited(self, _text: str) -> None:
         self._name_touched = True
-        self._refresh()
+        self._name_timer.start()
+
+    def _choice_edited(self, *_args) -> None:
+        self._choice_pending = True
+        self._show_pending()
+
+    def _show_pending(self) -> None:
+        self.choice = None
+        self.install_button.setEnabled(False)
+        self.problem_label.setText("<span style='color:#c0392b'>Click 'Use this choice' to see what the folders "
+                                   "you ticked install.</span>")
 
     def _game_changed(self) -> None:
         game = self.game
@@ -391,16 +416,20 @@ class InstallDialog(QDialog):
             self.prepared = staging.replan(self.prepared, roots or None, target, installed_games=self.installed)
         except ValueError as exc:
             self.choice_error.setText(f"<span style='color:#c0392b'>{exc}</span>")
+            self._choice_pending = True
+            self._show_pending()
             return
         self.choice_error.setText("")
+        self._choice_pending = False
         self._pick_update_target()
         self._refresh()
 
     # ------------------------------------------------------------ what it would do
 
     def _refresh(self) -> None:
+        self._name_timer.stop()
         prepared, plan, game = self.prepared, self.prepared.plan, self.game
-        if not self._name_touched:
+        if not self._name_touched:  # _preview shows the name an update keeps
             self.name_edit.setText(staging.suggested_name(prepared))
         bits = []
         if plan.nexus is not None and plan.nexus.is_nexus:
@@ -412,10 +441,16 @@ class InstallDialog(QDialog):
         guess = plan.game
         if guess.game_id:
             reasons = "; ".join(guess.reasons)
-            self.game_info.setText(f"Looks like a {GAMES[guess.game_id].name} mod ({guess.confidence.name.lower()} "
-                                   f"confidence){': ' + reasons if reasons else ''}")
+            info = (f"Looks like a {GAMES[guess.game_id].name} mod ({guess.confidence.name.lower()} confidence)"
+                    f"{': ' + reasons if reasons else ''}")
         else:
-            self.game_info.setText("The game can't be told from the files.")
+            info = "The game can't be told from the files."
+        if self._detected is not None and self._detected not in self.installed:
+            info += f" {GAMES[self._detected].name} was not found; pick a game to install it into anyway."
+        replace = self._replace_wanted
+        if replace is not None and (game is None or game.game_id != replace.game_id):
+            info += f" '{replace.name}' (the mod to update) is a {GAMES[replace.game_id].name} mod."
+        self.game_info.setText(info)
         problem = service.installable_problem(plan)
         if problem is None:
             reasons = "; ".join(plan.reasons)
@@ -433,7 +468,7 @@ class InstallDialog(QDialog):
         self.choice = None
         self.files_tree.clear()
         self.changes_text.setPlainText("")
-        why_not = problem or ("" if game is not None else "No game to install into.")
+        why_not = problem or ("" if game is not None else "Pick the game to install it into.")
         if not why_not:
             try:
                 why_not = self._preview(game)
@@ -445,6 +480,8 @@ class InstallDialog(QDialog):
         self.problem_label.setText(f"<span style='color:#c0392b'>{why_not}</span>" if why_not else "")
         self.install_button.setEnabled(not why_not)
         self.install_button.setText("Update" if self.choice is not None and self.choice.existing else "Install")
+        if self._choice_pending:
+            self._show_pending()
 
     def _preview(self, game: DiscoveredGame) -> str:
         """Fill in the files and the planned changes; returns why it can't be
@@ -454,10 +491,17 @@ class InstallDialog(QDialog):
             replace = None
             if self.as_update.isChecked() and self.update_combo.currentData() is not None:
                 replace = manifest.mod(self.update_combo.currentData())
-            name = self.name_edit.text().strip()
+            # Only a name the user typed renames: an update keeps the mod's name.
+            name = self.name_edit.text().strip() if self._name_touched else ""
             choice = service.choose_install(manifest, game.game_id, self.prepared, name=name or None,
                                             new=not self.as_update.isChecked(), replace=replace,
                                             disabled=self.disabled_check.isChecked())
+            if not self._name_touched:
+                self.name_edit.setText(choice.name)
+            same_name = choice.same_name
+            if choice.existing is None and same_name is None:
+                same_name = next((m.name for m in manifest.mods(game.game_id)
+                                  if m.name.casefold() == choice.name.casefold()), None)
             owners = service.link_owners(game.game_id, manifest)
             resolved = service.resolve_against_game(self.prepared.plan, game, owners,
                                                     replacing=choice.existing.id if choice.existing else None)
@@ -481,9 +525,9 @@ class InstallDialog(QDialog):
                 text = f"'{choice.name}' goes to the bottom of the list, disabled."
             else:
                 text = f"'{choice.name}' goes to the bottom of the list, so it wins conflicts with mods installed."
-                if choice.same_name:
-                    text += (f" A mod called '{choice.same_name}' is installed too, but it doesn't look like the "
-                             "same mod; choose 'Update' if this is its new version.")
+                if same_name:
+                    text += (f" A mod called '{same_name}' is installed too, but it doesn't look like the same "
+                             "mod; choose 'Update the installed mod' if this is its new version.")
             self.update_info.setText(text)
             result, mod_id = service.preview_install(manifest, target, self.prepared, choice)
             names = {m.id: m.name for m in manifest.mods(game.game_id)}
@@ -499,6 +543,8 @@ class InstallDialog(QDialog):
         return ""
 
     def _accept(self) -> None:
+        if self._name_timer.isActive():  # the name just typed counts
+            self._refresh()
         if self.choice is not None and self.install_button.isEnabled():
             self.accept()
 

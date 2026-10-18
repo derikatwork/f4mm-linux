@@ -49,6 +49,7 @@ import re
 import shutil
 import stat
 import tempfile
+import time
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -113,6 +114,33 @@ class CommitResult:
 # ---------------------------------------------------------------- prepare
 
 
+#: A temporary extraction untouched this long belongs to a run that was killed
+#: (or a window closed in the middle of an install); newer ones may be in use.
+STALE_SECONDS = 6 * 3600
+
+
+def remove_stale_extractions(tmp: Path | None = None) -> None:
+    """Remove analyze-*/install-* folders that runs which never finished left
+    in the app's temporary folder."""
+    tmp = paths.tmp_dir() if tmp is None else tmp
+    cutoff = time.time() - STALE_SECONDS
+    try:
+        entries = list(os.scandir(tmp))
+    except OSError:
+        return
+    for entry in entries:
+        try:
+            stale = entry.name.startswith(("analyze-", _WORKDIR_PREFIX)) and entry.is_dir(follow_symlinks=False) \
+                and entry.stat(follow_symlinks=False).st_mtime < cutoff
+        except OSError:
+            continue
+        if stale:
+            try:
+                _remove_tree(Path(entry.path), tmp, 1, "the app's temporary folder")
+            except (OSError, StagingError) as exc:
+                log.warning("could not delete %s: %s", entry.path, exc)
+
+
 def prepare(
     source: str | Path,
     *,
@@ -140,6 +168,7 @@ def prepare(
 
     tmp = paths.tmp_dir()
     _mkdir(tmp)
+    remove_stale_extractions(tmp)
     if is_folder and _inside_or_same(os.path.realpath(tmp), os.path.realpath(source)):
         raise StagingError(f"can't install {source}: it contains the app's own data folder")
     workdir = Path(tempfile.mkdtemp(prefix=_WORKDIR_PREFIX, dir=tmp))

@@ -388,7 +388,10 @@ class Manifest:
             cur = self._db.execute(
                 "INSERT INTO mods (game_id, name, folder, priority, enabled, version, nexus_id, source_archive, "
                 "installed_at, plan) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (game_id, name, folder, top + 1, int(enabled), version, nexus_id, source_archive, now(),
+                # To the microsecond: with the id and folder, it tells this mod
+                # apart from one installed later under a freed id and folder name.
+                (game_id, name, folder, top + 1, int(enabled), version, nexus_id, source_archive,
+                 datetime.now(timezone.utc).isoformat(timespec="microseconds"),
                  json.dumps(plan or {}, sort_keys=True)),
             )
             mod_id = cur.lastrowid

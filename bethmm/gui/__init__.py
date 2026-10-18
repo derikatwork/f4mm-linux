@@ -5,7 +5,39 @@ window is open."""
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
+
+# Run in a child process: a leaking PySide crashes the interpreter it ran in.
+_PROBE = """
+import sys
+from PySide6.QtCore import QObject, Signal
+class Probe(QObject):
+    ping = Signal()
+probe = Probe()
+before = sys.getrefcount(True)
+for _ in range(50):
+    probe.ping.emit()
+print(before - sys.getrefcount(True), flush=True)
+"""
+
+
+def pyside_problem() -> str | None:
+    """Why the installed PySide6 can't run the app, or None. PySide6 6.12.0
+    drops a reference to True on every signal emitted from Python; before
+    Python 3.12 (where True is immortal) that crashes the app sooner or later."""
+    if sys.version_info >= (3, 12):
+        return None
+    try:
+        out = subprocess.run([sys.executable, "-I", "-c", _PROBE], capture_output=True, text=True, timeout=120)
+        lost = int(out.stdout.split()[0])
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+        return None  # can't tell: don't stand in the way
+    if lost > 25:
+        import PySide6
+        return (f"PySide6 {PySide6.__version__} has a bug that crashes this app on Python "
+                f"{sys.version_info[0]}.{sys.version_info[1]}. Run ./install.sh again to install a working version.")
+    return None
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -25,7 +57,10 @@ def main(argv: list[str] | None = None) -> int:
         setup_logging()
     except OSError as exc:
         print(f"warning: logging disabled: {exc}", file=sys.stderr)
-    # The X11 window class the menu entry's StartupWMClass names, however the app was started.
+    # The X11 window class the menu entry's StartupWMClass names, however the
+    # app was started (taken back once the window exists: programs the app
+    # starts mustn't inherit it).
+    set_resource_name = "RESOURCE_NAME" not in os.environ
     os.environ.setdefault("RESOURCE_NAME", DESKTOP_ID)
     app = QApplication.instance()
     if app is None:
@@ -35,6 +70,11 @@ def main(argv: list[str] | None = None) -> int:
         archives = sys.argv[1:] if argv is None else list(argv)
     app.setApplicationName(APP_NAME)
     app.setDesktopFileName(DESKTOP_ID)
+    problem = pyside_problem()
+    if problem:
+        print(f"error: {problem}", file=sys.stderr)
+        QMessageBox.critical(None, APP_NAME, problem)
+        return 1
     try:
         settings = load_settings()
     except SettingsError as exc:
@@ -44,6 +84,8 @@ def main(argv: list[str] | None = None) -> int:
 
     window = MainWindow(settings)
     window.show()
+    if set_resource_name:
+        os.environ.pop("RESOURCE_NAME", None)
     if archives:
         QTimer.singleShot(0, lambda: window.install_paths([os.path.abspath(a) for a in archives]))
     return app.exec()

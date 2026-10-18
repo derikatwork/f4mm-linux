@@ -29,7 +29,6 @@ import signal
 import sqlite3
 import sys
 import tempfile
-import time
 from pathlib import Path
 
 from bethmm import APP_NAME, __version__, deploy, paths
@@ -37,7 +36,7 @@ from bethmm.archive import ArchiveError, extract_archive
 from bethmm.deploy import DeployError
 from bethmm.manifest import BUSY_MESSAGE, ManifestError
 from bethmm.service import ResolvedFile, ServiceError, link_owners, resolve_against_game
-from bethmm.staging import StagingError
+from bethmm.staging import StagingError, remove_stale_extractions
 from bethmm.discovery import DiscoveredGame, cache_is_current, get_games
 from bethmm.games import GAMES
 from bethmm.log import setup_logging
@@ -54,9 +53,6 @@ from bethmm.plugin_header import PluginHeaderError, candidate_games, read_plugin
 from bethmm.settings import LINK_MODES, GameOverride, Settings, SettingsError, load_settings, save_settings
 
 log = logging.getLogger(__name__)
-
-#: Leftover analyze-* extraction folders older than this are removed.
-STALE_TMP_SECONDS = 6 * 3600
 
 
 class CliError(Exception):
@@ -255,7 +251,7 @@ def _plan(folder: Path, args, installed: list[str], archive_name: str) -> Placem
 def _analyze_archive(archive: Path, args, settings: Settings, installed: list[str]) -> PlacementPlan:
     tmp = paths.tmp_dir()
     tmp.mkdir(parents=True, exist_ok=True)
-    _remove_stale_extractions(tmp)
+    remove_stale_extractions(tmp)
     workdir = Path(tempfile.mkdtemp(prefix="analyze-", dir=tmp))
     log.info("MKDIR %s (temporary extraction)", workdir)
     try:
@@ -274,23 +270,6 @@ def _remove_tree(folder: Path) -> None:
 
     shutil.rmtree(folder, onerror=on_error)
     log.info("DELETE %s (temporary extraction)", folder)
-
-
-def _remove_stale_extractions(tmp: Path) -> None:
-    """Remove analyze-*/install-* folders left behind by a run that was killed."""
-    cutoff = time.time() - STALE_TMP_SECONDS
-    try:
-        entries = list(os.scandir(tmp))
-    except OSError:
-        return
-    for entry in entries:
-        try:
-            stale = entry.name.startswith(("analyze-", "install-")) and entry.is_dir(follow_symlinks=False) \
-                and entry.stat(follow_symlinks=False).st_mtime < cutoff
-        except OSError:
-            continue
-        if stale:
-            _remove_tree(Path(entry.path))
 
 
 _RULE_TEXT = {

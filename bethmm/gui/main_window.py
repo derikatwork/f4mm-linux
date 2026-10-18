@@ -14,7 +14,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
-from PySide6.QtCore import QSize, Qt, QUrl
+from PySide6.QtCore import QCoreApplication, QEvent, QItemSelection, QItemSelectionModel, QSize, Qt, QUrl
 from PySide6.QtGui import QAction, QDesktopServices, QIcon, QKeySequence
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -79,6 +79,9 @@ class MainWindow(QMainWindow):
         self.tasks.busyChanged.connect(self._busy_changed)
         self._install_queue: list[tuple[str, int | None]] = []
         self._installing = False
+        # Once the window is closing, queued installs are dropped and results
+        # that would open a dialog only clean up.
+        self._closing = False
         self.setWindowTitle(APP_NAME)
         self.resize(1200, 760)
         self.setAcceptDrops(True)
@@ -91,6 +94,8 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------ hooks (tests replace these)
 
     def run_dialog(self, dialog: QDialog) -> bool:
+        if self._closing:
+            return False
         return dialog.exec() == QDialog.DialogCode.Accepted
 
     def ask(self, title: str, text: str) -> bool:
@@ -332,10 +337,14 @@ class MainWindow(QMainWindow):
             state_text = (f"{game.root}  ·  {len(rows)} mod(s), {sum(r.mod.enabled for r in rows)} enabled  ·  "
                           + ("PURGED: Deploy puts the mods back" if purged else f"{links} {mode}(s) deployed"))
         self.model.set_rows(rows)
+        keep = QItemSelection()
         for mod_id in selected:
             row = self.model.row_of(mod_id)
             if row is not None:
-                self.table.selectRow(row)
+                keep.select(self.model.index(row, 0), self.model.index(row, self.model.columnCount() - 1))
+        if not keep.isEmpty():
+            self.table.selectionModel().select(keep, QItemSelectionModel.SelectionFlag.ClearAndSelect
+                                               | QItemSelectionModel.SelectionFlag.Rows)
         self.state_label.setText(state_text)
         self.dry_label.setText("<b>DRY-RUN MODE</b>" if self.settings.dry_run else "")
         self.history.clear()
@@ -353,9 +362,10 @@ class MainWindow(QMainWindow):
         has_game = self.game is not None
         selected = self.selected_mods()
         for act in (self.act_install, self.act_install_folder, self.act_deploy, self.act_purge, self.act_verify,
-                    self.act_check_links, self.act_game_settings):
+                    self.act_check_links):
             act.setEnabled(idle and has_game)
-        for act in (self.act_settings, self.act_rescan, self.act_refresh):
+        # Game settings also sets up a game that wasn't found, or brings back a hidden one.
+        for act in (self.act_settings, self.act_rescan, self.act_refresh, self.act_game_settings):
             act.setEnabled(idle)
         for act in (self.act_enable, self.act_disable, self.act_up, self.act_down, self.act_top, self.act_bottom,
                     self.act_uninstall):
@@ -450,7 +460,12 @@ class MainWindow(QMainWindow):
         self.set_mods_enabled([mod_id], enabled)
 
     def set_mods_enabled(self, mod_ids: list[int], enabled: bool) -> None:
+        game, shown = self.game, [r.mod for r in self.model.rows]
+        if game is None:
+            return
+
         def mutate(manifest: Manifest) -> str:
+            service.check_unchanged(manifest, game.game_id, shown)
             names = []
             for mod_id in mod_ids:
                 manifest.set_enabled(mod_id, enabled)
@@ -464,11 +479,12 @@ class MainWindow(QMainWindow):
             self.set_mods_enabled(mods, enabled)
 
     def move_mod(self, mod_id: int, new_index: int) -> None:
-        game = self.game
+        game, shown = self.game, [r.mod for r in self.model.rows]
         if game is None:
             return
 
         def mutate(manifest: Manifest) -> str:
+            service.check_unchanged(manifest, game.game_id, shown)
             order = [m.id for m in manifest.mods(game.game_id)]
             new_order = service.moved_order(order, mod_id, new_index)
             manifest.set_order(game.game_id, new_order)
@@ -499,19 +515,21 @@ class MainWindow(QMainWindow):
 
         def job() -> str:
             with Manifest(lock=True) as manifest:
+                service.current(manifest, [mod])
                 manifest.update_mod(mod.id, name=name)
             return f"Renamed '{mod.name}' to '{name}'."
 
         self._run(job, self.note)
 
     def uninstall_selected(self) -> None:
-        mods, target = self.selected_mods(), self.target
+        mods, target, shown = self.selected_mods(), self.target, [r.mod for r in self.model.rows]
         if not mods or target is None:
             return
         listed = ", ".join(f"'{m.name}'" for m in mods)
 
         def preview() -> tuple[deploy.SyncResult | None, dict[int, str]]:
             with Manifest() as manifest:
+                service.check_unchanged(manifest, target.game_id, shown)
                 return service.preview_uninstall(manifest, target, mods), _names(manifest, target.game_id)
 
         def confirm(r) -> None:
@@ -526,6 +544,7 @@ class MainWindow(QMainWindow):
 
         def apply() -> tuple[service.UninstallResult, dict[int, str]]:
             with Manifest(lock=True) as manifest:
+                service.check_unchanged(manifest, target.game_id, shown)
                 names = _names(manifest, target.game_id)
                 return service.uninstall(manifest, target, mods), names
 
@@ -569,7 +588,7 @@ class MainWindow(QMainWindow):
             self._next_install()
 
     def _next_install(self) -> None:
-        if not self._install_queue or self.game is None:
+        if not self._install_queue or self.game is None or self._closing:
             self._install_queue.clear()
             self._installing = False
             self._busy_changed(self.tasks.busy)
@@ -589,6 +608,10 @@ class MainWindow(QMainWindow):
         self.tasks.run(prepare, lambda prepared: self._show_install(prepared, replace), failed)
 
     def _show_install(self, prepared: staging.Prepared, replace_id: int | None) -> None:
+        if self._closing:
+            staging.discard(prepared)
+            self._installing = False
+            return
         replace = None
         if replace_id is not None:
             try:
@@ -617,7 +640,7 @@ class MainWindow(QMainWindow):
             try:
                 with Manifest(lock=True) as manifest:
                     # Asked again under the lock, with the same options.
-                    existing = manifest.mod(choice.existing.id) if choice.existing is not None else None
+                    existing = service.current(manifest, [choice.existing])[0] if choice.existing else None
                     again = service.choose_install(manifest, game.game_id, prepared, name=choice.given_name,
                                                    new=existing is None, replace=existing, disabled=choice.disabled)
                     result = service.install(manifest, target, prepared, again)
@@ -796,19 +819,27 @@ class MainWindow(QMainWindow):
             self.reload_games(rescan=rescan)
 
     def open_game_settings(self) -> None:
-        game_id = self.game_combo.currentData() or self.settings.current_game
-        if game_id is None:
-            game_id, ok = QInputDialog.getItem(self, "Game settings", "Game:", sorted(GAMES), 0, False)
+        game_id = self.game_combo.currentData()
+        hidden = {g for g in GAMES if self.settings.override(g).ignore}
+        if game_id is None or hidden:
+            # Every game, so one that wasn't found can be set up and a hidden one brought back.
+            ids = sorted(GAMES, key=lambda g: GAMES[g].name)
+            labels = [GAMES[g].name + (" (hidden)" if g in hidden else "") for g in ids]
+            start = game_id or self.settings.current_game
+            label, ok = QInputDialog.getItem(self, "Game settings", "Game:", labels,
+                                             ids.index(start) if start in ids else 0, False)
             if not ok:
                 return
-        dialog = GameSettingsDialog(game_id, self.settings, self.game, parent=self)
+            game_id = ids[labels.index(label)]
+        game = next((g for g in self.games if g.game_id == game_id), None)
+        dialog = GameSettingsDialog(game_id, self.settings, game, parent=self)
         if self.run_dialog(dialog):
             dialog.apply()
             self.settings.current_game = game_id
             self._save_settings()
-            if self.settings.override(game_id).link_mode == "hardlink" and self.game is not None:
+            if self.settings.override(game_id).link_mode == "hardlink" and game is not None:
                 try:
-                    deploy.check_link_mode(service.target_for(self.game, self.settings))
+                    deploy.check_link_mode(service.target_for(game, self.settings))
                 except deploy.DeployError as exc:
                     self.tell("Hardlinks won't work here", str(exc), warning=True)
             self.reload_games()
@@ -920,11 +951,25 @@ class MainWindow(QMainWindow):
             self.install_paths(local)
 
     def closeEvent(self, event) -> None:
-        if self.tasks.busy and not self.ask("Still working", "An operation is still running. Quit anyway when it "
-                                                             "has finished?"):
-            event.ignore()
-            return
+        if self.busy:
+            self.tasks.hold()  # no dialog of a job that finishes meanwhile pops up over the question
+            try:
+                quit_anyway = self.ask("Still working", "An operation is still running. Quit when it has finished? "
+                                       "Archives still waiting to be installed are skipped.")
+                if quit_anyway:
+                    self._closing = True
+                    self._install_queue.clear()
+            finally:
+                self.tasks.release()
+            if not quit_anyway:
+                event.ignore()
+                return
+        self._closing = True
+        self._install_queue.clear()
         self.tasks.wait()
+        # Deliver the last results now, while the window still exists (an
+        # extracted archive waiting for its dialog is deleted).
+        QCoreApplication.sendPostedEvents(self.tasks, QEvent.Type.MetaCall.value)
         event.accept()
 
 
