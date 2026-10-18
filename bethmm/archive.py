@@ -262,6 +262,7 @@ def _split_backslash_names(dest: Path, warnings: list[str]) -> None:
         parts = [p for p in name.split("\\") if p not in ("", ".")]
         if not parts or ".." in parts:
             source.unlink()
+            log.info("DELETE %s (unsafe path)", source)
             warnings.append(f"removed {name!r}: unsafe path")
             continue
         target = folder
@@ -270,10 +271,12 @@ def _split_backslash_names(dest: Path, warnings: list[str]) -> None:
         target = target / parts[-1]
         if os.path.lexists(target):
             source.unlink()
+            log.info("DELETE %s (%s already exists)", source, target)
             warnings.append(f"removed {name!r}: {target.relative_to(dest).as_posix()} already exists")
             continue
         target.parent.mkdir(parents=True, exist_ok=True)
         os.rename(source, target)
+        log.info("RENAME %s -> %s", source, target)
 
 
 def _child_ci(folder: Path, name: str) -> Path:

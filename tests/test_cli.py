@@ -76,7 +76,7 @@ def test_games_lists_gog_installs(home, capsys):
 
 @needs_7z
 def test_analyze_archive_matches_existing_case_and_changes_nothing(home, tmp_path, capsys):
-    fo4 = gog_game(home, "fallout-4", "Fallout 4", "Fallout4.exe",
+    gog_game(home, "fallout-4", "Fallout 4", "Fallout4.exe",
                    ["data/textures/armor/", "data/Fallout4.esm"], appdata="Fallout4")
     before = snapshot(home / "Games")
     mod = zip_mod(tmp_path / "Cool Armor-12345-1-2-1700000000.zip", {
