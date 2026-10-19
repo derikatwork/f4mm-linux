@@ -491,6 +491,17 @@ def unretire(folder: Path) -> None:
         log.error("could not remove %s: %s", marker, exc)
 
 
+def _mark_installing(files_dir: Path) -> None:
+    """Mark the extracted files before they move into the mods folder: if the
+    app dies before the mod is recorded, 'verify --repair' knows the folder
+    is its own (no mod uses it) and deletes it. ``commit`` takes it off again."""
+    marker = files_dir / RETIRED_MARKER
+    if os.path.lexists(marker):  # a mod shipping a file of that name keeps it
+        return
+    marker.write_text("This folder is being installed. If that was interrupted, the app deletes it.\n")
+    log.info("WRITE %s", marker)
+
+
 def is_retired(folder: Path) -> bool:
     """Whether *folder* is one the app no longer needs: marked retired, or
     left by an interrupted deletion."""
@@ -588,6 +599,8 @@ def commit(
         # Marked before the switch, so even if the app dies during the redeploy
         # that follows, 'verify --repair' deletes it once no link uses it.
         retire(old_folder)
+    shipped_marker = os.path.lexists(prepared.files_dir / RETIRED_MARKER)
+    _mark_installing(prepared.files_dir)
     _move(prepared.files_dir, staging)
     try:
         # One transaction around the write and its read-back: an interruption
@@ -609,6 +622,8 @@ def commit(
         if old_folder is not None:
             unretire(old_folder)
         raise
+    if not shipped_marker:
+        unretire(staging)  # recorded: the folder is the mod's now
     log.info("%s mod %r (#%d) for %s in %s with %d files", "UPDATED" if result.replaced else "INSTALLED",
              mod.name, mod.id, game_id, staging, len(files))
     return result
@@ -620,13 +635,18 @@ def checked_files(prepared: Prepared) -> list[ModFile]:
     base = os.path.realpath(prepared.files_dir)
     files: list[ModFile] = []
     bad: list[str] = []
+    not_utf8: list[str] = []
     for m in prepared.plan.mappings:
+        try:
+            m.source.encode("utf-8")
+            m.dest.encode("utf-8")
+        except UnicodeEncodeError:
+            not_utf8.append(m.source)
+            continue
         try:
             fold_path(m.source)
             fold_path(m.dest)
-            m.source.encode("utf-8")
-            m.dest.encode("utf-8")
-        except (ValueError, UnicodeEncodeError):
+        except ValueError:
             bad.append(m.source)
             continue
         full = os.path.join(prepared.files_dir, m.source)
@@ -638,10 +658,18 @@ def checked_files(prepared: Prepared) -> list[ModFile]:
             bad.append(m.source)
             continue
         files.append(ModFile(source=m.source, dest=m.dest))
+    def listed(names: list[str]) -> str:
+        more = f" and {len(names) - 5} more" if len(names) > 5 else ""
+        return ", ".join(repr(_clean_path(Path(n))) for n in names[:5]) + more
+
+    if not_utf8:
+        raise StagingError(
+            f"these file names aren't valid UTF-8: {listed(not_utf8)}. Archives made on Windows sometimes store "
+            "names in a local code page; extract it with a tool that lets you choose the code page (for a zip: "
+            "unzip -O CP437, or CP866 for Cyrillic names) and install the extracted folder"
+        )
     if bad:
-        shown = ", ".join(repr(b) for b in bad[:5])
-        more = f" and {len(bad) - 5} more" if len(bad) > 5 else ""
-        raise StagingError(f"can't install these files (missing, not regular files or unusable names): {shown}{more}")
+        raise StagingError(f"can't install these files (missing, not regular files or unusable names): {listed(bad)}")
     return files
 
 

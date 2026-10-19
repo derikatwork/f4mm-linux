@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -66,3 +67,20 @@ def test_hand_edited_override_values_are_type_checked(tmp_path):
     }}))
     o = load_settings(tmp_path / "s.json").game_overrides["fallout4"]
     assert o == GameOverride(root=None, prefix=None, wine_user="derik", link_mode="hardlink", ignore=False)
+
+
+def test_a_symlinked_settings_file_stays_a_symlink(tmp_path, monkeypatch):
+    from bethmm import paths
+    from bethmm.settings import load_settings, save_settings
+
+    dotfile = tmp_path / "dotfiles" / "settings.json"
+    dotfile.parent.mkdir()
+    dotfile.write_text('{"games_dir": "~/Games"}\n')
+    link = paths.settings_path()
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(dotfile)
+    settings = load_settings()
+    settings.current_game = "fallout4"
+    save_settings(settings)
+    assert link.is_symlink() and os.readlink(link) == str(dotfile)
+    assert '"current_game": "fallout4"' in dotfile.read_text()

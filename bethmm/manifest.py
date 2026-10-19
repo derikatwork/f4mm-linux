@@ -32,6 +32,7 @@ import fcntl
 import json
 import os
 import sqlite3
+import urllib.parse
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -223,16 +224,25 @@ def _is_locked(exc: BaseException) -> bool:
 
 class Manifest:
     def __init__(self, path: str | Path | None = None, *, lock: bool = False) -> None:
+        """With *lock*, for changes. Without it, a view -- for reading, and for
+        previews made in a transaction that is rolled back -- that never
+        creates or upgrades the file (a dry run changes nothing): a missing or
+        older manifest is read into memory and upgraded there."""
         self.path = Path(path) if path is not None else paths.manifest_path()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock_fd: int | None = None
         self._db: sqlite3.Connection | None = None
         if lock:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
             self._acquire_lock()
         try:
-            self._db = sqlite3.connect(self.path, timeout=10, isolation_level=None)
+            if lock or self._current_on_disk():
+                self._db = sqlite3.connect(self.path, timeout=10, isolation_level=None)
+            else:
+                self._db = self._in_memory()
             self._db.row_factory = sqlite3.Row
             self._db.execute("PRAGMA foreign_keys = ON")
+            if lock:
+                self._fast_commits()
             self._migrate()
         except BaseException as exc:
             if self._db is not None:
@@ -245,6 +255,52 @@ class Manifest:
             raise
 
     # ------------------------------------------------------------ lifecycle
+
+    def _fast_commits(self) -> None:
+        """Write-ahead log, synced at checkpoints rather than on every commit:
+        the journal entry of each file operation (three commits) costs
+        microseconds instead of milliseconds, and an entry is still safe the
+        moment it is committed if the app is killed or crashes (only a power
+        cut can lose the last few -- which 'verify --repair' recovers from like
+        any interrupted run). Readers no longer wait for a writer, either."""
+        try:
+            self._db.execute("PRAGMA journal_mode = WAL")
+            self._db.execute("PRAGMA synchronous = NORMAL")
+        except sqlite3.OperationalError as exc:  # busy: this run keeps the slower default
+            if not _is_locked(exc):
+                raise
+
+    def _read_only(self) -> sqlite3.Connection:
+        uri = "file:" + urllib.parse.quote(str(self.path.absolute())) + "?mode=ro"
+        return sqlite3.connect(uri, uri=True, timeout=10, isolation_level=None)
+
+    def _current_on_disk(self) -> bool:
+        """Whether the file exists with this version's schema (or a newer one,
+        which ``_migrate`` refuses), so a view can use it as it is."""
+        if not self.path.exists():
+            return False
+        db = self._read_only()
+        try:
+            if not db.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta'").fetchone():
+                return False
+            row = db.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
+            try:
+                return row is not None and int(row[0]) >= SCHEMA_VERSION
+            except ValueError:
+                return True  # _migrate says what is wrong with it
+        finally:
+            db.close()
+
+    def _in_memory(self) -> sqlite3.Connection:
+        """A copy of the file (or an empty manifest) to upgrade without writing it."""
+        mem = sqlite3.connect(":memory:", isolation_level=None)
+        if self.path.exists():
+            disk = self._read_only()
+            try:
+                disk.backup(mem)
+            finally:
+                disk.close()
+        return mem
 
     def _acquire_lock(self) -> None:
         lock_path = self.path.with_name(self.path.name + ".lock")

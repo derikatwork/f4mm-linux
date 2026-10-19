@@ -1183,3 +1183,11 @@ def test_unknown_and_fomod_plans_list_unplaced_files():
     fomod = analyze_files(["fomod/ModuleConfig.xml", "00 Core/a.esp", "01 Opt/b.esp"])
     assert fomod.unplaced == ["00 Core/a.esp", "01 Opt/b.esp"]
     assert analyze_files(["a.esp"]).unplaced == []
+
+
+def test_a_script_extender_repacked_in_its_own_named_folder_goes_to_the_game_folder():
+    plan = analyze_files(["F4SE/f4se_loader.exe", "F4SE/f4se_1_10_163.dll", "F4SE/Data/Scripts/a.pex"])
+    assert plan.target is Target.GAME_ROOT
+    assert {m.dest for m in plan.mappings} == {"f4se_loader.exe", "f4se_1_10_163.dll", "Data/Scripts/a.pex"}
+    plan = analyze_files(["F4SE/Plugins/x.dll"])  # a plugin for it is Data content as before
+    assert [m.dest for m in plan.mappings] == ["Data/F4SE/Plugins/x.dll"]

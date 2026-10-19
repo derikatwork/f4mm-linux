@@ -181,15 +181,42 @@ def _candidates(manifest: Manifest, game_id: str) -> dict[str, list[tuple[ModRec
     return candidates
 
 
+def _settle_type_clashes(desired: dict[str, tuple[ModRecord, ModFile]]) -> dict[str, ModRecord]:
+    """A file of one mod where another mod has a folder (``textures/x`` and
+    ``textures/x/a.dds``): as in any conflict the mod lower in the list wins,
+    and the other side is not deployed. Removes the losing destinations from
+    *desired*; returns them -> the mod that won."""
+    files: dict[str, ModRecord] = {}  # accepted destinations -> mod
+    folders: dict[str, ModRecord] = {}  # every folder an accepted destination needs -> mod
+    lost: dict[str, ModRecord] = {}
+    for key, (mod, _f) in sorted(desired.items(), key=lambda item: (-item[1][0].priority, item[0])):
+        parts = key.split("/")
+        above = ["/".join(parts[:i]) for i in range(1, len(parts))]
+        winner = folders.get(key) or next((files[a] for a in above if a in files), None)
+        if winner is not None:
+            lost[key] = winner
+            continue
+        files[key] = mod
+        for a in above:
+            folders.setdefault(a, mod)
+    for key in lost:
+        del desired[key]
+    return lost
+
+
 def desired_files(manifest: Manifest, game_id: str) -> tuple[dict[str, tuple[ModRecord, ModFile]], dict[str, list[int]]]:
     """What should be deployed: folded destination -> (winning mod, file), and
-    folded destination -> every enabled mod providing it, lowest priority first.
-    (Planning additionally skips a winner whose staged file is missing.)"""
+    folded destination -> every enabled mod providing it, lowest priority first
+    (for a file that loses to another mod's folder there, or the other way
+    round, that mod comes last). (Planning additionally skips a winner whose
+    staged file is missing.)"""
     desired: dict[str, tuple[ModRecord, ModFile]] = {}
     providers: dict[str, list[int]] = {}
     for key, candidates in _candidates(manifest, game_id).items():
         desired[key] = candidates[-1]
         providers[key] = [mod.id for mod, _ in candidates]
+    for key, winner in _settle_type_clashes(desired).items():
+        providers[key].append(winner.id)
     return desired, providers
 
 
@@ -453,13 +480,18 @@ def _app_links_in(manifest: Manifest, game_id: str, root: Path) -> bool | None:
     return any(_is_our_link(_restore_target(root, e.path), Path(e.source or "")) for e in entries.values())
 
 
+#: Where the app looks again for a game that moved (its list of games is cached).
+RESCAN_HINT = ("If you moved or reinstalled the game, let the app find it again: 'bethmm games --rescan' "
+               "(in the window: Game > Rescan for games)")
+
+
 def _gone_message(game_id: str, root: Path, other: Path | None = None, manifest: Manifest | None = None) -> str:
     why = _why_gone(root, game_id, manifest) or f"{root} holds none of the app's links"
     where = (f"the folder the mods were deployed into can't be used ({why}), and the app's links are not in {other}"
              if other is not None else f"the game folder can't be used ({why})")
-    return (f"{where}. If it is on a drive that isn't mounted, mount it and try again. If that install of the game "
-            f"is gone for good, 'bethmm purge --forget-missing --game {game_id}' forgets what the app had there "
-            f"(the originals it backed up are kept in {paths.backups_dir(game_id) / SUPERSEDED_DIR})")
+    return (f"{where}. If it is on a drive that isn't mounted, mount it and try again. {RESCAN_HINT}. If that "
+            f"install of the game is gone for good, 'bethmm purge --forget-missing --game {game_id}' forgets what "
+            f"the app had there (the originals it backed up are kept in {paths.backups_dir(game_id) / SUPERSEDED_DIR})")
 
 
 def _has_records(manifest: Manifest, game_id: str) -> bool:
@@ -537,7 +569,7 @@ def _check_root(manifest: Manifest, target: GameTarget, *,
         if purge:
             raise GameFolderGone(_gone_message(game_id, root, manifest=manifest))
         raise DeployError(f"can't deploy into the game folder: {why}. If it is on a drive that isn't mounted, "
-                          "mount it first")
+                          f"mount it first. {RESCAN_HINT}")
     return root, warnings, switch_from
 
 
@@ -569,6 +601,7 @@ def plan_sync(manifest: Manifest, target: GameTarget, *, purge: bool = False) ->
                 desired[key] = (mod, f)
                 break
             plan.blocked.append((f.dest, f"staged file {staged} is missing; reinstall '{mod.name}'"))
+    _settle_type_clashes(desired)
     deployed = manifest.deployed(game_id)
     backups = manifest.backups(game_id)
     created = manifest.created_dirs(game_id)
@@ -682,6 +715,48 @@ def plan_sync(manifest: Manifest, target: GameTarget, *, purge: bool = False) ->
         if index is None:
             index = _superseded_index(game_id)
         return index.get(fold_path(path), [])
+
+    # What this plan removes makes room for what it creates (a winning mod's
+    # folder where a losing mod's file was); an original put back takes its path.
+    for op in removals:
+        if op.kind == "unlink":
+            resolver.forget(op.path)
+    for op in restores:
+        if op.kind == "restore" and os.path.lexists(op.source or ""):
+            resolver.resolve(op.path, plan=True)
+    # A folder the app made where a winning mod's file goes now (the mod that
+    # needed it lost the conflict) is removed first -- only when nothing but
+    # links this plan removes is in it.
+    unlinked = {fold_path(op.path) for op in removals if op.kind == "unlink"}
+
+    def emptied(path: str) -> list[str] | None:
+        """The app's folders at and below *path*, deepest first, if they hold
+        nothing but links this plan removes; None otherwise."""
+        found: list[str] = []
+        try:
+            entries = list(os.scandir(root / path))
+        except OSError:
+            return None
+        for entry in entries:
+            rel = f"{path}/{entry.name}"
+            if entry.is_dir(follow_symlinks=False):
+                below = emptied(rel) if fold_path(rel) in created else None
+                if below is None:
+                    return None
+                found += below
+            elif fold_path(rel) not in unlinked:
+                return None
+        return found + [path]
+
+    early_rmdirs: list[Op] = []
+    for key in sorted(desired):
+        folder = created.get(key)
+        if folder is None or not os.path.isdir(root / folder) or os.path.islink(root / folder):
+            continue
+        for path in emptied(folder) or ():
+            early_rmdirs.append(Op("rmdir", path, note="a winning mod's file goes here"))
+            resolver.forget(path)
+    early = {fold_path(op.path) for op in early_rmdirs}
 
     additions: list[Op] = []
     planned_dirs: set[str] = set()
@@ -805,10 +880,10 @@ def plan_sync(manifest: Manifest, target: GameTarget, *, purge: bool = False) ->
         Op("rmdir", path if replaced(path) else on_disk(path), note="replaced by a folder of the user's"
            if replaced(path) else "")
         for dkey, path in sorted(created.items(), key=lambda item: (-item[0].count("/"), item[0]))
-        if dkey not in needed or replaced(path)
+        if dkey not in early and (dkey not in needed or replaced(path))
     ]
 
-    plan.ops = removals + restores + additions + rmdirs
+    plan.ops = removals + restores + early_rmdirs + additions + rmdirs
     return plan
 
 

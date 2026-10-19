@@ -113,7 +113,7 @@ Open **BETH Mod Manager** from your applications menu (or run `bethmm-gui`, or
 The desktop app and the `bethmm` command use the same code and the same records,
 so you can switch between them freely. Only one change runs at a time: while one
 is running, another (from the command line or a second window) stops at once
-with "another bethmm command is using the manifest right now" and changes nothing.
+with "another bethmm process is changing mods right now" and changes nothing.
 
 If the GUI doesn't start, run `bethmm-gui` in a terminal to see why. An error
 about the `xcb` platform plugin means a system library is missing:
@@ -196,8 +196,9 @@ is killed halfway, the next `deploy`/`purge` or `verify --repair` cleans up.
 `verify --repair` removes stray links into the app's mods folder and half-made
 links of an interrupted run, puts back unrecorded originals from the backups
 folder, forgets records of things that are gone, moves files left by an
-interrupted move to `backups/<game>/.superseded/`, and deletes the previous version
-of an updated mod once no link uses it. It never deletes a folder in the mods
+interrupted move to `backups/<game>/.superseded/`, and deletes mod files nothing
+uses any more (the previous version of an updated mod once no link uses it, and
+what an interrupted install or uninstall left). It never deletes a folder in the mods
 folder that the app didn't mark as its own — it only reports it. While the game
 folder is missing or empty (say, on a drive that isn't mounted) it changes nothing.
 

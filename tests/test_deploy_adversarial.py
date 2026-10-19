@@ -1355,17 +1355,22 @@ def test_file_and_folder_collision_between_mods(world):
     a = add_mod(world.manifest, "A", {"Data/Thing": "a file"})
     b = add_mod(world.manifest, "B", {"Data/thing/inside.txt": "in a folder"})
     world.deploy()
-    # One of them is blocked; nothing crashes and repeated deploys are stable.
+    # The mod lower in the list wins, as in any conflict; repeated deploys are stable.
+    assert world.path("Data/thing/inside.txt").is_symlink() and not world.path("Data/thing").is_symlink()
+    assert world.plan().changes == []
+    world.manifest.set_enabled(b.id, False)
+    world.refresh()  # one run: the folder goes, the file comes
     assert world.path("Data/Thing").is_symlink()
     assert world.plan().changes == []
-    world.manifest.set_enabled(a.id, False)
-    world.refresh()
-    world.deploy()  # the folder can only be made once the file link is gone
-    assert world.path("Data/thing/inside.txt").is_symlink() or world.path("Data/Thing/inside.txt").is_symlink()
-    world.manifest.set_enabled(a.id, True)
+    world.manifest.set_enabled(b.id, True)
     world.manifest.set_order(GAME, [b.id, a.id])
     world.refresh()
+    assert world.path("Data/Thing").is_symlink()
+    assert world.plan().changes == []
+    world.manifest.set_order(GAME, [a.id, b.id])
     world.refresh()
+    assert world.path("Data/thing/inside.txt").is_symlink()
+    assert_deployed(world)
     world.purge()
     assert_vanilla(world)
 
@@ -1450,3 +1455,45 @@ def test_root_files_and_game_root_symlinked(tmp_path, monkeypatch):
 def test_make_tree_helper_sanity(tmp_path):
     make_tree(tmp_path, {"a/b.txt": "x"})
     assert (tmp_path / "a/b.txt").read_text() == "x"
+
+
+
+@pytest.mark.parametrize("after", [False, True], ids=["before-call", "after-call"])
+@pytest.mark.parametrize("file_wins", [True, False], ids=["folder-gives-way", "file-gives-way"])
+def test_killed_while_a_file_and_a_folder_swap(tmp_path, monkeypatch, file_wins, after):
+    """One mod's file where another's folder was (an app-made folder removed
+    first), killed at every file operation: repair and the next deploy end
+    in the right state, and purge in vanilla."""
+    def setup(base: Path):
+        world = fresh_world(base, monkeypatch, mode="symlink")
+        m = world.manifest
+        as_file = add_mod(m, "FileMod", {"Data/textures/clash": "a file", "Data/Fallout4.esm": "F esm"})
+        as_dir = add_mod(m, "DirMod", {"Data/Textures/Clash/in.dds": "in", "Data/Textures/Clash/d/m.dds": "m"})
+        order = [as_file.id, as_dir.id]
+        m.set_order(GAME, order if file_wins else order[::-1])
+        world.deploy()
+        m.set_order(GAME, order[::-1] if file_wins else order)
+        return world
+
+    world = setup(tmp_path / "count")
+    injector = Injector()
+    with injector.active(monkeypatch):
+        world.deploy()
+    total = injector.calls
+    world.manifest.close()
+    assert total > 3
+    for n in range(1, total + 1):
+        world = setup(tmp_path / f"n{n}")
+        try:
+            run_killable(Injector(n, Killed, after), monkeypatch, world.deploy)
+            reopen(world)
+            verify_and_repair(world)
+            result = world.deploy()
+            assert not result.failed and not result.plan.blocked, (result.failed, result.plan.blocked)
+            assert_deployed(world)
+            assert not world.purge().failed
+            assert_vanilla(world)
+        except AssertionError as exc:
+            raise AssertionError(f"killed at call {n}/{total} ({'after' if after else 'before'}): {exc}") from exc
+        finally:
+            world.manifest.close()

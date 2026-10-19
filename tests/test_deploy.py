@@ -87,7 +87,13 @@ def winners(manifest: Manifest, game: str = GAME) -> dict[str, tuple[ModRecord, 
             src = staged(mod, f.source)
             if src.is_file():
                 out[fold_path(f.dest)] = (mod, f, src)
-    return out
+    # A file where another mod has a folder (or the other way round): the mod
+    # lower in the list wins; the other side's files are not deployed.
+    kept: dict[str, tuple[ModRecord, ModFile, Path]] = {}
+    for key, value in sorted(out.items(), key=lambda kv: (-kv[1][0].priority, kv[0])):
+        if not any(other.startswith(key + "/") or key.startswith(other + "/") for other in kept):
+            kept[key] = value
+    return kept
 
 
 def folded_index(snap: Mapping[str, tuple]) -> dict[str, list[str]]:
@@ -699,3 +705,72 @@ def test_disabled_mod_is_never_linked(world):
     world.deploy()
     assert not world.path("Data/A.esp").exists()
     assert_vanilla(world, empty_records=False)
+
+
+
+# ---------------------------------------------------------------- a file where another mod has a folder
+
+
+def clash_world(world):
+    m = world.manifest
+    as_file = add_mod(m, "FileMod", {"Data/FileMod.esp": "f", "Data/textures/clash": "a file"})
+    as_dir = add_mod(m, "DirMod", {"Data/DirMod.esp": "d", "Data/Textures/Clash/inside.dds": "in",
+                                   "Data/Textures/Clash/deep/more.dds": "more"})
+    return as_file, as_dir
+
+
+def test_file_against_folder_the_lowest_wins_in_one_deploy(world):
+    as_file, as_dir = clash_world(world)
+    world.deploy()  # DirMod is lowest: its folder wins
+    assert world.path("Data/Textures/Clash/inside.dds").is_symlink()
+    assert not world.path("Data/textures/clash").is_symlink()
+    assert_deployed(world)
+    desired, providers = deploy.desired_files(world.manifest, GAME)
+    assert fold_path("Data/textures/clash") not in desired
+    assert providers[fold_path("Data/textures/clash")] == [as_file.id, as_dir.id]
+    summary = deploy.conflict_summary(world.manifest, GAME)
+    assert summary[as_dir.id].overwrites == {as_file.id: 1}
+
+    world.manifest.set_order(GAME, [as_dir.id, as_file.id])  # now the file wins
+    preview = world.plan()
+    result = world.deploy()
+    assert not result.failed and not result.plan.blocked, (result.failed, result.plan.blocked)
+    assert [(op.kind, op.path) for op in result.done] == [(op.kind, op.path) for op in preview.ops]
+    clash = world.path("Data/Textures/clash")
+    assert clash.is_symlink() and clash.read_text() == "a file"
+    assert_deployed(world)  # (includes: a second plan has nothing to do)
+
+    world.manifest.set_enabled(as_file.id, False)  # the folder comes back
+    result = world.deploy()
+    assert not result.failed and not result.plan.blocked
+    assert world.path("Data/Textures/Clash/deep/more.dds").read_text() == "more"
+    assert_deployed(world)
+    world.purge()
+    assert_vanilla(world)
+
+
+def test_a_folder_holding_the_users_file_is_not_removed_for_a_winning_file(world):
+    as_file, as_dir = clash_world(world)
+    world.deploy()
+    mine = world.path("Data/Textures/Clash/mine.dds")
+    mine.write_text("the user's")
+    world.manifest.set_order(GAME, [as_dir.id, as_file.id])
+    result = world.deploy()
+    assert not result.failed
+    assert any("other kind" in why for _path, why in result.plan.blocked)
+    assert mine.read_text() == "the user's" and not world.path("Data/Textures/Clash/inside.dds").exists()
+    mine.unlink()
+    result = world.deploy()  # nothing in the way any more
+    assert not result.plan.blocked and world.path("Data/Textures/clash").is_symlink()
+    assert_deployed(world)
+
+
+def test_file_against_folder_in_a_dry_run_matches_the_real_run(world):
+    as_file, as_dir = clash_world(world)
+    world.deploy()
+    world.manifest.set_order(GAME, [as_dir.id, as_file.id])
+    before = snapshot(world.root)
+    dry = world.deploy(dry_run=True)
+    assert snapshot(world.root) == before
+    real = world.deploy()
+    assert [(op.kind, op.path) for op in dry.done] == [(op.kind, op.path) for op in real.done]

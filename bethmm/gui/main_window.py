@@ -568,6 +568,9 @@ class MainWindow(QMainWindow):
             for mod, folder in outcome.kept_folders:
                 self.note(f"! kept the files of '{mod.name}' in {folder}: an interrupted run may have linked them; "
                           "Verify > Repair deletes the folder once nothing uses it.")
+            for mod, folder, why in outcome.not_deleted:
+                self.note(f"! could not delete the files of '{mod.name}' in {folder}: {why}. Verify > Repair "
+                          "deletes them once that is fixed.")
 
         self._run(preview, confirm)
 
@@ -666,7 +669,10 @@ class MainWindow(QMainWindow):
             else:
                 self.note(title + (" The game is purged, so nothing was linked." if choice.purged else
                                    " Nothing was linked: enable it to put it into the game."))
-            if result.kept_old_folder is not None:
+            if result.cleanup_error is not None:
+                self.note(f"! could not delete the previous files in {result.kept_old_folder}: "
+                          f"{result.cleanup_error}. Verify > Repair deletes them once that is fixed.")
+            elif result.kept_old_folder is not None:
                 self.note(f"! kept the previous files in {result.kept_old_folder}: {result.still_linked} link(s) "
                           "still point there. Deploy, then Verify > Repair deletes the folder.")
             if game.game_id != (self.game.game_id if self.game else None):

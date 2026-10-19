@@ -84,7 +84,7 @@ def _fake_prepared(tmp_path: Path, source_name: str, files: dict[str, bytes] | N
 
 @pytest.fixture
 def manifest():
-    m = Manifest()
+    m = Manifest(lock=True)
     yield m
     m.close()
 
@@ -920,7 +920,7 @@ def test_nothing_outside_tmp_and_mods_is_written(tmp_path, monkeypatch):
     make_tree(downloads / "Loose Mod", {"Data/Loose.esp": FO4_PLUGIN, "Data/Textures/l.dds": b"l"})
     os.symlink(downloads / "CoolMod-1234-1-2-1680000000.zip", downloads / "Loose Mod" / "link.zip")
     make_tree(home / "Games" / "fallout-4" / "drive_c" / "Fallout 4", {"Fallout4.exe": b"exe", "Data/Fallout4.esm": b"esm"})
-    manifest = Manifest()  # created up front: the manifest is not staging's to write
+    manifest = Manifest(lock=True)  # created up front: the manifest is not staging's to write
     manifest.close()
 
     def allowed(rel: str) -> bool:
@@ -931,7 +931,7 @@ def test_nothing_outside_tmp_and_mods_is_written(tmp_path, monkeypatch):
         return {k: v for k, v in _snapshot(home).items() if not allowed(k)}
 
     before = outside_snapshot()
-    with Manifest() as manifest:
+    with Manifest(lock=True) as manifest:
         for source in (downloads / "CoolMod-1234-1-2-1680000000.zip", downloads / "Loose Mod"):
             prepared = prepare(source)
             try:

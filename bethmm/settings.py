@@ -110,7 +110,10 @@ def save_settings(settings: Settings, path: Path | None = None) -> None:
 
 
 def write_json_atomic(path: Path, data) -> None:
-    """Write JSON via a temp file + rename so a crash never leaves half a file."""
+    """Write JSON via a temp file + rename so a crash never leaves half a file.
+    A symlink (a dotfile manager's) stays: the file it points to is written."""
+    if path.is_symlink():
+        path = Path(os.path.realpath(path))
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:

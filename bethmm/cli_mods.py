@@ -181,7 +181,11 @@ def _confirm(question: str, args) -> bool:
         return True
     if not sys.stdin.isatty():
         raise CliError(f"{question} -- add --yes to confirm when not running in a terminal")
-    reply = input(f"{question} [y/N] ").strip().lower()
+    try:
+        reply = input(f"{question} [y/N] ").strip().lower()
+    except EOFError:  # Ctrl-D: no
+        print()
+        return False
     return reply in ("y", "yes")
 
 
@@ -335,7 +339,10 @@ def cmd_install(args) -> int:
                 print("The game is purged, so nothing was linked. Run 'bethmm deploy' to put the mods back.")
             else:
                 print(f"Nothing was linked. 'bethmm enable \"{mod.name}\"' puts it into the game.")
-            if result.kept_old_folder is not None:
+            if result.cleanup_error is not None:
+                print(f"  ! could not delete the previous files in {result.kept_old_folder}: {result.cleanup_error}. "
+                      "'bethmm verify --repair' deletes them once that is fixed.")
+            elif result.kept_old_folder is not None:
                 print(f"  ! kept the previous files in {result.kept_old_folder}: {result.still_linked} link(s) still "
                       "point there. Run 'bethmm deploy'; then 'bethmm verify --repair' deletes the folder.")
             return status
@@ -470,6 +477,7 @@ def cmd_uninstall(args) -> int:
         status = _report(outcome.sync, manifest) if outcome.sync is not None else 0
         kept = {mod.id: folder for mod, folder in outcome.kept_folders}
         stuck = {mod.id for mod in outcome.still_linked}
+        not_deleted = {mod.id: (folder, why) for mod, folder, why in outcome.not_deleted}
         for mod in mods:
             if mod.id in stuck:
                 print(f"  ! '{mod.name}' still has links that could not be removed; it stays installed (disabled). "
@@ -479,6 +487,10 @@ def cmd_uninstall(args) -> int:
             if mod.id in kept:
                 print(f"  ! kept the files of '{mod.name}' in {kept[mod.id]}: an interrupted run may have linked "
                       "them; 'bethmm verify --repair' deletes the folder once nothing uses it.")
+            if mod.id in not_deleted:
+                folder, why = not_deleted[mod.id]
+                print(f"  ! could not delete the files of '{mod.name}' in {folder}: {why}. "
+                      "'bethmm verify --repair' deletes them once that is fixed.")
             print(f"Uninstalled '{mod.name}'.")
         return status
 
@@ -507,7 +519,7 @@ def cmd_conflicts(args) -> int:
         print("\nFiles provided by more than one enabled mod (the last one wins):")
         for key, mod_ids in sorted(providers.items()):
             if len(mod_ids) > 1 and (only is None or only in mod_ids):
-                where = deployed[key].path if key in deployed else desired[key][1].dest
+                where = deployed[key].path if key in deployed else desired[key][1].dest if key in desired else key
                 print(f"  {where}: {' < '.join(names[m] for m in mod_ids)}")
     return 0
 
@@ -601,7 +613,8 @@ def cmd_verify(args) -> int:
         report, retired, unknown, problems = found.report, found.retired, found.unknown, found.problems
         if report.root_missing:
             print(f"{name}: the game folder can't be used ({report.missing_reason}), so nothing was checked.")
-            print("  If it is on a drive that isn't mounted, mount it and run this again. If that install is gone,")
+            print("  If it is on a drive that isn't mounted, mount it and run this again. If you moved or reinstalled")
+            print("  the game, 'bethmm games --rescan' finds it again. If that install is gone,")
             print(f"  'bethmm purge --forget-missing --game {game_id}' forgets the app's links there.")
             return 1
         for note in report.notes:
@@ -636,7 +649,8 @@ def cmd_verify(args) -> int:
         for entry in report.interrupted:
             print(f"  interrupted operation: {entry.action} {entry.path or ''} ({entry.ts})")
         for folder in retired:
-            print(f"  previous version of a mod that nothing uses any more: {folder}")
+            print(f"  mod files nothing uses any more (a previous version, an uninstalled mod or an "
+                  f"interrupted install; --repair deletes them): {folder}")
         for path in report.left_alone:
             print(f"  note: {path} is a file the app didn't create, where a mod's link was; it is left alone "
                   "(delete it to let the mod link there again)")

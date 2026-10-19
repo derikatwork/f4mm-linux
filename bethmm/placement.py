@@ -508,7 +508,13 @@ def _ignorable_file(name: str) -> bool:
 def _wrapper_child(node: _Dir) -> _Dir | None:
     """The folder to descend into when *node* is only a wrapper (rule 1)."""
     dirs = [d for n, d in node.dirs.items() if not _is_junk(n) and n.lower() not in DOC_DIRS]
-    if len(dirs) != 1 or dirs[0].name.lower() in _RECOGNISED_DIRS:
+    if len(dirs) != 1:
+        return None
+    # A recognised folder (textures/, F4SE/ with Plugins/ ...) is the mod's
+    # content -- unless it wraps a script extender's loader (a repacked
+    # "F4SE/f4se_loader.exe"): no Data folder holds that.
+    low = dirs[0].name.lower()
+    if low in _RECOGNISED_DIRS and (low in ("data", "fomod") or not _signals(dirs[0]).loaders):
         return None
     if not all(_ignorable_file(name) for name in node.files):
         return None

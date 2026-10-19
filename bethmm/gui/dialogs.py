@@ -126,6 +126,7 @@ class VerifyDialog(QDialog):
         if report.root_missing:
             layout.addWidget(_label(f"<b>The game folder can't be used</b> ({report.missing_reason}), so nothing was "
                                     "checked. If it is on a drive that isn't mounted, mount it and verify again. If "
+                                    "you moved or reinstalled the game, Game > Rescan for games finds it again. If "
                                     "that install is gone, use Purge with 'the game is gone' to forget the app's "
                                     "links there."))
         for record in report.missing:
@@ -149,7 +150,8 @@ class VerifyDialog(QDialog):
         for entry in report.interrupted:
             add(problems, "interrupted operation", f"{entry.action} {entry.path or ''} ({entry.ts})")
         for folder in found.retired:
-            add(problems, "previous version nothing uses any more", str(folder))
+            add(problems, "mod files nothing uses any more (a previous version, an uninstalled mod or an "
+                "interrupted install)", str(folder))
         if report.moved_from is not None:
             add(notes, "the game was moved; checked the new folder", f"{report.moved_from} -> {report.root}")
         for note in report.notes:

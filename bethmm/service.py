@@ -265,6 +265,9 @@ class InstallResult:
     kept_old_folder: Path | None = None
     #: How many links still point into the kept folder.
     still_linked: int = 0
+    #: Why the previous version's folder couldn't be deleted (it is kept; the
+    #: update itself is done). None: no error.
+    cleanup_error: str | None = None
 
 
 def install(manifest: Manifest, target: deploy.GameTarget, prepared: staging.Prepared,
@@ -283,8 +286,17 @@ def install(manifest: Manifest, target: deploy.GameTarget, prepared: staging.Pre
         if still:  # (marked as retired by commit)
             out.kept_old_folder, out.still_linked = result.old_folder, len(still)
         else:
-            staging.remove_staging(result.old_folder)
+            try:
+                staging.remove_staging(result.old_folder)
+            except (OSError, staging.StagingError) as exc:  # the update is done; repair deletes it later
+                out.kept_old_folder, out.cleanup_error = result.old_folder, _reason(exc)
     return out
+
+
+def _reason(exc: BaseException) -> str:
+    if isinstance(exc, OSError) and exc.strerror:
+        return f"{exc.strerror}" + (f" ({exc.filename})" if exc.filename else "")
+    return str(exc)
 
 
 def link_owners(game_id: str, manifest: Manifest | None = None) -> dict[str, tuple[int, str]]:
@@ -373,6 +385,8 @@ class UninstallResult:
     still_linked: list[ModRecord] = field(default_factory=list)
     #: Staging folders kept because an interrupted run may have linked into them.
     kept_folders: list[tuple[ModRecord, Path]] = field(default_factory=list)
+    #: Uninstalled mods whose staged files couldn't be deleted: (mod, folder, why).
+    not_deleted: list[tuple[ModRecord, Path, str]] = field(default_factory=list)
 
 
 def _disable_all(mods: list[ModRecord]) -> Callable[[Manifest], None]:
@@ -407,7 +421,10 @@ def uninstall(manifest: Manifest, target: deploy.GameTarget, mods: list[ModRecor
         if links_into(manifest, mod.game_id, folder):
             out.kept_folders.append((mod, folder))
         else:
-            staging.remove_staging(folder)
+            try:
+                staging.remove_staging(folder)
+            except (OSError, staging.StagingError) as exc:  # uninstalled; repair deletes the rest later
+                out.not_deleted.append((mod, folder, _reason(exc)))
         out.removed.append(mod)
     return out
 
