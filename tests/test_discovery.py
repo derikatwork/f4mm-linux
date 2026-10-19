@@ -437,13 +437,35 @@ def test_lutris_prefix_used_when_it_contains_root(home, tmp_path):
     assert game.appdata_dir == appdata(prefix) / "Fallout3"
 
 
-def test_lutris_prefix_ignored_when_it_does_not_contain_root(home, tmp_path):
+def test_the_prefix_lutris_runs_the_game_with_wins(home, tmp_path):
+    """Installed in one prefix (where its installer ran), run by Lutris with
+    another: Wine keeps plugins.txt in the one it runs with."""
+    installer_prefix = make_prefix(tmp_path / "gog-installers")
+    root = make_gog_game(installer_prefix, "Fallout 4", "Fallout4.exe")
+    runs_in = make_prefix(tmp_path / "fallout-4")
+    make_tree(appdata(runs_in, USER), ["Fallout4/plugins.txt"])
+    write_yml(home / LUTRIS_CONFIG_DIRS[0] / "fo4-1.yml", lutris_yml(root / "Fallout4.exe", runs_in))
+    (game,), _ = discover_games(Settings(), home=home)
+    assert game.prefix == runs_in
+    assert game.plugins_txt == appdata(runs_in, USER) / "Fallout4" / "plugins.txt"
+
+
+def test_a_lutris_prefix_that_is_not_one_is_ignored(home, tmp_path):
     real_prefix = make_prefix(tmp_path / "real")
     root = make_gog_game(real_prefix, "Fallout 4", "Fallout4.exe")
-    other = make_prefix(tmp_path / "other")
-    write_yml(home / LUTRIS_CONFIG_DIRS[0] / "fo4-1.yml", lutris_yml(root / "Fallout4.exe", other))
+    (tmp_path / "not-a-prefix").mkdir()
+    write_yml(home / LUTRIS_CONFIG_DIRS[0] / "fo4-1.yml", lutris_yml(root / "Fallout4.exe", tmp_path / "not-a-prefix"))
     (game,), _ = discover_games(Settings(), home=home)
     assert game.prefix == real_prefix
+
+
+def test_a_lutris_path_spelled_in_another_case_is_found(home, tmp_path):
+    root = make_tree(tmp_path / "SSD" / "GOG Games" / "Fallout 4 GOTY", ["Fallout4.exe", "Data/"])
+    prefix = make_prefix(home / "Games" / "fo4-prefix")
+    write_yml(home / LUTRIS_CONFIG_DIRS[0] / "fo4-1.yml",
+              lutris_yml(tmp_path / "ssd" / "gog games" / "fallout 4 goty" / "Fallout4.exe", prefix))
+    (game,), _ = discover_games(Settings(), home=home)
+    assert game.root == root
 
 
 def test_lutris_home_prefix_is_not_deep_scanned(home):

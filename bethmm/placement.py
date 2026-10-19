@@ -107,7 +107,7 @@ KNOWN_DATA_DIRS = frozenset({
 
 #: Folders that belong in the game root (next to the exe).
 GAME_ROOT_DIRS = frozenset({
-    "enbseries", "enbcache", "reshade-shaders", "reshade", "injector",
+    "enbseries", "enbcache", "reshade-shaders",
 })
 
 #: Exact file names that belong in the game root.
@@ -477,7 +477,9 @@ def _signals(node: _Dir) -> _Signals:
         if low == "data":
             s.data_dirs.append(name)
         elif low == "fomod":
-            config = next((src for n, src in sub.files.items() if n.lower() == "moduleconfig.xml"), None)
+            # The XML installer, or the older C# one (FOMM): either chooses what to install.
+            config = next((src for n, src in sub.files.items() if n.lower() == "moduleconfig.xml"), None) \
+                or next((src for n, src in sub.files.items() if n.lower() == "script.cs"), None)
             if s.fomod_config is None:
                 s.fomod_config = config
         elif low in KNOWN_DATA_DIRS:
@@ -512,10 +514,13 @@ def _wrapper_child(node: _Dir) -> _Dir | None:
         return None
     # A recognised folder (textures/, F4SE/ with Plugins/ ...) is the mod's
     # content -- unless it wraps a script extender's loader (a repacked
-    # "F4SE/f4se_loader.exe"): no Data folder holds that.
+    # "F4SE/f4se_loader.exe") or a Data folder ("Tools/Data/x.esp"): no
+    # folder of that name holds those.
     low = dirs[0].name.lower()
-    if low in _RECOGNISED_DIRS and (low in ("data", "fomod") or not _signals(dirs[0]).loaders):
-        return None
+    if low in _RECOGNISED_DIRS:
+        inner = _signals(dirs[0])
+        if low in ("data", "fomod") or not (inner.loaders or inner.data_dirs):
+            return None
     if not all(_ignorable_file(name) for name in node.files):
         return None
     return dirs[0]
