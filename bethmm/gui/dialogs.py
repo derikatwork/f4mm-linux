@@ -606,15 +606,17 @@ class SettingsDialog(QDialog):
         if folder:
             self.games_dir.setText(folder)
 
-    def apply(self) -> bool:
-        """Copy the fields into the settings; True when discovery must rescan."""
-        s = self.settings
-        rescan = (self.games_dir.text().strip() or "~/Games") != s.games_dir or self.scan_depth.value() != s.scan_depth
-        s.games_dir = self.games_dir.text().strip() or "~/Games"
-        s.scan_depth = self.scan_depth.value()
-        s.sevenzip = self.sevenzip.text().strip() or None
-        s.dry_run = self.dry_run.isChecked()
-        return rescan
+    def apply(self, target: Settings | None = None) -> bool:
+        """Copy the fields the user changed into *target* (the settings as
+        saved now -- the command line may have changed others meanwhile;
+        default: the ones shown). True when discovery must rescan."""
+        shown, s = self.settings, target if target is not None else self.settings
+        values = {"games_dir": self.games_dir.text().strip() or "~/Games", "scan_depth": self.scan_depth.value(),
+                  "sevenzip": self.sevenzip.text().strip() or None, "dry_run": self.dry_run.isChecked()}
+        changed = {k: v for k, v in values.items() if v != getattr(shown, k)}
+        for key, value in changed.items():
+            setattr(s, key, value)
+        return "games_dir" in changed or "scan_depth" in changed
 
 
 class GameSettingsDialog(QDialog):
@@ -680,7 +682,11 @@ class GameSettingsDialog(QDialog):
         self.link_mode.setCurrentText("symlink")
         self.ignore.setChecked(False)
 
-    def apply(self) -> None:
+    def apply(self, target: Settings | None = None) -> None:
+        """Put this game's override into *target* (the settings as saved now;
+        default: the ones shown)."""
+        s = target if target is not None else self.settings
+
         def folder(text: str) -> str | None:
             """As the settings read it: ~ is expanded, a relative path is in the home folder."""
             text = text.strip()
@@ -694,6 +700,6 @@ class GameSettingsDialog(QDialog):
             ignore=self.ignore.isChecked(),
         )
         if o == GameOverride():
-            self.settings.game_overrides.pop(self.game_id, None)
+            s.game_overrides.pop(self.game_id, None)
         else:
-            self.settings.game_overrides[self.game_id] = o
+            s.game_overrides[self.game_id] = o

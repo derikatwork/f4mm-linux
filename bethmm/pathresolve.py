@@ -263,6 +263,13 @@ class CaseResolver:
 
             folded = _fold(comp)
             on_disk_names = [m for m in disk.matches(folded) if (*key, m) not in self._gone]
+            if (*key, comp) in self._gone and on_disk_names:
+                # Re-created exactly where the plan removes it (the app's own link
+                # switching mods) -- not onto another entry spelled in another case.
+                where = "/".join(key) or "."
+                others = ", ".join(repr(m) for m in on_disk_names)
+                ambiguous.append(f"{where!r} also has {others}, differing only in case from {comp!r}; using {comp!r}")
+                on_disk_names = []
             matches = sorted(set(on_disk_names) | set(planned.matches(folded)))
             if matches:
                 name = comp if comp in matches else matches[0]

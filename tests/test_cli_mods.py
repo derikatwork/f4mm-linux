@@ -977,3 +977,60 @@ def test_a_moved_game_suggests_a_rescan(home, fo4, tmp_path, capsys):
     capsys.readouterr()
     assert main(["deploy"]) == 1
     assert "games --rescan" in capsys.readouterr().err
+
+
+def test_install_preview_calls_a_file_folder_clash_with_a_mod_an_override(home, fo4, tmp_path, capsys):
+    a = mod_zip(tmp_path, "A-1-1-0.zip", {"A.esp": esp(), "textures/x": b"a file"})
+    assert main(["install", str(a), "--yes"]) == 0
+    b = mod_zip(tmp_path, "B-2-1-0.zip", {"B.esp": esp(), "textures/x/in.dds": b"in"})
+    capsys.readouterr()
+    assert main(["install", str(b), "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert "overrides A" in out and "other type already exists" not in out
+
+
+def test_repair_goes_on_past_a_folder_it_cant_delete(home, fo4, tmp_path, capsys, monkeypatch):
+    from bethmm import staging
+
+    for name in ("Aaa", "Zzz"):
+        assert main(["install", str(mod_zip(tmp_path, f"{name}-1-1-0.zip", {f"{name}.esp": esp()})), "--yes"]) == 0
+    real = staging.remove_staging
+    monkeypatch.setattr(staging, "remove_staging", lambda folder: (_ for _ in ()).throw(PermissionError(1, "no")))
+    assert main(["uninstall", "Aaa", "Zzz", "--yes"]) == 0  # both folders stay behind
+    calls = []
+
+    def first_fails(folder):
+        calls.append(folder)
+        if len(calls) == 1:
+            raise PermissionError(1, "Operation not permitted", str(folder))
+        real(folder)
+
+    monkeypatch.setattr(staging, "remove_staging", first_fails)
+    capsys.readouterr()
+    assert main(["verify", "--repair"]) == 1
+    out = capsys.readouterr().out
+    assert len(calls) == 2 and "deleted" in out and "could not delete" in out
+
+
+def test_override_link_mode_says_the_links_change_on_deploy(home, fo4, tmp_path, capsys):
+    a = mod_zip(tmp_path, "A-1-1-0.zip", {"A.esp": esp()})
+    assert main(["install", str(a), "--yes"]) == 0
+    capsys.readouterr()
+    assert main(["override", "fallout4", "--link-mode", "hardlink"]) == 0
+    assert "relinks them as hardlinks" in capsys.readouterr().out
+
+
+def test_dry_run_switched_on_at_a_question_stops_the_change(home, fo4, tmp_path, capsys, monkeypatch):
+    import sys
+
+    a = mod_zip(tmp_path, "Cee-1-1-0.zip", {"Cee.esp": esp()})
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True, raising=False)
+
+    def answer(_prompt=""):
+        assert main(["config", "--dry-run", "on"]) == 0  # meanwhile, in another terminal
+        return "y"
+
+    monkeypatch.setattr("builtins.input", answer)
+    assert main(["install", str(a)]) == 1
+    assert "nothing was changed" in capsys.readouterr().err
+    assert not os.path.lexists(fo4 / "Data" / "Cee.esp")

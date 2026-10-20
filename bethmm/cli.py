@@ -34,7 +34,7 @@ from pathlib import Path
 from bethmm import APP_NAME, __version__, deploy, paths
 from bethmm.archive import ArchiveError, extract_archive
 from bethmm.deploy import DeployError
-from bethmm.manifest import BUSY_MESSAGE, ManifestError
+from bethmm.manifest import BUSY_MESSAGE, Manifest, ManifestError
 from bethmm.service import ResolvedFile, ServiceError, link_owners, resolve_against_game
 from bethmm.staging import StagingError, remove_stale_extractions
 from bethmm.discovery import DiscoveredGame, cache_is_current, get_games
@@ -508,6 +508,12 @@ def cmd_override(args) -> int:
                 deploy.check_link_mode(deploy.GameTarget(args.game, match.root, mode))
             except deploy.DeployError as exc:
                 print(f"warning: {exc}", file=sys.stderr)
+        if paths.manifest_path().exists():
+            with Manifest() as manifest:
+                other = sum(d.link_type != mode for d in manifest.deployed(args.game).values())
+            if other:
+                print(f"  {other} mod file(s) in the game folder are still linked the other way; "
+                      f"'bethmm deploy --game {args.game}' relinks them as {mode}s.")
     else:
         print(f"{GAMES[args.game].name} is not currently listed (not found, or ignored).")
     for w in warnings:

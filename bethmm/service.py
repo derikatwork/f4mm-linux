@@ -346,8 +346,20 @@ def resolve_against_game(plan: PlacementPlan, game: DiscoveredGame,
     out = []
     for m in plan.mappings:
         r = resolver.resolve(m.dest, plan=True)
-        owner = owners.get(fold_path(str(r.rel)))
+        key = fold_path(str(r.rel))
+        owner = owners.get(key)
+        # Another mod's file where this needs a folder (or the other way round)
+        # is a conflict like any other: the mod lower in the list wins.
+        clash = None
         if r.type_conflict:
+            parts = key.split("/")
+            clash = next((owners[k] for k in ("/".join(parts[:i]) for i in range(1, len(parts))) if k in owners),
+                         None) or next((o for k, o in owners.items() if k.startswith(key + "/")), None)
+        if clash is not None and clash[0] == replacing:
+            status = "replaces the previous version's file"
+        elif clash is not None:
+            status = f"overrides {clash[1]} (its file or folder at this path stays installed)"
+        elif r.type_conflict:
             status = "conflict: a folder/file of the other type already exists there"
         elif r.exists_on_disk and owner is not None and owner[0] == replacing:
             status = "replaces the previous version's file"
@@ -499,6 +511,8 @@ class RepairOutcome:
     deleted: list[Path] = field(default_factory=list)
     #: Leftovers of the Wine link check removed.
     leftovers: list[str] = field(default_factory=list)
+    #: Retired folders that couldn't be deleted: (folder, why). The rest went on.
+    not_deleted: list[tuple[Path, str]] = field(default_factory=list)
 
 
 def repair(manifest: Manifest, target: deploy.GameTarget, found: Check, *, release_held: bool = False,
@@ -520,7 +534,11 @@ def repair(manifest: Manifest, target: deploy.GameTarget, found: Check, *, relea
         out.sync_error = str(exc)
         return out
     for folder in unused_staging(manifest, target.game_id)[0]:
-        staging.remove_staging(folder)
+        try:
+            staging.remove_staging(folder)
+        except (OSError, staging.StagingError) as exc:
+            out.not_deleted.append((folder, _reason(exc)))
+            continue
         out.deleted.append(folder)
     return out
 

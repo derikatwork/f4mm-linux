@@ -783,3 +783,91 @@ def test_a_mod_with_a_file_and_a_folder_of_one_name(qtbot, window, tmp_path, fo4
         assert row.overwrites == [] and row.overwritten_by == []  # not in conflict with itself
         result = deploy.deploy(m, service.target_for(window.game, window.settings), dry_run=True)
     assert any("also has a file where this needs a folder" in why for _p, why in result.plan.blocked)
+
+
+# ---------------------------------------------------------------- QA round 2 (GUI)
+
+
+def test_the_settings_dialog_saves_only_what_was_changed_in_it(qtbot, window, answers, fo4):
+    from bethmm.gui.dialogs import SettingsDialog
+
+    def change_7z(dialog) -> None:
+        if isinstance(dialog, SettingsDialog):
+            assert main(["override", "fallout4", "--link-mode", "hardlink"]) == 0  # meanwhile, elsewhere
+            dialog.sevenzip.setText("/opt/7zip/7zz")
+
+    answers.before_accept = change_7z
+    window.open_settings()
+    saved = load_settings()
+    assert saved.sevenzip == "/opt/7zip/7zz" and saved.override("fallout4").link_mode == "hardlink"
+
+
+def test_an_unreadable_settings_file_is_never_saved_over(qtbot, window, answers, fo4):
+    from bethmm import paths
+    broken = '{"games_dir": "~/Games", "game_overrides": {},}\n'
+    paths.settings_path().write_text(broken)
+    window.refresh()
+    window._game_chosen()
+    window.open_settings()
+    assert paths.settings_path().read_text() == broken
+    assert any("Not saved" in text for _, text, _w in answers.told)
+
+
+def test_dry_run_switched_on_while_a_question_is_open_stops_the_change(qtbot, window, answers, tmp_path, fo4):
+    two_mods(tmp_path)
+    window.refresh()
+    archive = mod_zip(tmp_path, "Better-3-1-0.zip", {"Better.esp": esp()})
+
+    def switch_on(_dialog) -> None:
+        assert main(["config", "--dry-run", "on"]) == 0
+
+    answers.before_accept = switch_on
+    window.install_paths([str(archive)])
+    idle(qtbot, window)
+    assert not os.path.lexists(fo4 / "Data" / "Better.esp")
+    assert main(["config", "--dry-run", "off"]) == 0
+    window.purge()
+    idle(qtbot, window)
+    assert (fo4 / "Data" / "ArmorPack.esp").is_symlink()  # the purge was stopped too
+    assert any("switched on meanwhile" in text for _, text, _w in answers.told)
+
+
+def test_a_drag_moves_the_mod_it_started_on(qtbot, window, tmp_path, fo4, monkeypatch):
+    from PySide6.QtGui import QDrag
+    for n in "ABCD":
+        assert main(["install", str(mod_zip(tmp_path, f"{n}-1-1-0.zip", {f"{n}.esp": esp()})), "--yes"]) == 0
+    window.refresh()
+    window.table.selectRow(0)
+    window.table.selectionModel().select(window.model.index(2, 0), window.table.selectionModel().SelectionFlag.Select
+                                         | window.table.selectionModel().SelectionFlag.Rows)
+    window.table.selectionModel().setCurrentIndex(window.model.index(2, 2),
+                                                  window.table.selectionModel().SelectionFlag.NoUpdate)
+    carried = {}
+    monkeypatch.setattr(QDrag, "exec", lambda self, *a, **k: carried.setdefault("data", self.mimeData()) and 0)
+    window.table.startDrag(Qt.DropAction.MoveAction)
+    window.model.dropMimeData(carried["data"], Qt.DropAction.MoveAction, 4, 0, QModelIndex())
+    idle(qtbot, window)
+    assert "".join(r.mod.name for r in window.model.rows) == "ABDC"  # C, the row dragged
+
+
+def test_switching_to_hardlinks_offers_to_relink(qtbot, window, answers, tmp_path, fo4):
+    from bethmm.gui.dialogs import GameSettingsDialog
+    two_mods(tmp_path)
+    window.refresh()
+
+    def hardlinks(dialog) -> None:
+        if isinstance(dialog, GameSettingsDialog):
+            dialog.link_mode.setCurrentText("hardlink")
+
+    answers.before_accept = hardlinks
+    answers.ask_answer = False
+    window.open_game_settings()
+    assert any("Relink the mod files" in q for q in answers.asked)
+    assert "still of the other kind" in window.state_label.text()
+    assert (fo4 / "Data" / "ArmorPack.esp").is_symlink()
+    answers.ask_answer = True
+    answers.before_accept = None
+    window.deploy()
+    idle(qtbot, window)
+    esp_file = fo4 / "Data" / "ArmorPack.esp"
+    assert not esp_file.is_symlink() and esp_file.stat().st_nlink == 2

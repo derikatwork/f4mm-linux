@@ -917,3 +917,14 @@ def test_cache_is_current(home, tmp_path):
     get_games(Settings(), cache_path=cache, home=home)
     assert cache_is_current(Settings(), cache)
     assert not cache_is_current(Settings(games_dir="/elsewhere"), cache)
+
+
+@pytest.mark.parametrize("override", [GameOverride(wine_user=USER), "same root"])
+def test_an_override_keeps_the_prefix_lutris_runs_the_game_with(home, tmp_path, override):
+    root = make_gog_game(make_prefix(tmp_path / "gog-installers"), "Fallout 4", "Fallout4.exe")
+    runs_in = make_prefix(tmp_path / "fallout-4")
+    write_yml(home / LUTRIS_CONFIG_DIRS[0] / "fo4-1.yml", lutris_yml(root / "Fallout4.exe", runs_in))
+    if override == "same root":
+        override = GameOverride(root=str(root))
+    (game,), _ = discover_games(Settings(game_overrides={"fallout4": override}), home=home)
+    assert game.prefix == runs_in

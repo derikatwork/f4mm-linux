@@ -854,6 +854,8 @@ def _apply_overrides(
             root,
             exe,
             source=source,
+            # The same folder keeps the prefix discovery chose (Lutris's, if it runs the game).
+            lutris_prefix=current.prefix if same and current is not None else None,
             prefix_hints=(current.prefix,) if current is not None else (),
             prefix_override=prefix_override,
             user_override=user_override,

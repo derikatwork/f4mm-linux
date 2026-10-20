@@ -721,6 +721,12 @@ def plan_sync(manifest: Manifest, target: GameTarget, *, purge: bool = False) ->
             index = _superseded_index(game_id)
         return index.get(fold_path(path), [])
 
+    # Unrecorded links of the app's that nothing wants any more.
+    for key, (path, source) in sorted(ours_unrecorded.items()):
+        if key in desired and key not in foreign:
+            continue
+        removals.append(Op("unlink", path, None, source, LEFTOVER_NOTE))
+
     # What this plan removes makes room for what it creates (a winning mod's
     # folder where a losing mod's file was); an original put back takes its path.
     for op in removals:
@@ -848,12 +854,6 @@ def plan_sync(manifest: Manifest, target: GameTarget, *, purge: bool = False) ->
             additions.append(backup_op)
         additions.append(Op("link", path, mod.id, str(staged), note))
         final[key] = path
-
-    # Unrecorded links of the app's that nothing wants any more.
-    for key, (path, source) in sorted(ours_unrecorded.items()):
-        if key in final or (key in desired and key not in foreign):
-            continue
-        removals.append(Op("unlink", path, None, source, LEFTOVER_NOTE))
 
     # Folders the app created that no remaining link needs, deepest first.
     needed: set[str] = set()
@@ -1024,6 +1024,10 @@ def apply_plan(manifest: Manifest, plan: SyncPlan, *, dry_run: bool = False) -> 
             log.warning("SKIPPED %s %s: %s", op.kind.upper(), plan.root / op.path, skip)
             result.failed.append((op, str(skip)))
             continue
+        except _Kept as kept:
+            manifest.finish_journal(entry, "skipped", str(kept))
+            result.warnings.append(str(kept))
+            continue
         if note:
             result.warnings.append(note)
         manifest.finish_journal(entry, "done")
@@ -1058,6 +1062,11 @@ def _unreconciled_link(entry: JournalEntry, root: Path, deployed: dict[str, Depl
 
 class _Skip(Exception):
     """An op that would be unsafe now (the disk changed since planning)."""
+
+
+class _Kept(Exception):
+    """An op that, as planned, leaves something in place (a folder the app
+    made still holds files): neither done nor a failure, just a note."""
 
 
 def _run(op: Op, plan: SyncPlan, manifest: Manifest, deployed: dict[str, DeployedFile],
@@ -1250,10 +1259,12 @@ def _run(op: Op, plan: SyncPlan, manifest: Manifest, deployed: dict[str, Deploye
             if _holds_app_files(manifest, game_id, key, deployed):
                 # E.g. a link whose removal failed: keep the record so a later run removes the folder.
                 log.info("KEEP %s (still holds files of the app)", abs_path)
-                return f"kept the folder {op.path} for now: it still holds files of the app"
+                if not any(k.startswith(key + "/") for k in deployed):
+                    raise _Kept(f"kept the folder {op.path}: a folder in it holds files the app didn't create")
+                raise _Kept(f"kept the folder {op.path} for now: it still holds files of the app")
             # The app made it, so it stays recorded: removed once it is empty.
             log.info("KEEP %s (contains files the app didn't create)", abs_path)
-            return f"kept the folder {op.path}: it contains files the app didn't create"
+            raise _Kept(f"kept the folder {op.path}: it contains files the app didn't create")
         with manifest.transaction():
             manifest.forget_dir(game_id, op.path)
         log.info("RMDIR %s", abs_path)
@@ -1603,6 +1614,10 @@ def verify(manifest: Manifest, target: GameTarget) -> VerifyReport:
         report.links_elsewhere.sort()
     resolver = CaseResolver(root)
     deployed = manifest.deployed(game_id)
+    other_kind = sum(record.link_type != target.link_mode for record in deployed.values())
+    if other_kind:
+        report.notes.append(f"{other_kind} link(s) are not {target.link_mode}s, the link mode set for the game; "
+                            "the next deploy relinks them")
     for record in deployed.values():
         status = _inspect(root / record.path, record)
         if status == "missing":

@@ -774,3 +774,39 @@ def test_file_against_folder_in_a_dry_run_matches_the_real_run(world):
     assert snapshot(world.root) == before
     real = world.deploy()
     assert [(op.kind, op.path) for op in dry.done] == [(op.kind, op.path) for op in real.done]
+
+
+def test_switching_mods_keeps_the_links_spelling_next_to_a_case_sibling(world):
+    """The user's own Data/Foo.esp next to the app's Data/FOO.esp: when another
+    mod takes the path over, its link goes where the app's link was."""
+    a = add_mod(world.manifest, "A", {"Data/FOO.esp": "a"})
+    b = add_mod(world.manifest, "B", {"Data/foo.esp": "b"})
+    world.manifest.set_order(GAME, [b.id, a.id])
+    world.deploy()
+    assert world.path("Data/FOO.esp").read_text() == "a"
+    mine = world.root / "Data" / "Foo.esp"
+    mine.write_text("the user's")
+    world.manifest.set_order(GAME, [a.id, b.id])
+    result = world.deploy()
+    assert not result.failed, result.failed
+    assert (world.root / "Data" / "FOO.esp").read_text() == "b" and mine.read_text() == "the user's"
+
+
+def test_a_kept_folder_is_reported_as_kept_not_removed(world):
+    add_mod(world.manifest, "Armor", {"Data/materials/armor/a.bgsm": "a"})
+    world.deploy()
+    (world.root / "Data" / "materials" / "armor" / "mine.bgsm").write_text("the user's")
+    result = world.purge()
+    assert not result.failed
+    assert not [op for op in result.done if op.kind == "rmdir"]
+    assert any("kept the folder Data/materials/armor" in w for w in result.warnings)
+    assert any("a folder in it holds files the app didn't create" in w for w in result.warnings)
+    kept = [e for e in world.manifest.history(GAME) if e.action == "rmdir"]
+    assert kept and all(e.status == "skipped" for e in kept)
+
+
+def test_verify_notes_links_of_the_other_kind(world):
+    add_mod(world.manifest, "A", {"Data/A.esp": "a"})
+    world.deploy()
+    report = deploy.verify(world.manifest, world.target("hardlink"))
+    assert any("not hardlinks" in n for n in report.notes)

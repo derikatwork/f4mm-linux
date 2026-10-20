@@ -1497,3 +1497,23 @@ def test_killed_while_a_file_and_a_folder_swap(tmp_path, monkeypatch, file_wins,
             raise AssertionError(f"killed at call {n}/{total} ({'after' if after else 'before'}): {exc}") from exc
         finally:
             world.manifest.close()
+
+
+@pytest.mark.parametrize("mode", ["symlink", "hardlink"])
+def test_a_leftover_link_of_a_killed_run_makes_room_for_a_winning_folder(tmp_path, monkeypatch, mode):
+    """A killed run linked FileMod's file at Data/clash and died before
+    recording it; now DirMod (a folder there) wins: one deploy settles it."""
+    world = fresh_world(tmp_path / "w", monkeypatch, mode=mode)
+    m = world.manifest
+    a = add_mod(m, "FileMod", {"Data/clash": "file"})
+    b = add_mod(m, "DirMod", {"Data/Clash/in.dds": "in"})
+    m.set_order(GAME, [b.id, a.id])
+    source = staged(a, "Data/clash")
+    m.journal(GAME, "link", "Data/clash", str(source), status="intent")
+    (os.symlink if mode == "symlink" else os.link)(source, world.path("Data/clash"))
+    m.set_order(GAME, [a.id, b.id])
+    result = world.deploy()
+    assert not result.failed and not result.plan.blocked, (result.failed, result.plan.blocked)
+    assert_deployed(world)
+    world.purge()
+    assert_vanilla(world)

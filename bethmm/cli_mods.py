@@ -186,7 +186,11 @@ def _confirm(question: str, args) -> bool:
     except EOFError:  # Ctrl-D: no
         print()
         return False
-    return reply in ("y", "yes")
+    if reply not in ("y", "yes"):
+        return False
+    if load_settings().dry_run:  # switched on elsewhere while the question was open
+        raise CliError("dry-run mode was switched on while this was waiting for an answer; nothing was changed")
+    return True
 
 
 def _mod_names(manifest: Manifest, game_id: str) -> dict[int, str]:
@@ -690,6 +694,9 @@ def cmd_verify(args) -> int:
         status = _report(outcome.sync, manifest)
         for folder in outcome.deleted:
             print(f"  deleted {folder}")
+        for folder, why in outcome.not_deleted:
+            print(f"  ! could not delete {folder}: {why}")
+            status = 1
         return status
 
 

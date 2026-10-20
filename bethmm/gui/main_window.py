@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from PySide6.QtCore import QCoreApplication, QEvent, QItemSelection, QItemSelectionModel, QSize, Qt, QUrl
-from PySide6.QtGui import QAction, QDesktopServices, QIcon, QKeySequence
+from PySide6.QtGui import QAction, QDesktopServices, QDrag, QIcon, QKeySequence
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
@@ -77,6 +77,19 @@ def _names(manifest: Manifest, game_id: str) -> dict[int, str]:
     return {m.id: m.name for m in manifest.mods(game_id)}
 
 
+class ModTable(QTableView):
+    """The mod list. A drag moves the mod it was started on (the row pressed),
+    also when several are selected -- one mod moves at a time."""
+
+    def startDrag(self, supported_actions) -> None:
+        index = self.currentIndex()
+        if not index.isValid():
+            return
+        drag = QDrag(self)
+        drag.setMimeData(self.model().mimeData([index]))
+        drag.exec(Qt.DropAction.MoveAction)
+
+
 class MainWindow(QMainWindow):
     def __init__(self, settings: Settings | None = None) -> None:
         super().__init__()
@@ -84,6 +97,7 @@ class MainWindow(QMainWindow):
         self.games: list[DiscoveredGame] = []
         self.tasks = TaskRunner(self)
         self.tasks.busyChanged.connect(self._busy_changed)
+        self._settings_error: str | None = None
         self._install_queue: list[tuple[str, ModRecord | None]] = []
         self._installing = False
         # Once the window is closing, queued installs are dropped and results
@@ -202,7 +216,7 @@ class MainWindow(QMainWindow):
         self.model.enableRequested.connect(self.set_enabled)
         self.model.moveRequested.connect(self.move_mod)
         self.model.filesDropped.connect(self.install_paths)
-        self.table = QTableView()
+        self.table = ModTable()
         self.table.setModel(self.model)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
@@ -304,8 +318,11 @@ class MainWindow(QMainWindow):
         ignored nor overwritten."""
         try:
             self.settings = load_settings()
+            self._settings_error = None
         except SettingsError as exc:
-            self.note(f"! {exc}")
+            if str(exc) != self._settings_error:
+                self.note(f"! {exc}")
+            self._settings_error = str(exc)  # never saved over: the user's file is fixed by hand
         return self.settings
 
     def reload_games(self, *, rescan: bool = False) -> None:
@@ -332,7 +349,7 @@ class MainWindow(QMainWindow):
 
     def _game_chosen(self) -> None:
         game = self.game
-        if game is not None and game.game_id != self._fresh_settings().current_game:
+        if game is not None and game.game_id != self._fresh_settings().current_game and self._settings_error is None:
             self.settings.current_game = game.game_id
             try:
                 save_settings(self.settings)
@@ -356,17 +373,20 @@ class MainWindow(QMainWindow):
                 with Manifest() as manifest, manifest.snapshot():
                     rows = service.mod_rows(manifest, game.game_id)
                     state = manifest.game_state(game.game_id)
-                    links = len(manifest.deployed(game.game_id))
+                    kinds = [d.link_type for d in manifest.deployed(game.game_id).values()]
                     history = manifest.history(game.game_id, limit=300)
             except Exception as exc:  # the window stays usable whatever the manifest holds
                 if not isinstance(exc, ManifestError):
                     log.error("could not read the manifest: %s", "".join(traceback.format_exception(exc)))
                 self.note(f"! could not read the mod list: {exc}")
-                rows, history, state, links = [], [], None, 0
+                rows, history, state, kinds = [], [], None, []
             mode = self.settings.override(game.game_id).link_mode
             purged = state is not None and not state.deployed
+            other = sum(kind != mode for kind in kinds)
+            links = f"{len(kinds)} {mode}(s) deployed" if not other else \
+                f"{len(kinds)} link(s) deployed, {other} still of the other kind: Deploy relinks them as {mode}s"
             state_text = (f"{game.root}  ·  {len(rows)} mod(s), {sum(r.mod.enabled for r in rows)} enabled  ·  "
-                          + ("PURGED: Deploy puts the mods back" if purged else f"{links} {mode}(s) deployed"))
+                          + ("PURGED: Deploy puts the mods back" if purged else links))
         self.model.set_rows(rows)
         keep = QItemSelection()
         for mod_id in selected:
@@ -456,6 +476,16 @@ class MainWindow(QMainWindow):
                 box.exec()
                 box.deleteLater()
         self.refresh()
+
+    def _still_allowed(self) -> deploy.GameTarget | None:
+        """After a confirmation: the target as the settings say now (the link
+        mode may have changed meanwhile), or None -- and nothing is done --
+        when dry-run mode was switched on while the question was open."""
+        if self._fresh_settings().dry_run:
+            self.note("! Dry-run mode was switched on meanwhile: nothing was changed.")
+            self.tell("Dry run", "Dry-run mode was switched on meanwhile: nothing was changed.")
+            return None
+        return self.target
 
     def _run(self, job: Callable[[], Any], done: Callable[[Any], None]) -> None:
         if self._closing:  # nothing new starts once the window is closing
@@ -586,10 +616,10 @@ class MainWindow(QMainWindow):
                                 "files they replaced go back, and their staged files are deleted.",
                                 result, names, apply_text="Uninstall", can_apply=not self.settings.dry_run,
                                 why_not=DRY_RUN_NOTE, parent=self)
-            if self.run_dialog(dialog):
-                self._run(apply, done)
+            if self.run_dialog(dialog) and (now := self._still_allowed()) is not None:
+                self._run(lambda: apply(now), done)
 
-        def apply() -> tuple[service.UninstallResult, dict[int, str]]:
+        def apply(target: deploy.GameTarget) -> tuple[service.UninstallResult, dict[int, str]]:
             with Manifest(lock=True) as manifest:
                 service.check_unchanged(manifest, target.game_id, shown)
                 names = _names(manifest, target.game_id)
@@ -652,7 +682,7 @@ class MainWindow(QMainWindow):
             return
         self._installing = True
         source, replace = self._install_queue.pop(0)
-        settings, installed = self.settings, [g.game_id for g in self.games]
+        settings, installed = self._fresh_settings(), [g.game_id for g in self.games]
         self.note(f"Reading {source} ...")
 
         def prepare() -> staging.Prepared:
@@ -691,6 +721,13 @@ class MainWindow(QMainWindow):
             self._next_install()
             return
         prepared, choice, game = dialog.prepared, dialog.choice, dialog.game
+        if self._fresh_settings().dry_run:  # switched on while the dialog was open
+            staging.discard(prepared)
+            self.note("! Dry-run mode was switched on meanwhile: nothing was installed.")
+            self.tell("Dry run", "Dry-run mode was switched on meanwhile: nothing was installed.")
+            self.refresh()
+            self._next_install()
+            return
         target = service.target_for(game, self.settings)
 
         def install() -> tuple[service.InstallResult, dict[int, str]]:
@@ -755,7 +792,7 @@ class MainWindow(QMainWindow):
             if not describe.changes(result) and not result.plan.blocked and not result.warnings:
                 if purged and not self.settings.dry_run:
                     # Nothing to link now, but mods enabled from now on are linked again.
-                    self._run(apply, lambda r2: self.report("Deployed.", r2[0], r2[1]))
+                    self._run(lambda: apply(target), lambda r2: self.report("Deployed.", r2[0], r2[1]))
                     return
                 self.note("Deploy: everything is already in place.")
                 self.tell("Deploy", "Everything is already in place.")
@@ -763,10 +800,10 @@ class MainWindow(QMainWindow):
             dialog = PlanDialog("Deploy", "Link every enabled mod into the game folder:", result, names,
                                 apply_text="Deploy", can_apply=not self.settings.dry_run, why_not=DRY_RUN_NOTE,
                                 parent=self)
-            if self.run_dialog(dialog):
-                self._run(apply, lambda r2: self.report("Deployed.", r2[0], r2[1]))
+            if self.run_dialog(dialog) and (now := self._still_allowed()) is not None:
+                self._run(lambda: apply(now), lambda r2: self.report("Deployed.", r2[0], r2[1]))
 
-        def apply() -> tuple[deploy.SyncResult, dict[int, str]]:
+        def apply(target: deploy.GameTarget) -> tuple[deploy.SyncResult, dict[int, str]]:
             with Manifest(lock=True) as manifest:
                 return deploy.deploy(manifest, target), _names(manifest, target.game_id)
 
@@ -792,10 +829,10 @@ class MainWindow(QMainWindow):
                          "Mods stay installed; Deploy puts them back.")
             dialog = PlanDialog("Purge", intro, result, names, apply_text="Purge",
                                 can_apply=not self.settings.dry_run, why_not=DRY_RUN_NOTE, parent=self)
-            if self.run_dialog(dialog):
-                self._run(apply, lambda r2: self.report("Purged.", r2[0], r2[1]))
+            if self.run_dialog(dialog) and (now := self._still_allowed()) is not None:
+                self._run(lambda: apply(now), lambda r2: self.report("Purged.", r2[0], r2[1]))
 
-        def apply() -> tuple[deploy.SyncResult, dict[int, str]]:
+        def apply(target: deploy.GameTarget) -> tuple[deploy.SyncResult, dict[int, str]]:
             with Manifest(lock=True) as manifest:
                 result = deploy.purge(manifest, target, forget_missing=forget_missing)
                 return result, _names(manifest, target.game_id)
@@ -835,9 +872,11 @@ class MainWindow(QMainWindow):
             dialog = VerifyDialog(game.name, found, can_repair=not self.settings.dry_run, parent=self)
             if self.run_dialog(dialog) and dialog.repair_button is not None:
                 release = dialog.release_held.isChecked()
-                self._run(lambda: repair(release), repaired)
+                now = self._still_allowed()
+                if now is not None:
+                    self._run(lambda: repair(release, now), repaired)
 
-        def repair(release_held: bool) -> tuple[service.RepairOutcome, dict[int, str]]:
+        def repair(release_held: bool, target: deploy.GameTarget) -> tuple[service.RepairOutcome, dict[int, str]]:
             with Manifest(lock=True) as manifest:
                 found = service.check(manifest, target)  # again, under the lock
                 outcome = service.repair(manifest, target, found, release_held=release_held, data_dir=game.data_dir)
@@ -855,6 +894,8 @@ class MainWindow(QMainWindow):
                 self.report("Purged again." if outcome.purged else "Redeployed.", outcome.sync, names)
             for folder in outcome.deleted:
                 self.note(f"deleted {folder}")
+            for folder, why in outcome.not_deleted:
+                self.note(f"! could not delete {folder}: {why}")
 
         self._run(check, show)
 
@@ -890,9 +931,9 @@ class MainWindow(QMainWindow):
     def open_settings(self) -> None:
         dialog = SettingsDialog(self._fresh_settings(), parent=self)
         if self.run_dialog(dialog):
-            rescan = dialog.apply()
-            self._save_settings()
-            self.reload_games(rescan=rescan)
+            rescan = dialog.apply(self._fresh_settings())  # onto what is saved now
+            if self._save_settings():
+                self.reload_games(rescan=rescan)
 
     def open_game_settings(self) -> None:
         self._fresh_settings()
@@ -911,31 +952,50 @@ class MainWindow(QMainWindow):
         game = next((g for g in self.games if g.game_id == game_id), None)
         dialog = GameSettingsDialog(game_id, self.settings, game, parent=self)
         if self.run_dialog(dialog):
-            dialog.apply()
+            mode_before = self._fresh_settings().override(game_id).link_mode
+            dialog.apply(self.settings)  # onto what is saved now
             hidden_now = self.settings.override(game_id).ignore
             if not hidden_now:
                 self.settings.current_game = game_id
             elif self.settings.current_game == game_id:
                 self.settings.current_game = None  # a hidden game isn't the current one any more
-            self._save_settings()
-            if self.settings.override(game_id).link_mode == "hardlink" and game is not None and not hidden_now:
+            if not self._save_settings():
+                return
+            mode_now = self.settings.override(game_id).link_mode
+            usable = True
+            if mode_now == "hardlink" and game is not None and not hidden_now:
                 try:
                     deploy.check_link_mode(service.target_for(game, self.settings))
                 except deploy.DeployError as exc:
+                    usable = False
                     self.tell("Hardlinks won't work here", str(exc), warning=True)
             self.reload_games()
             if self.settings.current_game is None and self.game is not None:
                 self.settings.current_game = self.game.game_id  # the game shown now, for the command line too
                 self._save_settings()
+            # The links in the game folder change kind only when the mods are deployed again.
+            if mode_now != mode_before and usable and not hidden_now and self.game is not None \
+                    and self.game.game_id == game_id:
+                with Manifest() as manifest:
+                    other = sum(d.link_type != mode_now for d in manifest.deployed(game_id).values())
+                if other and self.ask("Relink the mod files", f"{other} mod file(s) in the game folder are still "
+                                      f"{mode_before}s. Deploy now to relink them as {mode_now}s?"):
+                    self.deploy()
 
     def rescan_games(self) -> None:
         self.reload_games(rescan=True)
 
-    def _save_settings(self) -> None:
+    def _save_settings(self) -> bool:
+        if self._settings_error is not None:
+            self.tell("Settings", f"Not saved: {self._settings_error}. Fix the file (or delete it to start "
+                                  "over) and try again.", warning=True)
+            return False
         try:
             save_settings(self.settings)
         except OSError as exc:
             self.tell("Settings", f"Could not save the settings: {exc}", warning=True)
+            return False
+        return True
 
     # ------------------------------------------------------------ details
 
