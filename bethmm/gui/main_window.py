@@ -9,6 +9,7 @@ the plan is shown instead."""
 from __future__ import annotations
 
 import logging
+import sqlite3
 import traceback
 from datetime import datetime
 from pathlib import Path
@@ -43,7 +44,7 @@ from bethmm import APP_NAME, __version__, deploy, describe, paths, service, stag
 from bethmm.archive import ArchiveError
 from bethmm.discovery import DiscoveredGame, get_games
 from bethmm.games import GAMES
-from bethmm.manifest import Manifest, ManifestError, ModRecord
+from bethmm.manifest import BUSY_MESSAGE, Manifest, ManifestError, ModRecord
 from bethmm.pathresolve import fold_path
 from bethmm.settings import Settings, SettingsError, load_settings, save_settings
 
@@ -461,9 +462,14 @@ class MainWindow(QMainWindow):
                 f"{describe.describe_op(op, names)}: {reason}" for op, reason in result.failed[:20]), warning=True)
 
     def show_error(self, exc: BaseException) -> None:
-        if isinstance(exc, EXPECTED_ERRORS):
-            text = str(exc) if not isinstance(exc, OSError) else f"{exc.strerror or exc}" + (
-                f": {exc.filename}" if getattr(exc, "filename", None) else "")
+        if isinstance(exc, (*EXPECTED_ERRORS, sqlite3.Error)):
+            if isinstance(exc, sqlite3.Error):  # e.g. a damaged manifest.db
+                text = BUSY_MESSAGE if "locked" in str(exc) else \
+                    f"the manifest ({paths.manifest_path()}) can't be read: {exc}"
+            elif isinstance(exc, OSError):
+                text = f"{exc.strerror or exc}" + (f": {exc.filename}" if getattr(exc, "filename", None) else "")
+            else:
+                text = str(exc)
             self.note(f"! {text}")
             self.tell("Couldn't do that", text, warning=True)
         else:

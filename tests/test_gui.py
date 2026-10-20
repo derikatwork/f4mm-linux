@@ -871,3 +871,19 @@ def test_switching_to_hardlinks_offers_to_relink(qtbot, window, answers, tmp_pat
     idle(qtbot, window)
     esp_file = fo4 / "Data" / "ArmorPack.esp"
     assert not esp_file.is_symlink() and esp_file.stat().st_nlink == 2
+
+
+def test_a_damaged_manifest_is_reported_not_crashed_on(qtbot, window, answers, tmp_path, fo4, monkeypatch):
+    import sqlite3
+
+    from bethmm import service
+
+    def damaged(*_a, **_k):
+        raise sqlite3.DatabaseError("database disk image is malformed")
+
+    two_mods(tmp_path)
+    monkeypatch.setattr(service, "mod_rows", damaged)
+    window.refresh()
+    assert "database disk image is malformed" in window.messages.toPlainText()
+    window.show_error(sqlite3.DatabaseError("database disk image is malformed"))
+    assert any("can't be read" in text for _, text, warning in answers.told if warning)

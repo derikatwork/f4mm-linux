@@ -369,7 +369,13 @@ class Manifest:
         self._db.execute("BEGIN")
         try:
             yield
-        finally:
+        except BaseException:
+            try:
+                self._db.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass  # the error that got here is the one worth reporting
+            raise
+        else:
             self._db.execute("COMMIT")
 
     @contextmanager
