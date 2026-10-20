@@ -40,6 +40,9 @@ from bethmm.manifest import Manifest, ModRecord
 from bethmm.placement import Target
 from bethmm.settings import LINK_MODES, GameOverride, Settings
 
+#: File lists show this many rows (a big texture pack has tens of thousands).
+MAX_ROWS = 2000
+
 _TARGET_TEXT = {Target.DATA: "the Data folder", Target.GAME_ROOT: "the game folder (next to the .exe)",
                 Target.UNKNOWN: "an unknown place"}
 
@@ -315,7 +318,7 @@ class InstallDialog(QDialog):
         self.apply_choice.clicked.connect(self._apply_choice)
         self.folder_tree.itemChanged.connect(self._choice_edited)
         self.target_group.buttonToggled.connect(self._choice_edited)
-        self.choose_toggle.toggled.connect(self.choose_box.setVisible)
+        self.choose_toggle.toggled.connect(self._choose_toggled)
         problem = service.installable_problem(prepared.plan)
         self.choose_toggle.setChecked(problem is not None)
         self.choose_box.setVisible(problem is not None)
@@ -331,6 +334,15 @@ class InstallDialog(QDialog):
     def _name_edited(self, _text: str) -> None:
         self._name_touched = True
         self._name_timer.start()
+
+    def _choose_toggled(self, on: bool) -> None:
+        self.choose_box.setVisible(on)
+        if not on and self._choice_pending:  # back to the plan in effect
+            self._choice_pending = False
+            self.folder_tree.blockSignals(True)
+            self._fill_folders()
+            self.folder_tree.blockSignals(False)
+            self._refresh()
 
     def _choice_edited(self, *_args) -> None:
         self._choice_pending = True
@@ -510,11 +522,13 @@ class InstallDialog(QDialog):
             owners = service.link_owners(game.game_id, manifest)
             resolved = service.resolve_against_game(self.prepared.plan, game, owners,
                                                     replacing=choice.existing.id if choice.existing else None)
-            for r in resolved:
+            for r in resolved[:MAX_ROWS]:
                 note = "" if r.status == "new" else r.status
                 if r.case_adjusted:
                     note = f"{note}; {r.case_adjusted}" if note else r.case_adjusted
                 QTreeWidgetItem(self.files_tree, [r.source, r.dest, note])
+            if len(resolved) > MAX_ROWS:
+                QTreeWidgetItem(self.files_tree, [f"... and {len(resolved) - MAX_ROWS} more file(s)", "", ""])
             for col in (0, 1):
                 self.files_tree.resizeColumnToContents(col)
             self.tabs.setTabText(0, f"Files ({len(resolved)})")
@@ -667,10 +681,14 @@ class GameSettingsDialog(QDialog):
         self.ignore.setChecked(False)
 
     def apply(self) -> None:
+        def folder(text: str) -> str | None:
+            """As the settings read it: ~ is expanded, a relative path is in the home folder."""
+            text = text.strip()
+            return str(Path.home() / os.path.expanduser(text)) if text else None
+
         o = GameOverride(
-            root=os.path.abspath(os.path.expanduser(self.root.text().strip())) if self.root.text().strip() else None,
-            prefix=os.path.abspath(os.path.expanduser(self.prefix.text().strip())) if self.prefix.text().strip()
-            else None,
+            root=folder(self.root.text()),
+            prefix=folder(self.prefix.text()),
             wine_user=self.wine_user.text().strip() or None,
             link_mode=self.link_mode.currentText(),
             ignore=self.ignore.isChecked(),

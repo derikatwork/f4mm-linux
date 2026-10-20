@@ -360,6 +360,19 @@ class Manifest:
                          (str(SCHEMA_VERSION),))
 
     @contextmanager
+    def snapshot(self) -> Iterator[None]:
+        """Read several things as of one moment (another process may be
+        changing the manifest meanwhile). Changes nothing."""
+        if self._db.in_transaction:
+            yield
+            return
+        self._db.execute("BEGIN")
+        try:
+            yield
+        finally:
+            self._db.execute("COMMIT")
+
+    @contextmanager
     def transaction(self) -> Iterator[None]:
         """Group several changes so they are saved together or not at all."""
         if self._db.in_transaction:

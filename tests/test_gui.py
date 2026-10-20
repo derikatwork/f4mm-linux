@@ -241,7 +241,7 @@ def test_verify_and_repair(qtbot, window, answers, tmp_path, fo4):
 
 def test_dry_run_mode_changes_nothing(qtbot, window, answers, tmp_path, fo4):
     two_mods(tmp_path)
-    window.settings.dry_run = True
+    assert main(["config", "--dry-run", "on"]) == 0  # (the window reads the settings before each action)
     window.refresh()
     before = climods.snapshot(fo4)
     window.model.setData(window.model.index(0, COL_ENABLED), Qt.CheckState.Unchecked.value,
@@ -273,8 +273,10 @@ def test_errors_are_shown_not_raised(qtbot, window, answers, tmp_path, fo4, monk
     two_mods(tmp_path)
     window.refresh()
     monkeypatch.setattr(deploy, "_same_dev", lambda a, b: False)
-    window.settings.game_overrides["fallout4"] = __import__("bethmm.settings").settings.GameOverride(
-        link_mode="hardlink")
+    from bethmm.settings import GameOverride, save_settings
+    settings = load_settings()
+    settings.game_overrides["fallout4"] = GameOverride(link_mode="hardlink")
+    save_settings(settings)
     window.refresh()
     window.set_enabled(window.model.rows[0].mod.id, False)
     idle(qtbot, window)
@@ -605,3 +607,179 @@ def test_an_operation_keeps_the_list_where_it_was_scrolled(qtbot, window, tmp_pa
     assert scrolled > 0
     window.refresh()
     assert bar.value() == scrolled and window.table.currentIndex().row() == 2
+
+
+
+# ---------------------------------------------------------------- QA round 1 (GUI)
+
+
+def test_settings_changed_on_the_command_line_are_honoured_and_kept(qtbot, window, answers, tmp_path, fo4):
+    two_mods(tmp_path)
+    window.refresh()
+    assert main(["config", "--dry-run", "on"]) == 0  # while the window is open
+    before = climods.snapshot(fo4)
+    window.set_enabled(window.model.rows[0].mod.id, False)
+    idle(qtbot, window)
+    assert climods.snapshot(fo4) == before  # a dry run: only shown
+    assert isinstance(answers.dialogs[-1], PlanDialog) and "DRY-RUN" in window.dry_label.text()
+    window._game_chosen()  # saving the current game keeps what the command line set
+    assert load_settings().dry_run is True
+
+
+def test_a_failing_refresh_leaves_the_window_usable(qtbot, window, answers, tmp_path, fo4, monkeypatch):
+    from bethmm import service
+
+    real = service.mod_rows
+    calls = {"n": 0}
+
+    def flaky(manifest, game_id):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise KeyError(3)  # e.g. read while another process changed the list
+        return real(manifest, game_id)
+
+    archive = mod_zip(tmp_path, "Cool Mod-555-1-0-1700000000.zip", {"Cool.esp": esp()})
+    monkeypatch.setattr(service, "mod_rows", flaky)
+    window.install_paths([str(archive)])
+    idle(qtbot, window)
+    assert not window.busy and window.act_install.isEnabled() and window.table.isEnabled()
+    assert "could not read the mod list" in window.messages.toPlainText()
+    window.refresh()
+    assert [r.mod.name for r in window.model.rows] == ["Cool Mod"]
+
+
+def _view_drop(window, src_row: int, dst_row: int, lower: bool) -> None:
+    from PySide6.QtCore import QPointF
+    from PySide6.QtGui import QDragEnterEvent, QDragMoveEvent, QDropEvent
+    from PySide6.QtWidgets import QApplication
+
+    view = window.table
+    data = window.model.mimeData([window.model.index(src_row, 2)])
+    rect = view.visualRect(window.model.index(dst_row, 2))
+    pos = QPointF(rect.center().x(), rect.center().y() + (3 if lower else -3))
+    act, btn, mod = Qt.DropAction.MoveAction, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier
+    for event in (QDragEnterEvent(pos.toPoint(), act, data, btn, mod), QDragMoveEvent(pos.toPoint(), act, data, btn, mod)):
+        QApplication.sendEvent(view.viewport(), event)
+    QApplication.sendEvent(view.viewport(), QDropEvent(pos, act, data, btn, mod))
+
+
+def test_dropping_a_mod_onto_a_row_puts_it_above_or_below_it(qtbot, window, tmp_path, fo4):
+    for n in "ABCD":
+        assert main(["install", str(mod_zip(tmp_path, f"{n}-1-1-0.zip", {f"{n}.esp": esp(), "s.dds": n.encode()})),
+                     "--yes"]) == 0
+    window.show()
+    window.refresh()
+    qtbot.waitExposed(window)
+
+    def names() -> str:
+        return "".join(r.mod.name for r in window.model.rows)
+
+    _view_drop(window, 0, 3, lower=True)  # A onto the lower half of the last row: last, so it wins
+    idle(qtbot, window)
+    assert names() == "BCDA" and (fo4 / "Data" / "s.dds").read_bytes() == b"A"
+    _view_drop(window, 0, 1, lower=True)  # B below C
+    idle(qtbot, window)
+    assert names() == "CBDA"
+    _view_drop(window, 3, 0, lower=False)  # A above C: first
+    idle(qtbot, window)
+    assert names() == "ACBD"
+
+
+def test_dialogs_and_menus_are_not_kept(qtbot, window):
+    import shiboken6
+    from PySide6.QtCore import QEvent, QTimer
+    from PySide6.QtWidgets import QApplication, QDialog
+
+    dialog = QDialog(window)
+    QTimer.singleShot(0, dialog.accept)
+    assert MainWindow.run_dialog(window, dialog)
+    assert shiboken6.isValid(dialog)  # still readable right after
+    QApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete.value)
+    assert not shiboken6.isValid(dialog)
+
+
+def test_deploy_on_a_purged_game_with_nothing_to_link_deploys_it(qtbot, window, tmp_path, fo4):
+    a = mod_zip(tmp_path, "A-1-1-0.zip", {"A.esp": esp()})
+    assert main(["install", str(a), "--yes"]) == 0
+    assert main(["disable", "A"]) == 0
+    assert main(["purge", "--yes"]) == 0
+    window.refresh()
+    window.deploy()
+    idle(qtbot, window)
+    with Manifest() as m:
+        assert m.game_state("fallout4").deployed
+    window.set_enabled(window.model.rows[0].mod.id, True)
+    idle(qtbot, window)
+    assert (fo4 / "Data" / "A.esp").is_symlink()
+
+
+def test_a_closing_window_asks_and_tells_nothing(qtbot, home, fo4):
+    w = MainWindow(load_settings())
+    qtbot.addWidget(w)
+    w._closing = True
+    assert w.ask("Question", "Really?") is False  # (would block on a message box otherwise)
+    w.tell("Note", "Something")
+    w.deploy()
+    assert not w.tasks.busy
+
+
+def test_hiding_the_choice_box_goes_back_to_the_plan_in_effect(qtbot, home, fo4, tmp_path):
+    from bethmm import staging
+    dialog = _dialog(qtbot, tmp_path, "Pick Mod.zip", {"Main.esp": esp(), "Optional/Opt.esp": esp()})
+    try:
+        assert dialog.install_button.isEnabled()
+        dialog.choose_toggle.setChecked(True)
+        dialog.folder_tree.topLevelItem(0).setCheckState(0, Qt.CheckState.Unchecked)
+        assert not dialog.install_button.isEnabled()
+        dialog.choose_toggle.setChecked(False)
+        assert dialog.install_button.isEnabled() and dialog.choice is not None
+        assert dialog.folder_tree.topLevelItem(0).checkState(0) == Qt.CheckState.Checked
+    finally:
+        staging.discard(dialog.prepared)
+
+
+def test_small_ui_states(qtbot, window, answers, tmp_path, fo4):
+    two_mods(tmp_path)
+    window.refresh()
+    window.table.selectAll()
+    assert not window.act_up.isEnabled() and not window.act_top.isEnabled()  # one mod at a time
+    window.table.selectRow(0)
+    assert window.act_up.isEnabled()
+    assert window.details.tabText(1) == "Conflicts (1)"
+    window.table.clearSelection()
+    assert window.details.tabText(1) == "Conflicts"
+
+
+def test_dropping_archives_with_no_game_says_why(qtbot, tmp_path, monkeypatch, answers):
+    monkeypatch.setenv("HOME", str(tmp_path / "empty home"))
+    (tmp_path / "empty home").mkdir()
+    w = MainWindow(load_settings())
+    qtbot.addWidget(w)
+    w.tell = answers.tell
+    w.install_paths([str(tmp_path / "Cool-1-1-0.zip")])
+    assert "No game to install into" in w.messages.toPlainText() and answers.told
+
+
+def test_hiding_the_shown_game_makes_the_other_one_current(qtbot, window, answers, home, fo4):
+    make_tree(home / "Games" / "skyrim" / "drive_c" / "GOG Games" / "Skyrim", ["SkyrimSE.exe", "Data/"])
+    window.reload_games(rescan=True)
+    assert window.game.game_id == "fallout4"
+
+    def hide(dialog) -> None:
+        dialog.ignore.setChecked(True)
+
+    answers.before_accept = hide
+    window.open_game_settings()
+    assert window.game.game_id == "skyrimse"
+    assert load_settings().current_game == "skyrimse"
+
+
+def test_a_mod_with_a_file_and_a_folder_of_one_name(qtbot, window, tmp_path, fo4):
+    from bethmm import deploy, service
+    a = mod_zip(tmp_path, "Clash-1-1-0.zip", {"Clash.esp": esp(), "textures/Foo": b"f", "textures/foo/bar.dds": b"b"})
+    assert main(["install", str(a), "--yes"]) == 0
+    with Manifest() as m:
+        (row,) = service.mod_rows(m, "fallout4")
+        assert row.overwrites == [] and row.overwritten_by == []  # not in conflict with itself
+        result = deploy.deploy(m, service.target_for(window.game, window.settings), dry_run=True)
+    assert any("also has a file where this needs a folder" in why for _p, why in result.plan.blocked)

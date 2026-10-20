@@ -117,14 +117,16 @@ class ModRow:
 
 
 def mod_rows(manifest: Manifest, game_id: str) -> list[ModRow]:
-    mods = manifest.mods(game_id)
-    names = {m.id: m.name for m in mods}
-    summary = deploy.conflict_summary(manifest, game_id)
-    rows = []
-    for i, m in enumerate(mods, start=1):
-        c = summary.get(m.id, deploy.ModConflicts())
-        rows.append(ModRow(i, m, len(manifest.mod_files(m.id)),
-                           [names[o] for o in c.overwrites], [names[o] for o in c.overwritten_by]))
+    with manifest.snapshot():  # a mod installed meanwhile elsewhere is in both reads or neither
+        mods = manifest.mods(game_id)
+        names = {m.id: m.name for m in mods}
+        summary = deploy.conflict_summary(manifest, game_id)
+        rows = []
+        for i, m in enumerate(mods, start=1):
+            c = summary.get(m.id, deploy.ModConflicts())
+            rows.append(ModRow(i, m, len(manifest.mod_files(m.id)),
+                               [names.get(o, "?") for o in c.overwrites],
+                               [names.get(o, "?") for o in c.overwritten_by]))
     return rows
 
 

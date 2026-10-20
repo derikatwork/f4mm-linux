@@ -181,11 +181,14 @@ def _candidates(manifest: Manifest, game_id: str) -> dict[str, list[tuple[ModRec
     return candidates
 
 
-def _settle_type_clashes(desired: dict[str, tuple[ModRecord, ModFile]]) -> dict[str, ModRecord]:
+def _settle_type_clashes(
+    desired: dict[str, tuple[ModRecord, ModFile]],
+) -> dict[str, tuple[ModRecord, tuple[ModRecord, ModFile]]]:
     """A file of one mod where another mod has a folder (``textures/x`` and
     ``textures/x/a.dds``): as in any conflict the mod lower in the list wins,
-    and the other side is not deployed. Removes the losing destinations from
-    *desired*; returns them -> the mod that won."""
+    and the other side is not deployed. (Within one mod, the first in path
+    order wins.) Removes the losing destinations from *desired*; returns
+    them -> (the mod that won, what lost)."""
     files: dict[str, ModRecord] = {}  # accepted destinations -> mod
     folders: dict[str, ModRecord] = {}  # every folder an accepted destination needs -> mod
     lost: dict[str, ModRecord] = {}
@@ -199,9 +202,7 @@ def _settle_type_clashes(desired: dict[str, tuple[ModRecord, ModFile]]) -> dict[
         files[key] = mod
         for a in above:
             folders.setdefault(a, mod)
-    for key in lost:
-        del desired[key]
-    return lost
+    return {key: (winner, desired.pop(key)) for key, winner in lost.items()}
 
 
 def desired_files(manifest: Manifest, game_id: str) -> tuple[dict[str, tuple[ModRecord, ModFile]], dict[str, list[int]]]:
@@ -215,8 +216,9 @@ def desired_files(manifest: Manifest, game_id: str) -> tuple[dict[str, tuple[Mod
     for key, candidates in _candidates(manifest, game_id).items():
         desired[key] = candidates[-1]
         providers[key] = [mod.id for mod, _ in candidates]
-    for key, winner in _settle_type_clashes(desired).items():
-        providers[key].append(winner.id)
+    for key, (winner, (loser, _f)) in _settle_type_clashes(desired).items():
+        if winner.id != loser.id:
+            providers[key].append(winner.id)
     return desired, providers
 
 
@@ -601,7 +603,10 @@ def plan_sync(manifest: Manifest, target: GameTarget, *, purge: bool = False) ->
                 desired[key] = (mod, f)
                 break
             plan.blocked.append((f.dest, f"staged file {staged} is missing; reinstall '{mod.name}'"))
-    _settle_type_clashes(desired)
+    for _key, (winner, (mod, f)) in _settle_type_clashes(desired).items():
+        if winner.id == mod.id:
+            plan.blocked.append((f.dest, f"'{mod.name}' also has a file where this needs a folder, or the other "
+                                         "way round; only one of them fits in the game folder"))
     deployed = manifest.deployed(game_id)
     backups = manifest.backups(game_id)
     created = manifest.created_dirs(game_id)

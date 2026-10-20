@@ -98,10 +98,11 @@ class ModListModel(QAbstractTableModel):
         return None
 
     def flags(self, index: Index) -> Qt.ItemFlag:
-        base = Qt.ItemFlag.ItemIsDropEnabled
         if not index.isValid():
-            return base
-        flags = base | Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsDragEnabled
+            return Qt.ItemFlag.ItemIsDropEnabled
+        # Rows take no drops themselves, so the view drops above or below the
+        # row under the cursor (dragging a mod onto the last row makes it last).
+        flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsDragEnabled
         if index.column() == COL_ENABLED:
             flags |= Qt.ItemFlag.ItemIsUserCheckable
         return flags
