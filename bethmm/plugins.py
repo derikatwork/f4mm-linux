@@ -377,23 +377,38 @@ def sync(manifest: Manifest, target: GameTarget, *, dry_run: bool = False,
 def _finish(manifest: Manifest, target: GameTarget, pf: PluginsFile, original: bytes | None,
             records: dict[str, PluginRecord], new: dict[str, PluginRecord], change: PluginsChange,
             ours: dict[str, DeployedFile], data_dir: Path) -> None:
-    """Write plugins.txt (after backing it up), then the records; then, for a
-    game whose load order is by file date, date the app's plugins."""
+    """Write plugins.txt (after backing it up) and the records; then, for a
+    game whose load order is by file date, date the app's plugins.
+
+    Lines taken out are recorded before the file is written, lines added
+    after it: if the app is stopped in between, the next sync finds a line
+    still there for a plugin the app no longer has (and takes it out), or a
+    line it added without a record (and adopts it) -- never a line it would
+    take for one the user removed."""
+    if change.dry_run:
+        if GAMES[target.game_id].timestamp_load_order:
+            change.dated = _date(manifest, pf, ours, data_dir, True)
+        return
+    changed = {k: rec for k, rec in new.items() if records.get(k) != rec}
+    first = {k: rec for k, rec in changed.items() if not rec.listed}
+    if first:
+        with manifest.transaction():
+            for rec in first.values():
+                manifest.record_plugin(rec)
     content = render(pf)
     if content != original and (pf.entries or pf.exists):
-        if not change.dry_run:
-            change.backup = _backup(target.plugins_txt, target.game_id)
-            _write(target.plugins_txt, content)
-            change.written = True
-            manifest.journal(target.game_id, "plugins", str(target.plugins_txt), None,
-                             _summary(change), status="done")
-    if not change.dry_run and new != records:
+        change.backup = _backup(target.plugins_txt, target.game_id)
+        _write(target.plugins_txt, content)
+        change.written = True
+        manifest.journal(target.game_id, "plugins", str(target.plugins_txt), None, _summary(change), status="done")
+    rest = {k: rec for k, rec in changed.items() if k not in first}
+    gone = records.keys() - new.keys()
+    if rest or gone:
         with manifest.transaction():
-            for k in records.keys() - new.keys():
+            for k in gone:
                 manifest.forget_plugin(target.game_id, k)
-            for k, rec in new.items():
-                if records.get(k) != rec:
-                    manifest.record_plugin(rec)
+            for rec in rest.values():
+                manifest.record_plugin(rec)
     if GAMES[target.game_id].timestamp_load_order:
         change.dated = _date(manifest, pf, ours, data_dir, change.dry_run)
 

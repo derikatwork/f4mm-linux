@@ -5,6 +5,7 @@ moved, dated for games whose load order goes by file dates)."""
 from __future__ import annotations
 
 import os
+from contextlib import nullcontext
 from pathlib import Path
 
 import pytest
@@ -215,3 +216,53 @@ def test_a_mod_without_plugins_doesnt_create_plugins_txt(home, fnv, tmp_path):
     archive = mod_zip(tmp_path, "Tex-1-1-0.zip", {"textures/x.dds": b"x"})
     assert main(["install", str(archive), "--yes", "--game", "falloutnv"]) == 0
     assert not plugins_txt(home, "FalloutNV", "fallout-new-vegas").exists()
+
+
+class Stop(Exception):
+    pass
+
+
+@pytest.mark.parametrize("stop_at", ["before-records", "write", "after-write"])
+@pytest.mark.parametrize("game", ["fo4", "fnv"])
+def test_stopped_while_updating_plugins_txt_the_next_deploy_gets_it_right(home, tmp_path, monkeypatch, request,
+                                                                         stop_at, game, capsys):
+    """The app is stopped while it updates plugins.txt for a disabled mod
+    (before recording that the line goes, or before writing the file) or for
+    an enabled one (after writing the file): afterwards the line is there,
+    switched on, once the mod is enabled."""
+    request.getfixturevalue(game)
+    args = ["--game", "fallout4"] if game == "fo4" else ["--game", "falloutnv"]
+    esp_bytes = esp() if game == "fo4" else nv_esp()
+    assert main(["install", str(mod_zip(tmp_path, "A-1-1-0.zip", {"A.esp": esp_bytes})), "--yes", *args]) == 0
+    txt = plugins_txt(home) if game == "fo4" else plugins_txt(home, "FalloutNV", "fallout-new-vegas")
+    real_record = Manifest.record_plugin
+
+    def stop_write(*a, **k):
+        raise Stop
+
+    def stop_records(listed: bool):
+        def record(self, rec):
+            if rec.listed == listed:
+                raise Stop
+            return real_record(self, rec)
+        return record
+
+    with monkeypatch.context() as mp:
+        if stop_at == "before-records":
+            mp.setattr(Manifest, "record_plugin", stop_records(False))
+        elif stop_at == "write":
+            mp.setattr(plugins, "_write", stop_write)
+        with pytest.raises(Stop) if stop_at != "after-write" else nullcontext():
+            main(["disable", "A", *args])
+    with monkeypatch.context() as mp:
+        if stop_at == "after-write":
+            mp.setattr(Manifest, "record_plugin", stop_records(True))
+            with pytest.raises(Stop):
+                main(["enable", "A", *args])
+    capsys.readouterr()
+    assert main(["enable", "A", *args]) == 0
+    assert main(["deploy", *args]) == 0
+    listed = lines(txt)
+    assert ("*A.esp" if game == "fo4" else "A.esp") in listed
+    assert main(["deploy", *args]) == 0
+    assert lines(txt) == listed
