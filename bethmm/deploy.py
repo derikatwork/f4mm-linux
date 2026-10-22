@@ -629,6 +629,8 @@ def plan_sync(manifest: Manifest, target: GameTarget, *, purge: bool = False) ->
         plan.warnings.append(f"a previous run was interrupted ({len(unfinished)} unfinished operations); "
                              "this run cleans up after it ('bethmm verify' shows anything left)")
     interrupted_links = {fold_path(e.path): e for e in unfinished if e.action == "link" and e.path and e.source}
+    #: Exact paths of links an interrupted run was removing.
+    unlinking = {e.path for e in unfinished if e.action == "unlink" and e.path}
     resolver = CaseResolver(root)
     #: Links of the app that the manifest doesn't record (made by an interrupted
     #: run, or moved by a case rename of their folder): key -> (path, staged source).
@@ -669,9 +671,13 @@ def plan_sync(manifest: Manifest, target: GameTarget, *, purge: bool = False) ->
             freed.add(key)
         elif status == "missing":
             moved = _case_variant(resolver, record.path)
-            if moved is None:
+            if moved is None or record.path in unlinking:
+                # Gone. When an interrupted run was removing it, a case sibling
+                # there is someone else's file, not what replaced the link.
                 removals.append(Op("forget", record.path, record.mod_id, record.source, "the link was already gone"))
                 freed.add(key)
+                if moved is not None:
+                    resolver.forget(record.path)
             else:
                 removals.append(Op("forget", moved, record.mod_id, record.source, FOREIGN_NOTE))
                 foreign[key] = moved
@@ -735,6 +741,21 @@ def plan_sync(manifest: Manifest, target: GameTarget, *, purge: bool = False) ->
     for op in restores:
         if op.kind == "restore" and os.path.lexists(op.source or ""):
             resolver.resolve(op.path, plan=True)
+    planned_dirs: set[str] = set()
+    adopted: list[Op] = []
+    # Folders made just before the app died are recorded first, so they are
+    # removed again (only ever when empty) once nothing needs them -- also
+    # right below, when a winning mod's file goes where one of them is.
+    for entry in unfinished:
+        if entry.action != "mkdir" or not entry.path:
+            continue
+        dkey = fold_path(entry.path)
+        abs_dir = root / entry.path
+        if dkey not in created and dkey not in planned_dirs and abs_dir.is_dir() and not abs_dir.is_symlink():
+            planned_dirs.add(dkey)
+            created = {**created, dkey: entry.path}
+            adopted.append(Op("mkdir", entry.path, None, None, ADOPT_DIR_NOTE))
+
     # A folder the app made where a winning mod's file goes now (the mod that
     # needed it lost the conflict) is removed first -- only when nothing but
     # links this plan removes is in it.
@@ -770,18 +791,6 @@ def plan_sync(manifest: Manifest, target: GameTarget, *, purge: bool = False) ->
     early = {fold_path(op.path) for op in early_rmdirs}
 
     additions: list[Op] = []
-    planned_dirs: set[str] = set()
-    # Folders made just before the app died are recorded now, so they are
-    # removed again (only ever when empty) once nothing needs them.
-    for entry in unfinished:
-        if entry.action != "mkdir" or not entry.path:
-            continue
-        dkey = fold_path(entry.path)
-        abs_dir = root / entry.path
-        if dkey not in created and dkey not in planned_dirs and abs_dir.is_dir() and not abs_dir.is_symlink():
-            planned_dirs.add(dkey)
-            created = {**created, dkey: entry.path}
-            additions.append(Op("mkdir", entry.path, None, None, ADOPT_DIR_NOTE))
     for key, (mod, f) in sorted(desired.items(), key=lambda item: item[0]):
         if key in satisfied:
             continue
@@ -789,9 +798,13 @@ def plan_sync(manifest: Manifest, target: GameTarget, *, purge: bool = False) ->
             plan.blocked.append((foreign[key], "replaced by a file the app didn't create (left alone)"))
             continue
         staged = staged_file(mod, f.source)
-        # A path the app linked before keeps its spelling; resolving it again
-        # finds folders that have to be recreated.
-        resolved = resolver.resolve(deployed[key].path if key in deployed else f.dest, plan=True)
+        # A path the app linked before keeps its spelling (also one an
+        # interrupted run linked without recording it: not a case sibling of
+        # it, which is someone else's file); resolving it again finds folders
+        # that have to be recreated.
+        here = deployed[key].path if key in deployed else \
+            ours_unrecorded[key][0] if key in ours_unrecorded else f.dest
+        resolved = resolver.resolve(here, plan=True)
         if resolved.type_conflict:
             plan.blocked.append((f.dest, "a folder (or file) of the other kind already exists there"))
             continue
@@ -888,7 +901,7 @@ def plan_sync(manifest: Manifest, target: GameTarget, *, purge: bool = False) ->
         if dkey not in early and (dkey not in needed or replaced(path))
     ]
 
-    plan.ops = removals + restores + early_rmdirs + additions + rmdirs
+    plan.ops = removals + restores + adopted + early_rmdirs + additions + rmdirs
     return plan
 
 

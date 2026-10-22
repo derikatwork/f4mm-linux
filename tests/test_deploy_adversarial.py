@@ -1517,3 +1517,57 @@ def test_a_leftover_link_of_a_killed_run_makes_room_for_a_winning_folder(tmp_pat
     assert_deployed(world)
     world.purge()
     assert_vanilla(world)
+
+
+@pytest.mark.parametrize("mode", ["symlink", "hardlink"])
+def test_a_folder_made_just_before_a_crash_gives_way_to_a_winning_file(world, monkeypatch, mode):
+    """Stopped right after making a folder (not recorded yet) where another
+    mod's file goes once that mod wins again: one deploy puts the file there."""
+    world.mode = mode
+    as_file = add_mod(world.manifest, "FileMod", {"Data/textures/clash": "a file"})
+    as_dir = add_mod(world.manifest, "DirMod", {"Data/Textures/Clash/in.dds": "in", "Data/Textures/Clash/d/m.dds": "m"})
+    world.manifest.set_order(GAME, [as_dir.id, as_file.id])
+    world.deploy()
+    world.manifest.set_order(GAME, [as_file.id, as_dir.id])  # the folder wins
+    with monkeypatch.context() as mp:
+        fail_once(mp, Manifest, "record_dir")
+        with pytest.raises(Boom):
+            world.deploy()
+    assert world.path("Data/Textures/Clash").is_dir()
+    world.manifest.set_order(GAME, [as_dir.id, as_file.id])  # the file wins again
+    result = world.deploy()
+    assert not result.failed and not result.plan.blocked, (result.failed, result.plan.blocked)
+    record = world.manifest.deployed(GAME)["DATA/TEXTURES/CLASH"]
+    assert record.mod_id == as_file.id and world.path(record.path).read_text() == "a file"
+    assert [op.kind for op in world.plan().ops] == []
+    world.purge()
+    assert_vanilla(world)
+
+
+@pytest.mark.parametrize("stopped_at", ["record_link", "forget_link"])
+@pytest.mark.parametrize("mode", ["symlink", "hardlink"])
+def test_a_relink_stopped_next_to_a_users_case_sibling(world, monkeypatch, mode, stopped_at):
+    """A's link Data/Sub/Bar.dds is switched to B's next to the user's own
+    Data/Sub/BAR.dds, and the app stops right after making B's link (or right
+    after removing A's): the next deploy links B's file at Bar.dds again and
+    never takes the user's file for the app's."""
+    world.mode = mode
+    add_mod(world.manifest, "A", {"Data/Sub/Bar.dds": "A bar"})
+    b = add_mod(world.manifest, "B", {"Data/sub/bar.dds": "B bar"}, enabled=False)
+    world.deploy()
+    mine = world.root / "Data" / "Sub" / "BAR.dds"
+    mine.write_text("the user's")
+    world.manifest.set_enabled(b.id, True)
+    with monkeypatch.context() as mp:
+        fail_once(mp, Manifest, stopped_at)
+        with pytest.raises(Boom):
+            world.deploy()
+    result = world.deploy()
+    assert not result.failed and not result.plan.blocked, (result.failed, result.plan.blocked)
+    assert mine.read_text() == "the user's" and not world.manifest.backups(GAME)
+    record = world.manifest.deployed(GAME)["DATA/SUB/BAR.DDS"]
+    assert record.path == "Data/Sub/Bar.dds" and record.mod_id == b.id
+    assert world.path("Data/Sub/Bar.dds").read_text() == "B bar"
+    world.purge()
+    assert not os.path.lexists(world.path("Data/Sub/Bar.dds")) and mine.read_text() == "the user's"
+    assert deploy.verify(world.manifest, world.target()).ok
