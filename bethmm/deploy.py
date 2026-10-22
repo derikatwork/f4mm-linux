@@ -1572,6 +1572,11 @@ class VerifyReport:
     #: that is not the folder checked (e.g. a copy of the game made with the
     #: links in it): relative paths, reported but never touched.
     links_elsewhere: list[str] = field(default_factory=list)
+    #: Paths a deploy would link, unlink or switch to another mod (or version):
+    #: the game folder doesn't match the mod list, e.g. because the app was
+    #: stopped between saving a change to the list and deploying it. (Not a
+    #: fault of the records: :attr:`ok` leaves it out; a deploy fixes it.)
+    out_of_date: list[str] = field(default_factory=list)
     #: Informational lines.
     notes: list[str] = field(default_factory=list)
 
@@ -1675,10 +1680,40 @@ def verify(manifest: Manifest, target: GameTarget) -> VerifyReport:
     report.left_alone = sorted(path for path in manifest.left_alone(game_id).values()
                                if os.path.lexists(root / path))
     report.interrupted = manifest.unfinished_journal(game_id)
+    # Whether a deploy would change anything -- not asked while an interrupted
+    # run or a moved folder is reported: the repair redeploys after those anyway.
+    if (state is None or state.deployed) and not report.interrupted and _same_root(root, new) \
+            and not report.links_elsewhere:
+        reported = {fold_path(r.path) for r in report.missing + report.foreign}
+        reported |= {fold_path(path) for pair in report.case_moved for path in pair}
+        report.out_of_date = _out_of_date(manifest, target, deployed, reported)
     report.orphan_links.sort()
     report.orphan_backups.sort()
     report.temp_leftovers.sort()
     return report
+
+
+def _out_of_date(manifest: Manifest, target: GameTarget, deployed: dict[str, DeployedFile],
+                 reported: set[str]) -> list[str]:
+    """Paths where a deploy would link, unlink or switch to another mod's (or
+    version's) file, leaving out *reported* (folded) ones. A link only of the
+    other kind (the link mode was changed) doesn't count: verify notes those."""
+    try:
+        plan = plan_sync(manifest, target)
+    except DeployError:
+        return []
+    linked = {fold_path(op.path) for op in plan.ops if op.kind == "link"}
+    out: set[str] = set()
+    for op in plan.ops:
+        key = fold_path(op.path)
+        record = deployed.get(key)
+        if key in reported:
+            continue
+        if op.kind == "link" and (record is None or record.source != op.source):
+            out.add(op.path)
+        elif op.kind == "unlink" and record is not None and key not in linked:
+            out.add(op.path)
+    return sorted(out)
 
 
 def _unfinished_links(manifest: Manifest, game_id: str) -> dict[str, JournalEntry]:

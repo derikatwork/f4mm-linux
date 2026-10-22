@@ -156,6 +156,10 @@ class VerifyDialog(QDialog):
         for folder in found.retired:
             add(problems, "mod files nothing uses any more (a previous version, an uninstalled mod or an "
                 "interrupted install)", str(folder))
+        if report.out_of_date:
+            add(problems, f"not up to date with the mod list (a change was saved but not deployed): a deploy "
+                f"changes {len(report.out_of_date)} file(s)", ", ".join(report.out_of_date[:3])
+                + (", ..." if len(report.out_of_date) > 3 else ""))
         if report.moved_from is not None:
             add(notes, "the game was moved; checked the new folder", f"{report.moved_from} -> {report.root}")
         for note in report.notes:

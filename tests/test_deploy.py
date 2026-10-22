@@ -810,3 +810,32 @@ def test_verify_notes_links_of_the_other_kind(world):
     world.deploy()
     report = deploy.verify(world.manifest, world.target("hardlink"))
     assert any("not hardlinks" in n for n in report.notes)
+
+
+def test_verify_finds_a_game_folder_out_of_date_with_the_mod_list(world):
+    """The app stopped between saving a change to the list and deploying it."""
+    a = add_mod(world.manifest, "A", {"Data/A.esp": "a", "Data/shared.dds": "a"})
+    b = add_mod(world.manifest, "B", {"Data/B.esp": "b", "Data/shared.dds": "b"})
+    world.deploy()
+    assert deploy.verify(world.manifest, world.target()).out_of_date == []
+    world.manifest.set_order(GAME, [b.id, a.id])  # A wins shared.dds now
+    assert deploy.verify(world.manifest, world.target()).out_of_date == ["Data/shared.dds"]
+    world.manifest.set_enabled(b.id, False)
+    add_mod(world.manifest, "C", {"Data/C.esp": "c"})
+    report = deploy.verify(world.manifest, world.target())
+    assert report.out_of_date == ["Data/B.esp", "Data/C.esp", "Data/shared.dds"] and report.ok  # the records are fine
+    world.deploy()
+    assert deploy.verify(world.manifest, world.target()).out_of_date == []
+
+
+def test_verify_doesnt_call_the_other_link_kind_or_a_kept_folder_out_of_date(world):
+    add_mod(world.manifest, "A", {"Data/A.esp": "a", "Data/materials/armor/a.bgsm": "a"})
+    world.deploy()
+    assert deploy.verify(world.manifest, world.target("hardlink")).out_of_date == []
+    world.manifest.set_enabled(world.manifest.mods(GAME)[0].id, False)
+    (world.root / "Data" / "materials" / "armor" / "mine.bgsm").write_text("the user's")
+    world.deploy()  # keeps the folder that holds the user's file
+    assert deploy.verify(world.manifest, world.target()).out_of_date == []
+    world.manifest.set_enabled(world.manifest.mods(GAME)[0].id, True)
+    world.purge()
+    assert deploy.verify(world.manifest, world.target()).out_of_date == []  # a purged game stays purged

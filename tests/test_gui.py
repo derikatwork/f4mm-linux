@@ -1029,3 +1029,19 @@ def test_no_relink_offer_on_a_purged_game(qtbot, window, answers, tmp_path, fo4,
     assert not any("Relink" in q for q in answers.asked)
     with Manifest() as manifest:
         assert not manifest.game_state("fallout4").deployed
+
+
+def test_verify_offers_to_bring_an_out_of_date_game_folder_in_line(qtbot, window, answers, tmp_path, fo4):
+    from PySide6.QtWidgets import QTreeWidget
+    two_mods(tmp_path)
+    with Manifest(lock=True) as manifest:  # saved, but the app stopped before deploying it
+        armor = manifest.find_mod("fallout4", "Armor Pack")
+        manifest.set_enabled(armor.id, False)
+    window.refresh()
+    window.verify()
+    idle(qtbot, window)
+    dialog = next(d for d in answers.dialogs if isinstance(d, VerifyDialog))
+    rows = [dialog.findChild(QTreeWidget).topLevelItem(0).child(i).text(0)
+            for i in range(dialog.findChild(QTreeWidget).topLevelItem(0).childCount())]
+    assert any("not up to date with the mod list" in r for r in rows) and dialog.repair_button is not None
+    assert not os.path.lexists(fo4 / "Data" / "ArmorPack.esp")  # repaired: the disabled mod's files are gone

@@ -538,9 +538,10 @@ class Check:
 
     @property
     def problems(self) -> bool:
-        """Something repair can work on. Links found in another copy of the
-        game are only reported: repair never touches them."""
-        return not replace(self.report, links_elsewhere=[]).ok or bool(self.retired)
+        """Something repair can work on (it redeploys after its fixes, which
+        also brings a game folder that is out of date in line). Links found in
+        another copy of the game are only reported: repair never touches them."""
+        return not replace(self.report, links_elsewhere=[]).ok or bool(self.retired or self.report.out_of_date)
 
 
 def check(manifest: Manifest, target: deploy.GameTarget) -> Check:

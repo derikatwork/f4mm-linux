@@ -1106,3 +1106,29 @@ def test_override_offers_no_relink_on_a_purged_game(home, fo4, tmp_path, capsys,
     capsys.readouterr()
     assert main(["override", "fallout4", "--link-mode", "hardlink"]) == 0
     assert "relinks them" not in capsys.readouterr().out
+
+
+def test_verify_repair_finishes_an_update_stopped_before_its_deploy(home, fo4, tmp_path, capsys, monkeypatch):
+    from bethmm import deploy
+
+    v1 = mod_zip(tmp_path, "Cool-1234-1-0-1700000000.zip", {"Cool.esp": esp(), "meshes/old.nif": b"v1"})
+    assert main(["install", str(v1), "--yes"]) == 0
+    v2 = mod_zip(tmp_path, "Cool-1234-2-0-1700000001.zip", {"Cool.esp": esp(), "meshes/new.nif": b"v2"})
+
+    def stopped(*_args, **_kwargs):
+        raise KeyboardInterrupt  # the app stopped right after the update was saved
+
+    with monkeypatch.context() as mp:
+        mp.setattr(deploy, "refresh", stopped)
+        assert main(["install", str(v2), "--replace", "Cool", "--yes"]) != 0
+    assert (fo4 / "Data" / "meshes" / "old.nif").read_bytes() == b"v1"  # still version 1 in the game
+    capsys.readouterr()
+    assert main(["verify"]) == 1
+    assert "not up to date with the mod list" in capsys.readouterr().out
+    assert main(["verify", "--repair"]) == 0
+    out = capsys.readouterr().out
+    assert (fo4 / "Data" / "meshes" / "new.nif").read_bytes() == b"v2"
+    assert not os.path.lexists(fo4 / "Data" / "meshes" / "old.nif")
+    assert "deleted" in out  # version 1's folder: nothing uses it any more
+    assert sorted(p.name for p in paths.mods_dir("fallout4").iterdir()) == ["Cool (2)"]
+    assert main(["verify"]) == 0

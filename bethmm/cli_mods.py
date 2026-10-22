@@ -655,6 +655,10 @@ def cmd_verify(args) -> int:
         for folder in retired:
             print(f"  mod files nothing uses any more (a previous version, an uninstalled mod or an "
                   f"interrupted install; --repair deletes them): {folder}")
+        if report.out_of_date:
+            some = ", ".join(report.out_of_date[:3]) + (", ..." if len(report.out_of_date) > 3 else "")
+            print(f"  not up to date with the mod list (a change was saved but not deployed, e.g. the app was "
+                  f"stopped): a deploy changes {len(report.out_of_date)} file(s): {some}")
         for path in report.left_alone:
             print(f"  note: {path} is a file the app didn't create, where a mod's link was; it is left alone "
                   "(delete it to let the mod link there again)")

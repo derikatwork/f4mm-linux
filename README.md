@@ -181,7 +181,7 @@ and reported.
 bethmm purge              # remove every link, restore every original, remove the folders it made
 bethmm purge --all        # every game
 bethmm deploy             # put the enabled mods back (also re-creates links that went missing)
-bethmm verify             # compare the game folder with what the app recorded
+bethmm verify             # compare the game folder with what the app recorded (and with the mod list)
 bethmm verify --repair    # fix what is safe to fix, then redeploy (or purge again if purged)
 bethmm status             # per game: mods, links, backups
 bethmm status --deployed-only   # what the app still has in game folders (exit status 3 if anything)
@@ -192,6 +192,9 @@ bethmm history            # the latest file operations
 `bethmm deploy` again. Every operation is recorded in
 `~/.local/share/beth-mod-manager/manifest.db` *before* it happens, so even if the app
 is killed halfway, the next `deploy`/`purge` or `verify --repair` cleans up.
+`verify` also says when the game folder isn't up to date with the mod list (the
+app was stopped after saving a change but before deploying it); `verify --repair`
+deploys it.
 
 `verify --repair` removes stray links into the app's mods folder and half-made
 links of an interrupted run, puts back unrecorded originals from the backups
