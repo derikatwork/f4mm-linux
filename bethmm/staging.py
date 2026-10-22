@@ -20,7 +20,8 @@ or, when *roots*/*target* are given, ``placement.plan_for_roots``.
 move across filesystems) and records the mod in the manifest with one
 ``ModFile`` per plan mapping (``source`` relative to the staging folder,
 ``dest`` relative to the game root). Files the plan skipped (readmes ...) stay
-in the staging folder but are never deployed.
+in the staging folder but are never deployed -- except for a FOMOD installer's
+plan: only the files its chosen options install are kept.
 
 With *replace* (an existing ``ModRecord`` of the same game) the existing
 record is updated in place -- same priority, same enabled state, new folder,
@@ -528,7 +529,8 @@ def commit(
     UNKNOWN (the user must choose a root/target first), when the plan is a
     FOMOD without mappings, when *replace* belongs to another game, or when
     ``prepared.files_dir`` is not an install folder made by ``prepare``. A
-    failure or interruption before the manifest is saved moves the files back.
+    failure or interruption before the manifest is saved moves the files back
+    (for a FOMOD plan, only the chosen ones: the rest is deleted first).
     The manifest's ``plan`` field stores ``{"root", "target", "rule",
     "wrapper_dirs", "skipped": <count>}`` from the PlacementPlan.
 
@@ -591,6 +593,7 @@ def commit(
             "rule": plan.rule.value,
             "wrapper_dirs": list(plan.wrapper_dirs),
             "skipped": len(plan.skipped),
+            **({"fomod": {"choices": plan.fomod_choices}} if plan.fomod_choices is not None else {}),
         },
     )
 
@@ -599,6 +602,8 @@ def commit(
         # Marked before the switch, so even if the app dies during the redeploy
         # that follows, 'verify --repair' deletes it once no link uses it.
         retire(old_folder)
+    if plan.fomod_choices is not None:
+        _keep_only(prepared.files_dir, {m.source for m in plan.mappings})
     shipped_marker = os.path.lexists(prepared.files_dir / RETIRED_MARKER)
     _mark_installing(prepared.files_dir)
     _move(prepared.files_dir, staging)
@@ -627,6 +632,27 @@ def commit(
     log.info("%s mod %r (#%d) for %s in %s with %d files", "UPDATED" if result.replaced else "INSTALLED",
              mod.name, mod.id, game_id, staging, len(files))
     return result
+
+
+def _keep_only(folder: Path, keep: set[str]) -> None:
+    """Delete the extracted files that aren't in *keep* (what a FOMOD
+    installer's unchosen options would have installed): only the chosen files
+    are kept with the mod. Only ever inside the app's temporary folder."""
+    _check_location(folder, paths.tmp_dir(), 2, "the app's temporary folder")
+    removed = 0
+    for dirpath, dirnames, filenames in os.walk(folder, topdown=False):
+        for name in filenames:
+            full = os.path.join(dirpath, name)
+            if os.path.relpath(full, folder).replace(os.sep, "/") not in keep:
+                os.unlink(full)
+                removed += 1
+        for name in dirnames:
+            full = os.path.join(dirpath, name)
+            try:
+                os.unlink(full) if os.path.islink(full) else os.rmdir(full)
+            except OSError:
+                pass  # still holds chosen files
+    log.info("DELETE %d file(s) in %s that the installer's choices don't install", removed, folder)
 
 
 def checked_files(prepared: Prepared) -> list[ModFile]:

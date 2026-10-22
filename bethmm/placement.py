@@ -73,7 +73,7 @@ from __future__ import annotations
 import os
 import stat
 from collections import deque
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 from typing import Callable, Iterable, Iterator, Sequence
@@ -224,6 +224,9 @@ class PlacementPlan:
     unplaced: list[str] = field(default_factory=list)
     #: Source path of fomod/ModuleConfig.xml when the mod is a FOMOD installer.
     fomod_config: str | None = None
+    #: The choices made in the installer (``fomod.Wizard.choices``) once it
+    #: has run and the mappings are its files; None before.
+    fomod_choices: list[dict] | None = None
     candidate_roots: list[RootCandidate] = field(default_factory=list)
     game: GameGuess = field(default_factory=lambda: GameGuess(None, Confidence.NONE))
     nexus: NexusInfo | None = None
@@ -247,6 +250,7 @@ class PlacementPlan:
             "unplaced": list(self.unplaced),
             "fomod_config": self.fomod_config,
             "is_fomod": self.is_fomod,
+            "fomod_choices": self.fomod_choices,
             "candidate_roots": [
                 {"path": c.path, "target": c.target.value, "rule": c.rule.value}
                 for c in self.candidate_roots
@@ -758,6 +762,20 @@ def _common_parent(paths: Sequence[str]) -> str:
             break
         common.append(parts[0])
     return "/".join(common)
+
+
+def plan_for_fomod(plan: PlacementPlan, files: Iterable[str], mappings: Sequence[FileMapping],
+                   choices: list[dict], *, warnings: Sequence[str] = (), chosen: Sequence[str] = ()) -> PlacementPlan:
+    """*plan* (a FOMOD plan) with the files its installer chose: they go into
+    Data; everything else in the archive is not installed."""
+    mapped = {m.source for m in mappings}
+    reasons = ["you ran its FOMOD installer"
+               + (f" and chose {', '.join(repr(c) for c in chosen[:8])}" + (", ..." if len(chosen) > 8 else "")
+                  if chosen else "")]
+    return replace(plan, target=Target.DATA, rule=Rule.FOMOD, confidence=Confidence.HIGH,
+                   reasons=reasons, warnings=list(plan.warnings) + list(warnings), mappings=list(mappings),
+                   skipped=sorted(f for f in files if f not in mapped), unplaced=[], candidate_roots=[],
+                   fomod_choices=list(choices))
 
 
 def plan_for_roots(

@@ -334,10 +334,10 @@ def format_plan(
     for warning in plan.warnings:
         out.append(f"  ! {warning}")
 
-    if plan.is_fomod:
+    if plan.is_fomod and plan.fomod_choices is None:
         out.append("")
-        out.append(f"This is a FOMOD installer ({plan.fomod_config}). The guided installer arrives in a later")
-        out.append("phase; until then you pick which sub-folders to install.")
+        out.append(f"This is a FOMOD installer ({plan.fomod_config}): 'bethmm install' runs it and asks for its")
+        out.append("options. To install folders of your choice instead, add --root (and --target).")
 
     if plan.candidate_roots:
         out.append("")

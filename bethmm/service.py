@@ -15,7 +15,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from typing import Callable, Iterator, TypeVar
 
-from bethmm import deploy, paths, staging, winecheck
+from bethmm import deploy, fomod, paths, placement, plugins, staging, winecheck
 from bethmm.discovery import DiscoveredGame
 from bethmm.games import GAMES
 from bethmm.manifest import Manifest, ManifestError, ModRecord
@@ -177,14 +177,67 @@ def installable_problem(plan: PlacementPlan) -> str | None:
     or a target first), or None."""
     if plan.target is not Target.UNKNOWN and plan.mappings:
         return None
+    if plan.is_fomod and plan.fomod_choices is not None:
+        return "the options chosen in its FOMOD installer install no files"
     if plan.is_fomod:
-        return "this is a FOMOD installer; the guided installer arrives in phase 4. For now choose which of its " \
-               "folders to install (and where)."
+        return "this is a FOMOD installer: run it to choose what to install (or choose which of its folders to " \
+               "install, and where)"
     if not plan.unplaced and not plan.candidate_roots:
         skipped = f" ({len(plan.skipped)} file(s) such as readmes are never installed)" if plan.skipped else ""
         return f"the archive contains no files to install{skipped}"
     return "it is not clear where these files go: choose the folder(s) to install and whether they go into Data " \
            "or the game folder"
+
+
+# ---------------------------------------------------------------- FOMOD
+
+
+def fomod_module(prepared: staging.Prepared) -> fomod.Module:
+    """The FOMOD installer in *prepared* (``fomod.FomodError`` if it can't be run)."""
+    if prepared.plan.fomod_config is None:
+        raise fomod.FomodError("this mod has no FOMOD installer")
+    return fomod.load(prepared.files_dir, prepared.plan.fomod_config)
+
+
+def fomod_file_state(game: DiscoveredGame | None) -> fomod.FileStateFn:
+    """How an installer's conditions on files are answered for *game*: a
+    plugin in its Data folder is active when plugins.txt (or the game itself)
+    loads it; any other file there counts as active; the rest is missing."""
+    if game is None or not game.data_dir.is_dir():
+        return lambda _path: fomod.FileState.MISSING
+    gdef = GAMES[game.game_id]
+    active = plugins.active_keys(plugins.read(game.plugins_txt, gdef.plugins_format), gdef)
+    resolver = CaseResolver(game.data_dir)
+
+    def state(path: str) -> fomod.FileState:
+        try:
+            found = resolver.resolve(path).exists_on_disk
+        except ValueError:
+            return fomod.FileState.MISSING
+        if not found:
+            return fomod.FileState.MISSING
+        name = path.replace("\\", "/").rsplit("/", 1)[-1]
+        if plugins.is_plugin_name(name) and plugins.key(name) not in active:
+            return fomod.FileState.INACTIVE
+        return fomod.FileState.ACTIVE
+    return state
+
+
+def remembered_fomod_choices(mod: ModRecord | None) -> list[dict] | None:
+    """The installer choices made when *mod* was installed (None: none)."""
+    if mod is None or not isinstance(mod.plan.get("fomod"), dict):
+        return None
+    choices = mod.plan["fomod"].get("choices")
+    return choices if isinstance(choices, list) else None
+
+
+def apply_fomod(prepared: staging.Prepared, wizard: fomod.Wizard) -> staging.Prepared:
+    """*prepared* planned with the files the installer's current choices install."""
+    outcome = wizard.outcome(prepared.files)
+    plan = placement.plan_for_fomod(prepared.plan, prepared.files, outcome.mappings, wizard.choices(),
+                                    warnings=list(wizard.module.warnings) + outcome.warnings,
+                                    chosen=outcome.chosen)
+    return replace(prepared, plan=plan)
 
 
 @dataclass

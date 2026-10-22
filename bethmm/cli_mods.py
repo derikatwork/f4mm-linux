@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 from typing import Callable
 
-from bethmm import deploy, describe, service, staging, winecheck
+from bethmm import deploy, describe, fomod, paths, service, staging, winecheck
 from bethmm.discovery import DiscoveredGame, get_games
 from bethmm.games import GAMES
 from bethmm.manifest import Manifest, ManifestError, ModRecord
@@ -269,17 +269,27 @@ def cmd_install(args) -> int:
         raise CliError(f"{exc}{hint}") from exc
     try:
         plan = prepared.plan
+        detected = service.detected_game(plan, settings, installed)
+        if plan.is_fomod:
+            game = _choose_game(args, settings, games, detected=detected)
+            try:
+                ran = _run_fomod(prepared, game, args)
+            except fomod.FomodError as exc:
+                print(format_plan(plan, None, None, [], installed=installed, source=str(args.source)))
+                print()
+                raise CliError(f"{exc}. Choose the folders to install with --root (and --target).") from None
+            if ran is None:
+                print("Cancelled.")
+                return 1
+            prepared = ran
+            plan = prepared.plan
         problem = service.installable_problem(plan)
         if problem is not None:
             print(format_plan(plan, None, None, [], installed=installed, source=str(args.source)))
             print()
-            if plan.is_fomod:
-                raise CliError("this is a FOMOD installer; the guided installer arrives in phase 4. "
-                               "For now choose the folders to install with --root (and --target).")
-            if not plan.unplaced and not plan.candidate_roots:
+            if plan.is_fomod or (not plan.unplaced and not plan.candidate_roots):
                 raise CliError(problem)
             raise CliError("choose what to install with --root <folder> and --target data|game (see above)")
-        detected = service.detected_game(plan, settings, installed)
         game = _choose_game(args, settings, games, detected=detected)
 
         dry = _dry(args, settings)
@@ -427,6 +437,124 @@ def cmd_enable(args) -> int:
         word = "Enabled" if args.enabled else "Disabled"
         return f"{word} " + ", ".join(f"'{m.name}'" for m in mods) + "."
     return _mutate_and_refresh(args, mutate)
+
+
+# ---------------------------------------------------------------- FOMOD
+
+
+def _run_fomod(prepared: staging.Prepared, game: DiscoveredGame, args) -> staging.Prepared | None:
+    """Run the archive's FOMOD installer: ask for each step in a terminal, or
+    (with --yes, or without a terminal) take the choices made when the mod
+    being updated was installed, else the installer's defaults. None: cancelled."""
+    module = service.fomod_module(prepared)
+    wizard = fomod.Wizard(module, service.fomod_file_state(game))
+    existing = None
+    if paths.manifest_path().exists() and not args.new:
+        with Manifest() as manifest:
+            existing = _find(manifest, game.game_id, args.replace) if args.replace else \
+                staging.find_existing(manifest, game.game_id, prepared, args.name)
+    previous = service.remembered_fomod_choices(existing)
+    title = module.name + "".join(f", {w}" for w in (
+        f"version {module.info.version}" if module.info.version else "",
+        f"by {module.info.author}" if module.info.author else "") if w)
+    print(f"FOMOD installer: {title}")
+    for warning in module.warnings:
+        print(f"  ! {warning}")
+    if previous:
+        skipped = wizard.apply_choices(previous)
+        print(f"  (the choices made when '{existing.name}' was installed are preselected"
+              + (f"; not available any more: {', '.join(skipped)})" if skipped else ")"))
+    needs = wizard.unmet_dependencies()
+    if needs:
+        print(f"  ! the installer says it needs: {needs}")
+    if getattr(args, "yes", False) or not sys.stdin.isatty():
+        if module.steps:
+            print("  using the choices made last time" if previous else "  using the installer's default choices",
+                  "(run it in a terminal without --yes to choose)")
+    elif not _ask_fomod(wizard):
+        return None
+    return service.apply_fomod(prepared, wizard)
+
+
+def _option_line(wizard: fomod.Wizard, step: int, group: int, index: int, chosen: list[int]) -> str:
+    g = wizard.module.steps[step].groups[group]
+    option = g.options[index]
+    single = g.type in (fomod.GroupType.EXACTLY_ONE, fomod.GroupType.AT_MOST_ONE)
+    mark = ("(*)" if index in chosen else "( )") if single else ("[x]" if index in chosen else "[ ]")
+    kind = wizard.option_type(step, group, index)
+    notes = {fomod.OptionType.REQUIRED: "required", fomod.OptionType.RECOMMENDED: "recommended",
+             fomod.OptionType.NOT_USABLE: "can't be used", fomod.OptionType.COULD_BE_USABLE: "may not work"}
+    note = f"  [{notes[kind]}]" if kind in notes else ""
+    text = " ".join(option.description.split())
+    if len(text) > 70:
+        text = text[:67] + "..."
+    return f"    {index + 1}. {mark} {option.name}{note}" + (f" - {text}" if text else "")
+
+
+_GROUP_HELP = {
+    fomod.GroupType.EXACTLY_ONE: "choose one",
+    fomod.GroupType.AT_MOST_ONE: "choose one, or - for none",
+    fomod.GroupType.AT_LEAST_ONE: "choose one or more (numbers separated by spaces)",
+    fomod.GroupType.ANY: "choose any (numbers separated by spaces, - for none)",
+    fomod.GroupType.ALL: "all of them are installed",
+}
+
+
+def _ask_fomod(wizard: fomod.Wizard) -> bool:
+    """Ask for every visible step's choices; False when the user cancels."""
+    step = wizard.next_step(None)
+    visited: list[int] = []
+    while step is not None:
+        s = wizard.module.steps[step]
+        visible = wizard.visible_steps()
+        print(f"\nStep {visible.index(step) + 1} of {len(visible)}: {s.name or '(unnamed)'}")
+        back = False
+        for g, group in enumerate(s.groups):
+            if not group.options:
+                continue
+            while True:
+                chosen = wizard.selection(step)[g]
+                print(f"  {group.name or 'Options'} - {_GROUP_HELP[group.type]}:")
+                for i in range(len(group.options)):
+                    print(_option_line(wizard, step, g, i, chosen))
+                if all(wizard.locked(step, g, i) for i in range(len(group.options))):
+                    break  # nothing to choose
+                default = " ".join(str(i + 1) for i in chosen) or "-"
+                try:
+                    reply = input(f"  Your choice [{default}] (b = back, q = cancel): ").strip().lower()
+                except EOFError:
+                    print()
+                    return False
+                if reply == "q":
+                    return False
+                if reply == "b":
+                    back = True
+                    break
+                if not reply:
+                    picked = chosen
+                elif reply == "-":
+                    picked = []
+                else:
+                    try:
+                        picked = [int(x) - 1 for x in reply.replace(",", " ").split()]
+                    except ValueError:
+                        print("  ! type the numbers of the options")
+                        continue
+                why = wizard.problem(step, g, picked)
+                if why is not None:
+                    print(f"  ! {why}")
+                    continue
+                wizard.choose(step, g, picked)
+                break
+            if back:
+                break
+        if back:
+            if visited:
+                step = visited.pop()
+            continue
+        visited.append(step)
+        step = wizard.next_step(step)
+    return True
 
 
 def _find(manifest: Manifest, game_id: str, query: str) -> ModRecord:
