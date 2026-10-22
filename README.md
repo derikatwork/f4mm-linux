@@ -4,8 +4,9 @@ A mod manager for Bethesda games (Fallout 4, Skyrim Special Edition, Fallout: Ne
 Vegas, Fallout 3, Oblivion, Starfield, Skyrim LE) installed through **Lutris/Wine**
 on Linux. You pick an archive you downloaded from Nexus Mods with "Manual
 Download"; the app works out which game it is for and where its files belong,
-and (from phase 2 on) installs it by linking files into the game folder, so the
-game folder can always be returned to vanilla.
+and installs it by linking its files into the game folder, so the game folder can
+always be returned to vanilla. It has a desktop app and a `bethmm` command; both
+work on the same mods and records.
 
 ## Status
 
@@ -16,10 +17,11 @@ The project is built in phases:
 | 1 | Game discovery, placement rules, tests, read-only CLI | **done** |
 | 2 | Staging, deploy/undeploy with symlinks, manifest, CLI | **done** |
 | 3 | Desktop GUI (PySide6) | **done** |
-| 4 | FOMOD installer, plugins.txt management | next |
+| 4 | FOMOD installer, plugins.txt management | in progress |
 
-Until phase 4, plugins (`.esp/.esm/.esl`) are linked into `Data` but **not** added to
-`plugins.txt` — enable them in the game's launcher or edit `plugins.txt` by hand.
+Until phase 4 is done, plugins (`.esp/.esm/.esl`) are linked into `Data` but **not**
+added to `plugins.txt` — enable them in the game's launcher or edit `plugins.txt` by
+hand. FOMOD installers aren't run yet: you pick which of their folders to install.
 
 ## Install (Ubuntu and Ubuntu-based: Mint, Pop!_OS, Zorin, ...)
 
@@ -45,6 +47,18 @@ cd f4mm-linux
    first install) and a **BETH Mod Manager** entry in your applications menu.
 
 Keep the cloned folder: the app runs from it. To update, `git pull && ./install.sh`.
+
+### First steps
+
+1. Open **BETH Mod Manager** and check that your game is in the list at the top
+   (if not: *Game ▸ Game settings*, or `bethmm games` and `bethmm override`).
+2. Run *Game ▸ Check links* once per game: it tells you whether Wine sees the
+   app's links, or whether that game needs hardlinks (see
+   [Does the game see the links?](#does-the-game-see-the-links)).
+3. Drag a mod archive from `~/Downloads` onto the window and click **Install**.
+
+Not sure yet? Switch on dry-run mode (*Settings*, or `bethmm config --dry-run on`)
+and the app only shows what it would do.
 
 Options: `--yes` (don't ask), `--dev` (also install the test tools and run the
 tests), `--no-gui` (command line only: no Qt, no menu entry), `--no-system-packages`
@@ -83,9 +97,10 @@ Open **BETH Mod Manager** from your applications menu (or run `bethmm-gui`, or
 * **Install**: *File ▸ Install...* (Ctrl+O), or drag archives from your file
   manager onto the window (`bethmm-gui ~/Downloads/mod.7z` opens straight into
   the install dialog). The dialog shows where every file would go — new, replacing
-  an original game file (which is backed up), or overriding another mod — and, on
-  its *Changes in the game folder* tab, exactly what would be linked and backed
-  up. When the archive looks like a new version of a mod you have, the button says
+  an original game file (which is backed up), overriding another mod, or (for an
+  update that keeps its place in the list) losing to a mod lower in the list —
+  and, on its *Changes in the game folder* tab, exactly what would be linked and
+  backed up. When the archive looks like a new version of a mod you have, the button says
   **Update**; you can install it as a new mod instead, or pick which mod it
   updates. If the app can't tell where an archive's files belong, tick *Choose the
   folders myself*, tick the folders to install and where they go, and click *Use
@@ -100,13 +115,16 @@ Open **BETH Mod Manager** from your applications menu (or run `bethmm-gui`, or
   conflicts, and where it came from, with a link to its Nexus page. Right-click
   it to rename (F2), update it from an archive, open its folder or uninstall it (Del).
 * *Game* menu: **Deploy** (Ctrl+D), **Purge** (back to vanilla, mods stay
-  installed), **Verify** (shows what doesn't match the records, with a *Repair*
-  button), **Check links** (does Wine see the links?) and *Game settings* (game
+  installed), **Verify** (shows what doesn't match the records or the mod list,
+  with a *Repair* button), **Check links** (does Wine see the links?) and *Game settings* (game
   folder, Wine prefix, link mode, hide the game — and set up a game that wasn't
   found, or bring back a hidden one).
-* *Settings*: where your Lutris games are, the `7z` program, and **dry-run mode**:
-  every change then opens a preview of exactly what it would do in the game
-  folder, and nothing is changed.
+* *Settings*: where your Lutris games are (and how many folder levels to search),
+  the `7z` program, and **dry-run mode**: every change then opens a preview of
+  exactly what it would do in the game folder, and nothing is changed. Settings
+  changed from the command line while the window is open are picked up; the
+  window saves only what you changed in it, and never saves over a settings file
+  it can't read (fix or delete the file first).
 * The *Messages* tab at the bottom says what each action did; *History* lists the
   latest file operations.
 
@@ -252,7 +270,7 @@ Hardlinks are real directory entries inside the game folder, so sandboxes see th
 but they only work when the game and `~/.local/share` are on the same disk; the app
 checks this when you switch (and before every change) and tells you if they aren't.
 
-## Using phase 1 commands
+## Finding games and looking inside archives
 
 ### Find your games
 
