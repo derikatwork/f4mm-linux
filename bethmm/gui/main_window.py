@@ -8,6 +8,8 @@ the plan is shown instead."""
 
 from __future__ import annotations
 
+import copy
+import dataclasses
 import logging
 import sqlite3
 import traceback
@@ -918,6 +920,10 @@ class MainWindow(QMainWindow):
         if not self.ask("Check links", f"Put a test file into {game.data_dir} through a {mode}, have Wine read it, "
                                        "and remove it again? This can take up to two minutes."):
             return
+        now = self._still_allowed()
+        if now is None:
+            return
+        mode = now.link_mode  # as the settings say now
 
         def job() -> winecheck.LinkCheck:
             with Manifest(lock=True):  # keeps a concurrent repair from removing the test link
@@ -937,8 +943,9 @@ class MainWindow(QMainWindow):
     def open_settings(self) -> None:
         dialog = SettingsDialog(self._fresh_settings(), parent=self)
         if self.run_dialog(dialog):
-            rescan = dialog.apply(self._fresh_settings())  # onto what is saved now
-            if self._save_settings():
+            settings = copy.deepcopy(self._fresh_settings())  # what is saved now; the window's only once saved
+            rescan = dialog.apply(settings)
+            if self._save_settings(settings):
                 self.reload_games(rescan=rescan)
 
     def open_game_settings(self) -> None:
@@ -958,14 +965,15 @@ class MainWindow(QMainWindow):
         game = next((g for g in self.games if g.game_id == game_id), None)
         dialog = GameSettingsDialog(game_id, self.settings, game, parent=self)
         if self.run_dialog(dialog):
-            mode_before = self._fresh_settings().override(game_id).link_mode
-            dialog.apply(self.settings)  # onto what is saved now
-            hidden_now = self.settings.override(game_id).ignore
+            settings = copy.deepcopy(self._fresh_settings())  # what is saved now; the window's only once saved
+            mode_before = settings.override(game_id).link_mode
+            dialog.apply(settings)
+            hidden_now = settings.override(game_id).ignore
             if not hidden_now:
-                self.settings.current_game = game_id
-            elif self.settings.current_game == game_id:
-                self.settings.current_game = None  # a hidden game isn't the current one any more
-            if not self._save_settings():
+                settings.current_game = game_id
+            elif settings.current_game == game_id:
+                settings.current_game = None  # a hidden game isn't the current one any more
+            if not self._save_settings(settings):
                 return
             mode_now = self.settings.override(game_id).link_mode
             usable = True
@@ -977,13 +985,20 @@ class MainWindow(QMainWindow):
                     self.tell("Hardlinks won't work here", str(exc), warning=True)
             self.reload_games()
             if self.settings.current_game is None and self.game is not None:
-                self.settings.current_game = self.game.game_id  # the game shown now, for the command line too
-                self._save_settings()
+                # The game shown now, for the command line too.
+                self._save_settings(dataclasses.replace(self.settings, current_game=self.game.game_id))
             # The links in the game folder change kind only when the mods are deployed again.
             if mode_now != mode_before and usable and not hidden_now and self.game is not None \
                     and self.game.game_id == game_id:
-                with Manifest() as manifest:
-                    other = sum(d.link_type != mode_now for d in manifest.deployed(game_id).values())
+                try:
+                    with Manifest() as manifest, manifest.snapshot():
+                        state = manifest.game_state(game_id)
+                        # A purged game is left alone: a deploy would put every mod back.
+                        other = 0 if state is not None and not state.deployed else \
+                            sum(d.link_type != mode_now for d in manifest.deployed(game_id).values())
+                except (ManifestError, sqlite3.Error, OSError) as exc:
+                    self.note(f"! could not read the mod list: {exc}")
+                    other = 0
                 if other and self.ask("Relink the mod files", f"{other} mod file(s) in the game folder are still "
                                       f"{mode_before}s. Deploy now to relink them as {mode_now}s?"):
                     self.deploy()
@@ -991,16 +1006,20 @@ class MainWindow(QMainWindow):
     def rescan_games(self) -> None:
         self.reload_games(rescan=True)
 
-    def _save_settings(self) -> bool:
+    def _save_settings(self, settings: Settings | None = None) -> bool:
+        """Save *settings* (default: the window's) and make them the window's;
+        when they can't be saved, the window keeps the ones it had."""
+        settings = self.settings if settings is None else settings
         if self._settings_error is not None:
             self.tell("Settings", f"Not saved: {self._settings_error}. Fix the file (or delete it to start "
                                   "over) and try again.", warning=True)
             return False
         try:
-            save_settings(self.settings)
+            save_settings(settings)
         except OSError as exc:
             self.tell("Settings", f"Could not save the settings: {exc}", warning=True)
             return False
+        self.settings = settings
         return True
 
     # ------------------------------------------------------------ details

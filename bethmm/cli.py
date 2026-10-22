@@ -508,9 +508,16 @@ def cmd_override(args) -> int:
                 deploy.check_link_mode(deploy.GameTarget(args.game, match.root, mode))
             except deploy.DeployError as exc:
                 print(f"warning: {exc}", file=sys.stderr)
+        other = 0
         if paths.manifest_path().exists():
-            with Manifest() as manifest:
-                other = sum(d.link_type != mode for d in manifest.deployed(args.game).values())
+            try:
+                with Manifest() as manifest, manifest.snapshot():
+                    state = manifest.game_state(args.game)
+                    # A purged game is left alone: a deploy would put every mod back.
+                    if state is None or state.deployed:
+                        other = sum(d.link_type != mode for d in manifest.deployed(args.game).values())
+            except (ManifestError, sqlite3.Error) as exc:  # the settings are saved all the same
+                print(f"warning: could not read the mod list: {exc}", file=sys.stderr)
             if other:
                 print(f"  {other} mod file(s) in the game folder are still linked the other way; "
                       f"'bethmm deploy --game {args.game}' relinks them as {mode}s.")

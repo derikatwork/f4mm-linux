@@ -3,6 +3,7 @@ installing a mod, and settings."""
 
 from __future__ import annotations
 
+import dataclasses
 import os
 from pathlib import Path
 
@@ -586,7 +587,7 @@ class SettingsDialog(QDialog):
         row.addWidget(browse)
         form.addRow("Lutris games folder:", row)
         self.scan_depth = QSpinBox()
-        self.scan_depth.setRange(1, 20)
+        self.scan_depth.setRange(1, max(20, settings.scan_depth))  # the command line takes any depth
         self.scan_depth.setValue(settings.scan_depth)
         form.addRow("Folder levels to search:", self.scan_depth)
         self.sevenzip = QLineEdit(settings.sevenzip or "")
@@ -600,6 +601,12 @@ class SettingsDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+        self._shown = self._values()
+
+    def _values(self) -> dict[str, object]:
+        """The settings as the fields say."""
+        return {"games_dir": self.games_dir.text().strip() or "~/Games", "scan_depth": self.scan_depth.value(),
+                "sevenzip": self.sevenzip.text().strip() or None, "dry_run": self.dry_run.isChecked()}
 
     def _browse(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Lutris games folder", os.path.expanduser(self.games_dir.text()))
@@ -610,10 +617,8 @@ class SettingsDialog(QDialog):
         """Copy the fields the user changed into *target* (the settings as
         saved now -- the command line may have changed others meanwhile;
         default: the ones shown). True when discovery must rescan."""
-        shown, s = self.settings, target if target is not None else self.settings
-        values = {"games_dir": self.games_dir.text().strip() or "~/Games", "scan_depth": self.scan_depth.value(),
-                  "sevenzip": self.sevenzip.text().strip() or None, "dry_run": self.dry_run.isChecked()}
-        changed = {k: v for k, v in values.items() if v != getattr(shown, k)}
+        s = target if target is not None else self.settings
+        changed = {k: v for k, v in self._values().items() if v != self._shown[k]}
         for key, value in changed.items():
             setattr(s, key, value)
         return "games_dir" in changed or "scan_depth" in changed
@@ -659,6 +664,7 @@ class GameSettingsDialog(QDialog):
         buttons.rejected.connect(self.reject)
         buttons.button(QDialogButtonBox.StandardButton.RestoreDefaults).clicked.connect(self._defaults)
         layout.addWidget(buttons)
+        self._shown = self._values()
 
     def _with_browse(self, edit: QLineEdit) -> QWidget:
         box = QWidget()
@@ -682,23 +688,27 @@ class GameSettingsDialog(QDialog):
         self.link_mode.setCurrentText("symlink")
         self.ignore.setChecked(False)
 
-    def apply(self, target: Settings | None = None) -> None:
-        """Put this game's override into *target* (the settings as saved now;
-        default: the ones shown)."""
-        s = target if target is not None else self.settings
+    def _values(self) -> dict[str, object]:
+        """This game's override as the fields say."""
 
         def folder(text: str) -> str | None:
             """As the settings read it: ~ is expanded, a relative path is in the home folder."""
             text = text.strip()
             return str(Path.home() / os.path.expanduser(text)) if text else None
 
-        o = GameOverride(
-            root=folder(self.root.text()),
-            prefix=folder(self.prefix.text()),
-            wine_user=self.wine_user.text().strip() or None,
-            link_mode=self.link_mode.currentText(),
-            ignore=self.ignore.isChecked(),
-        )
+        return {"root": folder(self.root.text()), "prefix": folder(self.prefix.text()),
+                "wine_user": self.wine_user.text().strip() or None, "link_mode": self.link_mode.currentText(),
+                "ignore": self.ignore.isChecked()}
+
+    def apply(self, target: Settings | None = None) -> None:
+        """Copy the fields the user changed into this game's override in
+        *target* (the settings as saved now -- the command line may have
+        changed others meanwhile; default: the ones shown)."""
+        s = target if target is not None else self.settings
+        o = dataclasses.replace(s.override(self.game_id))
+        for key, value in self._values().items():
+            if value != self._shown[key]:
+                setattr(o, key, value)
         if o == GameOverride():
             s.game_overrides.pop(self.game_id, None)
         else:

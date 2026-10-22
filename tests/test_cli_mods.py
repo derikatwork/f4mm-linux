@@ -1034,3 +1034,75 @@ def test_dry_run_switched_on_at_a_question_stops_the_change(home, fo4, tmp_path,
     assert main(["install", str(a)]) == 1
     assert "nothing was changed" in capsys.readouterr().err
     assert not os.path.lexists(fo4 / "Data" / "Cee.esp")
+
+
+def _file_line(out: str, source: str) -> str:
+    """The install preview's line for one of the mod's files."""
+    return next(x for x in out.splitlines() if x.strip().startswith(f"{source}  ->  "))
+
+
+def test_install_preview_says_conflict_when_the_games_own_folder_is_in_the_way(home, fo4, tmp_path, capsys):
+    # A's file sits in the game's own textures folder; B has a file called 'textures'.
+    a = mod_zip(tmp_path, "A-1-1-0.zip", {"A.esp": esp(), "textures/shared.dds": b"a"})
+    assert main(["install", str(a), "--yes"]) == 0
+    b = mod_zip(tmp_path, "B-2-1-0.zip", {"B.esp": esp(), "textures": b"a file named textures"})
+    capsys.readouterr()
+    assert main(["install", str(b), "--dry-run"]) == 0
+    line = _file_line(capsys.readouterr().out, "textures")
+    assert "other type already exists" in line and "overrides" not in line
+    # A folder that holds only what the app put there does give way.
+    c = mod_zip(tmp_path, "C-3-1-0.zip", {"C.esp": esp(), "meshes/newdir/c.nif": b"c"})
+    assert main(["install", str(c), "--yes"]) == 0
+    d = mod_zip(tmp_path, "D-4-1-0.zip", {"D.esp": esp(), "meshes/newdir": b"a file"})
+    capsys.readouterr()
+    assert main(["install", str(d), "--dry-run"]) == 0
+    line = _file_line(capsys.readouterr().out, "meshes/newdir")
+    assert "overrides C" in line
+
+
+def test_update_preview_says_which_mod_lower_in_the_list_keeps_winning(home, fo4, tmp_path, capsys):
+    a = mod_zip(tmp_path, "A-1-1-0.zip", {"A.esp": esp(), "textures/x.dds": b"a1", "textures/y/in.dds": b"a1"})
+    z = mod_zip(tmp_path, "Z-2-1-0.zip", {"Z.esp": esp(), "textures/x.dds": b"z", "textures/y": b"z file"})
+    assert main(["install", str(a), "--yes"]) == 0
+    assert main(["install", str(z), "--yes"]) == 0
+    a2 = mod_zip(tmp_path, "A-1-2-0.zip", {"A.esp": esp(), "textures/x.dds": b"a2", "textures/y/in.dds": b"a2"})
+    capsys.readouterr()
+    assert main(["install", str(a2), "--replace", "A", "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert "overrides Z" not in out
+    assert "loses to Z, lower in the list" in _file_line(out, "textures/x.dds")
+    assert "loses to Z, lower in the list" in _file_line(out, "textures/y/in.dds")
+    assert main(["install", str(a2), "--replace", "A", "--yes"]) == 0
+    assert (fo4 / "Data" / "textures" / "x.dds").read_bytes() == b"z"
+
+
+def test_override_saves_even_when_the_manifest_cant_be_read(home, fo4, tmp_path, capsys):
+    a = mod_zip(tmp_path, "A-1-1-0.zip", {"A.esp": esp()})
+    assert main(["install", str(a), "--yes"]) == 0
+    paths.manifest_path().write_bytes(b"this is not a database" * 100)
+    for suffix in ("-wal", "-shm"):
+        Path(str(paths.manifest_path()) + suffix).unlink(missing_ok=True)
+    capsys.readouterr()
+    assert main(["override", "fallout4", "--link-mode", "hardlink"]) == 0
+    assert "could not read the mod list" in capsys.readouterr().err
+    assert load_settings().override("fallout4").link_mode == "hardlink"
+
+
+def test_override_offers_no_relink_on_a_purged_game(home, fo4, tmp_path, capsys, monkeypatch):
+    a = mod_zip(tmp_path, "A-1-1-0.zip", {"A.esp": esp(), "B.esp": esp()})
+    assert main(["install", str(a), "--yes"]) == 0
+    real_unlink = os.unlink
+
+    def failing_unlink(path, *args, **kwargs):
+        if str(path).endswith("A.esp"):
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "unlink", failing_unlink)
+    main(["purge", "--yes"])  # one link stays behind
+    monkeypatch.setattr(os, "unlink", real_unlink)
+    with Manifest() as manifest:
+        assert not manifest.game_state("fallout4").deployed and manifest.deployed("fallout4")
+    capsys.readouterr()
+    assert main(["override", "fallout4", "--link-mode", "hardlink"]) == 0
+    assert "relinks them" not in capsys.readouterr().out

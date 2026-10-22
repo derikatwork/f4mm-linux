@@ -6,6 +6,7 @@ operations the command line uses."""
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import pytest
 
@@ -887,3 +888,144 @@ def test_a_damaged_manifest_is_reported_not_crashed_on(qtbot, window, answers, t
     assert "database disk image is malformed" in window.messages.toPlainText()
     window.show_error(sqlite3.DatabaseError("database disk image is malformed"))
     assert any("can't be read" in text for _, text, warning in answers.told if warning)
+
+
+def test_check_links_reads_the_settings_again_after_its_question(qtbot, window, answers, fo4, monkeypatch):
+    from bethmm import winecheck
+
+    ran = []
+    monkeypatch.setattr(winecheck, "check_links", lambda game, link_mode: ran.append(link_mode) or
+                        winecheck.LinkCheck(ok=True, message="fine"))
+
+    def meanwhile(command):
+        def ask(title, text):
+            answers.asked.append(text)
+            assert main(command) == 0  # meanwhile, in a terminal
+            return True
+        return ask
+
+    window.ask = meanwhile(["config", "--dry-run", "on"])
+    window.check_links()
+    idle(qtbot, window)
+    assert ran == [] and any("switched on meanwhile" in text for _, text, _w in answers.told)
+    assert main(["config", "--dry-run", "off"]) == 0
+    window.ask = meanwhile(["override", "fallout4", "--link-mode", "hardlink"])
+    window.check_links()
+    idle(qtbot, window)
+    assert ran == ["hardlink"]
+
+
+def _break_settings() -> None:
+    """A hand-edited settings file that can't be read (a trailing comma)."""
+    p = paths.settings_path()
+    p.write_text(p.read_text().rstrip().rstrip("}") + ",}\n")
+
+
+def test_settings_that_could_not_be_saved_are_not_used(qtbot, window, answers, tmp_path, fo4):
+    from bethmm.gui.dialogs import GameSettingsDialog, SettingsDialog
+    two_mods(tmp_path)
+    assert main(["config", "--dry-run", "on"]) == 0
+    window.refresh()
+    _break_settings()
+
+    def change(dialog) -> None:
+        if isinstance(dialog, SettingsDialog):
+            dialog.dry_run.setChecked(False)
+        if isinstance(dialog, GameSettingsDialog):
+            dialog.link_mode.setCurrentText("hardlink")
+
+    answers.before_accept = change
+    window.open_settings()
+    window.open_game_settings()
+    assert sum("Not saved" in text for _, text, _w in answers.told) == 2
+    assert window.settings.dry_run and "DRY-RUN" in window.dry_label.text()
+    assert window.target.link_mode == "symlink"
+
+
+def test_game_settings_keep_what_the_command_line_changed_meanwhile(qtbot, window, answers, home, fo4):
+    from bethmm.gui.dialogs import GameSettingsDialog
+    prefix = home / "Games" / "fallout-4"
+
+    def meanwhile(command, change):
+        def before(dialog) -> None:
+            if isinstance(dialog, GameSettingsDialog):
+                assert main(command) == 0
+                change(dialog)
+        return before
+
+    answers.before_accept = meanwhile(["override", "fallout4", "--link-mode", "hardlink"],
+                                      lambda d: d.wine_user.setText(climods.USER))
+    window.open_game_settings()
+    saved = load_settings().override("fallout4")
+    assert saved.wine_user == climods.USER and saved.link_mode == "hardlink"
+    answers.before_accept = meanwhile(["override", "fallout4", "--prefix", str(prefix)],
+                                      lambda d: d.link_mode.setCurrentText("symlink"))
+    window.open_game_settings()
+    saved = load_settings().override("fallout4")
+    assert saved.prefix == str(prefix) and saved.link_mode == "symlink" and saved.wine_user == climods.USER
+
+
+def test_a_scan_depth_above_twenty_is_kept(qtbot, window, answers, fo4):
+    from bethmm.gui.dialogs import SettingsDialog
+    assert main(["config", "--scan-depth", "30"]) == 0
+    window.reload_games()
+    shown = []
+
+    def change_7z(dialog) -> None:
+        if isinstance(dialog, SettingsDialog):
+            shown.append(dialog.scan_depth.value())
+            dialog.sevenzip.setText("/opt/7zip/7zz")
+
+    answers.before_accept = change_7z
+    window.open_settings()
+    saved = load_settings()
+    assert shown == [30] and saved.scan_depth == 30 and saved.sevenzip == "/opt/7zip/7zz"
+
+
+def test_game_settings_with_a_damaged_manifest(qtbot, window, answers, tmp_path, fo4):
+    from bethmm.gui.dialogs import GameSettingsDialog
+    two_mods(tmp_path)
+    window.refresh()
+    paths.manifest_path().write_bytes(b"garbage" * 1000)
+    for suffix in ("-wal", "-shm"):
+        Path(str(paths.manifest_path()) + suffix).unlink(missing_ok=True)
+
+    def hardlinks(dialog) -> None:
+        if isinstance(dialog, GameSettingsDialog):
+            dialog.link_mode.setCurrentText("hardlink")
+
+    answers.before_accept = hardlinks
+    window.open_game_settings()  # doesn't raise
+    assert load_settings().override("fallout4").link_mode == "hardlink"
+    assert "could not read the mod list" in window.messages.toPlainText()
+    assert not any("Relink" in q for q in answers.asked)
+
+
+def test_no_relink_offer_on_a_purged_game(qtbot, window, answers, tmp_path, fo4, monkeypatch):
+    from bethmm.gui.dialogs import GameSettingsDialog
+    two_mods(tmp_path)
+    window.refresh()
+    real_unlink = os.unlink
+
+    def failing_unlink(path, *args, **kwargs):
+        if str(path).endswith("ArmorPack.esp"):
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "unlink", failing_unlink)
+    window.purge()
+    idle(qtbot, window)
+    monkeypatch.setattr(os, "unlink", real_unlink)
+    with Manifest() as manifest:
+        assert not manifest.game_state("fallout4").deployed and manifest.deployed("fallout4")
+
+    def hardlinks(dialog) -> None:
+        if isinstance(dialog, GameSettingsDialog):
+            dialog.link_mode.setCurrentText("hardlink")
+
+    answers.before_accept = hardlinks
+    window.open_game_settings()
+    idle(qtbot, window)
+    assert not any("Relink" in q for q in answers.asked)
+    with Manifest() as manifest:
+        assert not manifest.game_state("fallout4").deployed

@@ -12,7 +12,7 @@ from __future__ import annotations
 import os
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Callable, Iterator, TypeVar
 
 from bethmm import deploy, paths, staging, winecheck
@@ -301,19 +301,59 @@ def _reason(exc: BaseException) -> str:
     return str(exc)
 
 
-def link_owners(game_id: str, manifest: Manifest | None = None) -> dict[str, tuple[int, str]]:
-    """Folded path -> (id, name) of the installed mod whose link the app put
-    there (read-only; empty when nothing was ever installed)."""
+@dataclass
+class LinkOwners:
+    """What the app has put into a game folder (from :func:`link_owners`)."""
+
+    #: Folded path -> (id, name) of the installed mod whose link the app put there.
+    links: dict[str, tuple[int, str]] = field(default_factory=dict)
+    #: Mod id -> its place in the list (the higher, the lower in the list: it wins).
+    position: dict[int, int] = field(default_factory=dict)
+    #: Folded paths of the folders the app made.
+    dirs: set[str] = field(default_factory=set)
+
+
+def link_owners(game_id: str, manifest: Manifest | None = None) -> LinkOwners:
+    """The app's links and folders in *game_id*'s folder (read-only; empty
+    when nothing was ever installed)."""
     if manifest is None:
         if not paths.manifest_path().exists():
-            return {}
+            return LinkOwners()
         try:
             with Manifest() as opened:
                 return link_owners(game_id, opened)
         except ManifestError:
-            return {}
-    names = {m.id: m.name for m in manifest.mods(game_id)}
-    return {key: (d.mod_id, names.get(d.mod_id, "another mod")) for key, d in manifest.deployed(game_id).items()}
+            return LinkOwners()
+    with manifest.snapshot():
+        mods = manifest.mods(game_id)
+        names = {m.id: m.name for m in mods}
+        links = {key: (d.mod_id, names.get(d.mod_id, "another mod")) for key, d in manifest.deployed(game_id).items()}
+        return LinkOwners(links, {m.id: i for i, m in enumerate(mods)}, set(manifest.created_dirs(game_id)))
+
+
+def _ours_in_the_way(root: Path, rel: PurePosixPath, owners: LinkOwners) -> bool:
+    """For a path where the game folder has a file instead of a folder (or a
+    folder instead of a file): whether all that is in the way is the app's
+    -- its link, or a folder it made holding only its links and folders -- so
+    a deploy can clear it. A folder or file of the game's is never removed."""
+    for i in range(1, len(rel.parts)):
+        above = root.joinpath(*rel.parts[:i])
+        if not os.path.lexists(above):
+            return False  # in the way only within this mod
+        if above.is_symlink() or not above.is_dir():
+            return fold_path("/".join(rel.parts[:i])) in owners.links
+    folder = root / rel
+    if folder.is_symlink() or not folder.is_dir() or fold_path(str(rel)) not in owners.dirs:
+        return False
+    for path, dirs, files in os.walk(folder):
+        here = Path(path).relative_to(root)
+        for name in dirs:
+            key = fold_path(str(here / name))
+            if key not in (owners.links if (Path(path) / name).is_symlink() else owners.dirs):
+                return False
+        if any(fold_path(str(here / name)) not in owners.links for name in files):
+            return False
+    return True
 
 
 @dataclass
@@ -333,38 +373,48 @@ class ResolvedFile:
                 "status": self.status, "new_dirs": self.new_dirs, "notes": self.notes}
 
 
-def resolve_against_game(plan: PlacementPlan, game: DiscoveredGame,
-                         owners: dict[str, tuple[int, str]] | None = None,
+def resolve_against_game(plan: PlacementPlan, game: DiscoveredGame, owners: LinkOwners | None = None,
                          replacing: int | None = None) -> list[ResolvedFile]:
     """Where each mapping would land in the real game folder (read-only).
     *owners* (from :func:`link_owners`) tells the app's links from game
-    files; *replacing* is the mod this one updates."""
+    files; *replacing* is the mod this one updates (it keeps its place in
+    the list; a new mod goes to the bottom)."""
     if not game.root.is_dir():
         return []
     resolver = CaseResolver(game.root)
-    owners = owners or {}
+    owners = owners or LinkOwners()
+    links = owners.links
+    place = owners.position.get(replacing) if replacing is not None else None
+
+    def loses_to(other: tuple[int, str]) -> bool:
+        return other[0] != replacing and place is not None and owners.position.get(other[0], -1) > place
+
+    def against(other: tuple[int, str], what: str) -> str:
+        if other[0] == replacing:
+            return "replaces the previous version's file"
+        if loses_to(other):
+            return f"loses to {other[1]}, lower in the list ({what} stays in the game)"
+        return f"overrides {other[1]} ({what} stays installed)"
+
     out = []
     for m in plan.mappings:
         r = resolver.resolve(m.dest, plan=True)
         key = fold_path(str(r.rel))
-        owner = owners.get(key)
+        owner = links.get(key)
         # Another mod's file where this needs a folder (or the other way round)
         # is a conflict like any other: the mod lower in the list wins.
         clash = None
         if r.type_conflict:
             parts = key.split("/")
-            clash = next((owners[k] for k in ("/".join(parts[:i]) for i in range(1, len(parts))) if k in owners),
-                         None) or next((o for k, o in owners.items() if k.startswith(key + "/")), None)
-        if clash is not None and clash[0] == replacing:
-            status = "replaces the previous version's file"
-        elif clash is not None:
-            status = f"overrides {clash[1]} (its file or folder at this path stays installed)"
+            clash = next((links[k] for k in ("/".join(parts[:i]) for i in range(1, len(parts))) if k in links),
+                         None) or next((o for k, o in links.items() if k.startswith(key + "/")), None)
+        # A win counts only when all that is in the way is the app's to clear.
+        if clash is not None and (loses_to(clash) or _ours_in_the_way(game.root, r.rel, owners)):
+            status = against(clash, "its file or folder at this path")
         elif r.type_conflict:
             status = "conflict: a folder/file of the other type already exists there"
-        elif r.exists_on_disk and owner is not None and owner[0] == replacing:
-            status = "replaces the previous version's file"
         elif r.exists_on_disk and owner is not None:
-            status = f"overrides {owner[1]} (its file stays installed)"
+            status = against(owner, "its file")
         elif r.exists_on_disk:
             status = "replaces an existing game file (it would be backed up)"
         elif r.exists:
