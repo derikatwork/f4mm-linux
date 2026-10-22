@@ -17,11 +17,7 @@ The project is built in phases:
 | 1 | Game discovery, placement rules, tests, read-only CLI | **done** |
 | 2 | Staging, deploy/undeploy with symlinks, manifest, CLI | **done** |
 | 3 | Desktop GUI (PySide6) | **done** |
-| 4 | FOMOD installer, plugins.txt management | in progress |
-
-Until phase 4 is done, plugins (`.esp/.esm/.esl`) are linked into `Data` but **not**
-added to `plugins.txt` — enable them in the game's launcher or edit `plugins.txt` by
-hand. FOMOD installers aren't run yet: you pick which of their folders to install.
+| 4 | FOMOD installer, plugins.txt management | **done** |
 
 ## Install (Ubuntu and Ubuntu-based: Mint, Pop!_OS, Zorin, ...)
 
@@ -105,18 +101,28 @@ Open **BETH Mod Manager** from your applications menu (or run `bethmm-gui`, or
   updates. If the app can't tell where an archive's files belong, tick *Choose the
   folders myself*, tick the folders to install and where they go, and click *Use
   this choice*.
+* **FOMOD installers**: an archive with a guided installer (`fomod/ModuleConfig.xml`)
+  opens it first: choose the options of each step (the description and picture
+  of an option show when you point at it), then the install dialog shows exactly
+  what your choices install. *Run its installer again...* there changes them.
+  When you update such a mod, the choices you made last time are preselected.
 * **Enable / disable**: tick or untick the box in front of a mod.
 * **Order**: drag mods up and down (or Ctrl+Up / Ctrl+Down, or the *Mod* menu).
 * Every change is applied to the game folder right away. If the game folder is
   missing or unusable, nothing is changed and the reason is shown. A file the app
   didn't make that is in a mod's way is left alone: that one file isn't linked,
   and the *Messages* tab says so.
+* **Plugins** tab: the load order the game uses (later plugins win), which mod each
+  plugin comes from, and plugins whose masters are missing or load after them (in
+  red). Tick to switch a plugin on or off, drag to move it. See
+  [Plugins and load order](#plugins-and-load-order).
 * Select a mod to see its files (and which of them another mod overrides), its
   conflicts, and where it came from, with a link to its Nexus page. Right-click
   it to rename (F2), update it from an archive, open its folder or uninstall it (Del).
 * *Game* menu: **Deploy** (Ctrl+D), **Purge** (back to vanilla, mods stay
   installed), **Verify** (shows what doesn't match the records or the mod list,
-  with a *Repair* button), **Check links** (does Wine see the links?) and *Game settings* (game
+  with a *Repair* button), **Check links** (does Wine see the links?), *Update
+  plugins.txt* (after you edited it by hand) and *Game settings* (game
   folder, Wine prefix, link mode, hide the game — and set up a game that wasn't
   found, or bring back a hidden one).
 * *Settings*: where your Lutris games are (and how many folder levels to search),
@@ -150,6 +156,14 @@ bethmm move "Some Mod" --down    # --up, --top, --bottom, --to N
 bethmm conflicts --files
 bethmm uninstall "Some Mod"
 ```
+
+An archive with a FOMOD installer runs it: in a terminal, `install` asks for the
+options of each step (Enter keeps the preselected ones, `b` goes back, `q`
+cancels); with `--yes`, or when not run in a terminal, it takes the choices made
+when the mod being updated was installed, else the installer's defaults. Only the
+files your choices install are kept. `--root`/`--target` skip the installer and
+install the folders you name instead (also the way to install the rare old
+installers written in C#, `fomod/script.cs`, which the app can't run).
 
 `install` options: `--dry-run` (show exactly what would change in the game folder),
 `--no-deploy` (add the mod disabled: nothing of it is linked until you `enable` it),
@@ -244,7 +258,7 @@ for a game that is no longer found, too.
 ### Dry run
 
 Add `--dry-run` to `install`, `enable`, `disable`, `move`, `uninstall`, `deploy`,
-`purge`, `verify --repair` or `check-links` to see exactly which files would be
+`purge`, `verify --repair`, `check-links` or the `plugins` commands to see exactly which files would be
 linked, backed up or restored without changing anything. (`verify --repair
 --dry-run` lists the repairs; run `deploy --dry-run` after the repair for the links.)
 `bethmm config --dry-run on` makes that the default for everything until you switch
@@ -269,6 +283,59 @@ bethmm deploy
 Hardlinks are real directory entries inside the game folder, so sandboxes see them,
 but they only work when the game and `~/.local/share` are on the same disk; the app
 checks this when you switch (and before every change) and tells you if they aren't.
+
+## Plugins and load order
+
+After every deploy and purge the app keeps the game's `plugins.txt` (in the Wine
+prefix: `drive_c/users/<you>/AppData/Local/<game>/plugins.txt`) in line with the
+plugins it put into `Data`:
+
+* a newly installed mod's plugins are added, switched on, at the end (masters
+  after the last master);
+* when a mod is disabled or uninstalled (or the game purged), its plugins' lines
+  are taken out — and remembered, with their place and whether they were on, so
+  enabling the mod (or deploying again) puts them back exactly where they were;
+* a plugin you switched off stays off; lines the app didn't add, comments, the
+  file's encoding and line endings are left as they are;
+* before every change, `plugins.txt` is copied to
+  `~/.local/share/beth-mod-manager/plugins-backups/<game>/` (the first copy and the
+  latest 30 are kept), and the new file replaces the old one in one step.
+
+```bash
+bethmm plugins                       # the load order: on/off, which mod, missing masters
+bethmm plugins disable "Some Plugin.esp"   # or its number, or part of its name
+bethmm plugins enable 12
+bethmm plugins move "Patch.esp" --after "Some Plugin.esp"   # --up, --down, --top, --bottom, --to N, --before X
+bethmm plugins sync                  # bring plugins.txt in line now (e.g. after editing it by hand)
+```
+
+The ones that change something take `--dry-run`. Fallout 4, Skyrim SE and Starfield use the
+`*Plugin.esp` format, where the order of the lines is the load order; their own
+masters, DLCs and Creation Club content are loaded anyway and aren't listed. New
+Vegas, Fallout 3, Oblivion and Skyrim LE list only active plugins (the game's own
+masters included), and **load plugins in the order of their file dates**: the app
+sets the dates of the plugins it installed so that they load in the order shown,
+after all the others — it never changes the date of a file it didn't install, so
+only its own plugins can be moved there.
+
+Sorting with LOOT isn't built in yet; `bethmm plugins sort` is where a sorter will
+plug in (see `SORTERS` in `bethmm/plugins.py`).
+
+**Fallout 4** only loads the plugins in `plugins.txt` and loose files (textures,
+meshes, ...) when these are set (the game's launcher doesn't add them; the app
+doesn't edit INI files). The files are in the prefix under
+`drive_c/users/<you>/Documents/My Games/Fallout4/` (`My Documents` with older Wine):
+
+```ini
+; Fallout4Prefs.ini
+[Launcher]
+bEnableFileSelection=1
+
+; Fallout4Custom.ini
+[Archive]
+bInvalidateOlderFiles=1
+sResourceDataDirsFinal=
+```
 
 ## Finding games and looking inside archives
 
@@ -356,7 +423,8 @@ Prints the plugin's masters, header version and the game it was made for.
 | Log of every file operation (links, backups, restores, folders, installs, settings/cache writes, extractions) | `~/.local/share/beth-mod-manager/logs/bethmm.log` |
 | Installed mods (staged files) | `~/.local/share/beth-mod-manager/mods/<game>/<mod>/` |
 | Originals of game files replaced by mods | `~/.local/share/beth-mod-manager/backups/<game>/` |
-| Manifest (mod list, every link/backup/folder the app made, history) | `~/.local/share/beth-mod-manager/manifest.db` |
+| Copies of `plugins.txt`, made before each change | `~/.local/share/beth-mod-manager/plugins-backups/<game>/` |
+| Manifest (mod list, every link/backup/folder the app made, plugins.txt lines it manages, history) | `~/.local/share/beth-mod-manager/manifest.db` |
 
 ## Running the tests
 
@@ -375,8 +443,9 @@ The rules live in `bethmm/placement.py` and are applied in order:
 
 1. **Wrapper folders** — a single unrecognised top-level folder such as
    `CoolMod v1.2/` is stepped into (repeatedly). Loose readmes next to it are ignored.
-2. **FOMOD** — `fomod/ModuleConfig.xml` means a guided installer (phase 4); for now
-   you pick which sub-folders to install.
+2. **FOMOD** — `fomod/ModuleConfig.xml` means a guided installer: it runs, and the
+   files of the options you choose go into `Data/` (`bethmm/fomod.py`). Or you pick
+   which sub-folders to install.
 3. **Data folder** — a `Data/` folder at the root means the root is the game folder
    (typical for script extenders: loader `.exe` + `.dll`s + `Data/`).
 4. **Data content** — plugins (`.esp/.esm/.esl`), archives (`.ba2/.bsa`) or known Data
