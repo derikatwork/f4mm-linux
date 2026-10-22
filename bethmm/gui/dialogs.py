@@ -1,13 +1,17 @@
 """Dialogs: the plan of a change (shown before it is made), verify/repair,
-installing a mod, and settings."""
+a FOMOD installer, installing a mod, and settings."""
 
 from __future__ import annotations
 
+import copy
 import dataclasses
+import html
 import os
 from pathlib import Path
+from typing import Callable
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QEvent, QObject, Qt, QTimer
+from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QButtonGroup,
@@ -26,7 +30,10 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QRadioButton,
+    QScrollArea,
     QSpinBox,
+    QSplitter,
+    QTextBrowser,
     QTabWidget,
     QTreeWidget,
     QTreeWidgetItem,
@@ -34,7 +41,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from bethmm import deploy, describe, service, staging
+from bethmm import deploy, describe, fomod, service, staging
 from bethmm.discovery import DiscoveredGame
 from bethmm.games import GAMES
 from bethmm.manifest import Manifest, ModRecord
@@ -46,6 +53,10 @@ MAX_ROWS = 2000
 
 _TARGET_TEXT = {Target.DATA: "the Data folder", Target.GAME_ROOT: "the game folder (next to the .exe)",
                 Target.UNKNOWN: "an unknown place"}
+
+
+def _escape(text: str) -> str:
+    return html.escape(text, quote=False)
 
 
 def _label(text: str, *, wrap: bool = True, selectable: bool = True) -> QLabel:
@@ -66,6 +77,7 @@ def _ops_text(result: deploy.SyncResult | None, names: dict[int, str]) -> str:
         lines += result.forgotten
     for op in result.done:
         lines.append(describe.describe_op(op, names))
+    lines += describe.plugins_lines(result.plugins)
     for path, reason in result.plan.blocked:
         lines.append(f"! not deployed: {path}: {reason}")
     for warning in result.warnings:
@@ -194,14 +206,237 @@ class VerifyDialog(QDialog):
         layout.addWidget(buttons)
 
 
+_TYPE_NOTES = {fomod.OptionType.REQUIRED: "required", fomod.OptionType.RECOMMENDED: "recommended",
+               fomod.OptionType.NOT_USABLE: "can't be used", fomod.OptionType.COULD_BE_USABLE: "may not work"}
+_GROUP_HELP = {fomod.GroupType.EXACTLY_ONE: "choose one", fomod.GroupType.AT_MOST_ONE: "choose one or none",
+               fomod.GroupType.AT_LEAST_ONE: "choose one or more", fomod.GroupType.ANY: "choose any",
+               fomod.GroupType.ALL: "all are installed"}
+
+
+class FomodDialog(QDialog):
+    """A FOMOD installer, step by step: each group's options (one to choose
+    with round buttons, several with tick boxes), the description and picture
+    of the option under the mouse, Back and Next, Install at the last step.
+    The choices are made in ``wizard``."""
+
+    def __init__(self, wizard: fomod.Wizard, prepared: staging.Prepared, *, note: str = "",
+                 parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.wizard = wizard
+        self.prepared = prepared
+        module = wizard.module
+        self.setWindowTitle(f"{module.name}: installer")
+        self.resize(900, 620)
+        layout = QVBoxLayout(self)
+        about = ", ".join(x for x in (f"version {module.info.version}" if module.info.version else "",
+                                      f"by {module.info.author}" if module.info.author else "") if x)
+        layout.addWidget(_label(f"<b>{_escape(module.name)}</b>" + (f" ({_escape(about)})" if about else "")))
+        if note:
+            layout.addWidget(_label(note))
+        self.step_label = _label("")
+        layout.addWidget(self.step_label)
+        split = QSplitter(Qt.Orientation.Horizontal)
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        split.addWidget(self.scroll)
+        side = QWidget()
+        side_layout = QVBoxLayout(side)
+        self.image = QLabel()
+        self.image.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.image.setMinimumSize(320, 200)
+        side_layout.addWidget(self.image)
+        self.description = QTextBrowser()
+        side_layout.addWidget(self.description, 1)
+        split.addWidget(side)
+        split.setStretchFactor(0, 3)
+        split.setStretchFactor(1, 2)
+        layout.addWidget(split, 1)
+        self.problem_label = _label("")
+        layout.addWidget(self.problem_label)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
+        self.back_button = buttons.addButton("Back", QDialogButtonBox.ButtonRole.ActionRole)
+        self.next_button = buttons.addButton("Next", QDialogButtonBox.ButtonRole.ActionRole)
+        self.back_button.clicked.connect(self.back)
+        self.next_button.clicked.connect(self.next)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        index: dict[str, str] = {}
+        for f in prepared.files:
+            index.setdefault(f.upper(), f)
+        self._files = index
+        self.step = wizard.next_step(None)
+        self.history: list[int] = []
+        #: Per group of the step shown: its option widgets.
+        self.widgets: list[list[QCheckBox | QRadioButton]] = []
+        self._hover: dict[QObject, fomod.Option] = {}
+        self._show_step()
+
+    # ------------------------------------------------------------ one step
+
+    def _show_step(self) -> None:
+        self._hover.clear()
+        self.widgets = []
+        page = QWidget()
+        page_layout = QVBoxLayout(page)
+        step = self.step
+        visible = self.wizard.visible_steps()
+        if step is None:
+            self.step_label.setText("This installer has no options to choose.")
+        else:
+            s = self.wizard.module.steps[step]
+            self.step_label.setText(f"<b>Step {visible.index(step) + 1} of {len(visible)}:</b> "
+                                    f"{_escape(s.name or '(unnamed)')}")
+            selection = self.wizard.selection(step)
+            first: fomod.Option | None = None
+            for g, group in enumerate(s.groups):
+                box = QGroupBox(f"{group.name or 'Options'} ({_GROUP_HELP[group.type]})")
+                box_layout = QVBoxLayout(box)
+                single = group.type in (fomod.GroupType.EXACTLY_ONE, fomod.GroupType.AT_MOST_ONE)
+                exclusive = QButtonGroup(box) if single else None
+                widgets: list[QCheckBox | QRadioButton] = []
+                for i, option in enumerate(group.options):
+                    kind = self.wizard.option_type(step, g, i)
+                    text = option.name + (f"  ({_TYPE_NOTES[kind]})" if kind in _TYPE_NOTES else "")
+                    widget = QRadioButton(text) if single else QCheckBox(text)
+                    if exclusive is not None:
+                        exclusive.addButton(widget)
+                    widget.setChecked(i in selection[g])
+                    widget.setEnabled(not self.wizard.locked(step, g, i))
+                    widget.toggled.connect(lambda _on, g=g: self._changed(g))
+                    widget.installEventFilter(self)
+                    self._hover[widget] = option
+                    widget.clicked.connect(lambda _c=False, option=option: self._describe(option))
+                    box_layout.addWidget(widget)
+                    widgets.append(widget)
+                    first = first or option
+                if group.type is fomod.GroupType.AT_MOST_ONE:
+                    none = QRadioButton("None")
+                    exclusive.addButton(none)
+                    none.setChecked(not selection[g])
+                    none.toggled.connect(lambda _on, g=g: self._changed(g))
+                    box_layout.addWidget(none)
+                self.widgets.append(widgets)
+                page_layout.addWidget(box)
+            if first is not None:
+                self._describe(first)
+        page_layout.addStretch(1)
+        self.scroll.setWidget(page)
+        self.back_button.setEnabled(bool(self.history))
+        self._update()
+
+    def _chosen(self, g: int) -> list[int]:
+        return [i for i, w in enumerate(self.widgets[g]) if w.isChecked()]
+
+    def _changed(self, g: int) -> None:
+        if self.step is None:
+            return
+        chosen = self._chosen(g)
+        if self.wizard.problem(self.step, g, chosen) is None:
+            self.wizard.choose(self.step, g, chosen)
+        self._update()
+
+    def problems(self) -> list[str]:
+        if self.step is None:
+            return []
+        return [why for g in range(len(self.widgets))
+                if (why := self.wizard.problem(self.step, g, self._chosen(g))) is not None]
+
+    def _update(self) -> None:
+        problems = self.problems()
+        self.problem_label.setText("<span style='color:#c0392b'>" + _escape("; ".join(problems)) + "</span>"
+                                   if problems else "")
+        last = self.step is None or self.wizard.next_step(self.step) is None
+        self.next_button.setText("Install" if last else "Next")
+        self.next_button.setEnabled(not problems)
+        if self.step is not None:  # a choice can show or hide later steps
+            visible = self.wizard.visible_steps()
+            name = self.wizard.module.steps[self.step].name or "(unnamed)"
+            self.step_label.setText(f"<b>Step {visible.index(self.step) + 1} of {len(visible)}:</b> {_escape(name)}")
+
+    def _describe(self, option: fomod.Option) -> None:
+        self.description.setPlainText(f"{option.name}\n\n{option.description or ''}".strip())
+        pixmap = QPixmap()
+        if option.image:
+            rel = f"{self.wizard.module.root}/{option.image}" if self.wizard.module.root else option.image
+            actual = self._files.get(rel.upper())
+            if actual is not None:
+                pixmap = QPixmap(str(self.prepared.files_dir / actual))
+        self.image.setVisible(not pixmap.isNull())
+        if pixmap.isNull():
+            self.image.clear()
+        else:
+            self.image.setPixmap(pixmap.scaled(self.image.width(), max(self.image.height(), 200),
+                                               Qt.AspectRatioMode.KeepAspectRatio,
+                                               Qt.TransformationMode.SmoothTransformation))
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if event.type() == QEvent.Type.Enter and watched in self._hover:
+            self._describe(self._hover[watched])
+        return super().eventFilter(watched, event)
+
+    # ------------------------------------------------------------ moving on
+
+    def next(self) -> None:
+        if self.problems():
+            return
+        following = None if self.step is None else self.wizard.next_step(self.step)
+        if following is None:
+            self.accept()
+            return
+        self.history.append(self.step)
+        self.step = following
+        self._show_step()
+
+    def back(self) -> None:
+        if self.history:
+            self.step = self.history.pop()
+            self._show_step()
+
+
+def run_fomod(prepared: staging.Prepared, game: DiscoveredGame | None, run_dialog: Callable[[QDialog], bool], *,
+              replace: ModRecord | None = None, wizard: fomod.Wizard | None = None,
+              parent: QWidget | None = None) -> tuple[staging.Prepared | None, fomod.Wizard | None, str]:
+    """Run *prepared*'s FOMOD installer (*wizard*: again, with the choices made
+    before). Returns the prepared archive planned with the chosen files (None:
+    cancelled), the wizard, and a note for the user (the installer couldn't
+    be run, so its folders are chosen instead; which choices were reused)."""
+    note = ""
+    if wizard is None:
+        try:
+            module = service.fomod_module(prepared)
+        except fomod.FomodError as exc:
+            return prepared, None, f"{exc}. Choose which of its folders to install."
+        wizard = fomod.Wizard(module, service.fomod_file_state(game))
+        if game is not None:
+            existing, previous = service.previous_fomod_choices(prepared, game.game_id, replace=replace)
+            if previous:
+                skipped = wizard.apply_choices(previous)
+                note = (f"The choices made when '{existing.name}' was installed are preselected"
+                        + (f" (not available any more: {', '.join(skipped)})." if skipped else "."))
+    else:
+        wizard = copy.copy(wizard)
+        wizard.selections = copy.deepcopy(wizard.selections)
+    needs = wizard.unmet_dependencies()
+    if needs:
+        note += f" The installer says it needs: {needs}."
+    if wizard.module.steps and not run_dialog(FomodDialog(wizard, prepared, note=note.strip(), parent=parent)):
+        return None, wizard, ""
+    return service.apply_fomod(prepared, wizard), wizard, note.strip()
+
+
 class InstallDialog(QDialog):
     """Install one prepared (extracted) archive: where its files go, whether
     it updates an installed mod, and exactly what changes in the game folder."""
 
     def __init__(self, prepared: staging.Prepared, games: list[DiscoveredGame], settings: Settings, *,
                  replace: ModRecord | None = None, current: str | None = None, can_install: bool = True,
-                 why_not: str = "", parent: QWidget | None = None) -> None:
+                 why_not: str = "", fomod_wizard: fomod.Wizard | None = None,
+                 run_dialog: Callable[[QDialog], bool] | None = None, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        #: The FOMOD installer as last run (None: there is none, or it couldn't run).
+        self.fomod_wizard = fomod_wizard
+        self._fomod_plan = prepared.plan
+        self._run_dialog = run_dialog or (lambda dialog: dialog.exec() == QDialog.DialogCode.Accepted)
         self.prepared = prepared
         self.games = games
         self.settings = settings
@@ -253,7 +488,14 @@ class InstallDialog(QDialog):
         self.choice_error = _label("")
         choose.addWidget(self.choice_error)
         self.choose_toggle = QCheckBox("Choose the folders myself")
-        layout.addWidget(self.choose_toggle)
+        toggle_row = QHBoxLayout()
+        toggle_row.addWidget(self.choose_toggle)
+        toggle_row.addStretch(1)
+        self.fomod_button = QPushButton("Run its installer again...")
+        self.fomod_button.setVisible(fomod_wizard is not None)
+        self.fomod_button.clicked.connect(self.run_installer_again)
+        toggle_row.addWidget(self.fomod_button)
+        layout.addLayout(toggle_row)
         layout.addWidget(self.choose_box)
 
         update_box = QGroupBox("New mod or update")
@@ -392,6 +634,24 @@ class InstallDialog(QDialog):
             widget.blockSignals(False)
 
     def _options_changed(self, *_args) -> None:
+        self._refresh()
+
+    def run_installer_again(self) -> None:
+        """Change the choices made in the mod's FOMOD installer."""
+        if self.fomod_wizard is None:
+            return
+        base = dataclasses.replace(self.prepared, plan=self._fomod_plan)
+        ran, wizard, _note = run_fomod(base, self.game, self._run_dialog, wizard=self.fomod_wizard, parent=self)
+        if ran is None:
+            return
+        self.prepared, self.fomod_wizard = ran, wizard
+        if self.choose_toggle.isChecked():
+            self.choose_toggle.setChecked(False)
+        self._choice_pending = False
+        self.folder_tree.blockSignals(True)  # refilled: no choice of the user's
+        self._fill_folders()
+        self.folder_tree.blockSignals(False)
+        self._pick_update_target()
         self._refresh()
 
     def _fill_folders(self) -> None:

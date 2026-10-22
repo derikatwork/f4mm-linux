@@ -223,6 +223,18 @@ def fomod_file_state(game: DiscoveredGame | None) -> fomod.FileStateFn:
     return state
 
 
+def previous_fomod_choices(prepared: staging.Prepared, game_id: str, *, replace: ModRecord | None = None,
+                           new: bool = False, name: str | None = None) -> tuple[ModRecord | None, list[dict] | None]:
+    """The mod this archive would update (*replace*, else what the update
+    rules find before its installer has run) and the installer choices made
+    when that mod was installed."""
+    existing = replace
+    if existing is None and not new and paths.manifest_path().exists():
+        with Manifest() as manifest:
+            existing = staging.find_existing(manifest, game_id, prepared, name)
+    return existing, remembered_fomod_choices(existing)
+
+
 def remembered_fomod_choices(mod: ModRecord | None) -> list[dict] | None:
     """The installer choices made when *mod* was installed (None: none)."""
     if mod is None or not isinstance(mod.plan.get("fomod"), dict):

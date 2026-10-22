@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 from typing import Callable
 
-from bethmm import deploy, describe, fomod, paths, plugins, service, staging, winecheck
+from bethmm import deploy, describe, fomod, plugins, service, staging, winecheck
 from bethmm.discovery import DiscoveredGame, get_games
 from bethmm.games import GAMES
 from bethmm.manifest import Manifest, ManifestError, ModRecord
@@ -484,12 +484,12 @@ def _run_fomod(prepared: staging.Prepared, game: DiscoveredGame, args) -> stagin
     being updated was installed, else the installer's defaults. None: cancelled."""
     module = service.fomod_module(prepared)
     wizard = fomod.Wizard(module, service.fomod_file_state(game))
-    existing = None
-    if paths.manifest_path().exists() and not args.new:
+    replace = None
+    if args.replace:
         with Manifest() as manifest:
-            existing = _find(manifest, game.game_id, args.replace) if args.replace else \
-                staging.find_existing(manifest, game.game_id, prepared, args.name)
-    previous = service.remembered_fomod_choices(existing)
+            replace = _find(manifest, game.game_id, args.replace)
+    existing, previous = service.previous_fomod_choices(prepared, game.game_id, replace=replace, new=args.new,
+                                                        name=args.name)
     title = module.name + "".join(f", {w}" for w in (
         f"version {module.info.version}" if module.info.version else "",
         f"by {module.info.author}" if module.info.author else "") if w)

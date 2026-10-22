@@ -40,9 +40,11 @@ from PySide6.QtWidgets import (
     QToolBar,
     QTreeWidget,
     QTreeWidgetItem,
+    QVBoxLayout,
+    QWidget,
 )
 
-from bethmm import APP_NAME, __version__, deploy, describe, paths, service, staging, winecheck
+from bethmm import APP_NAME, __version__, deploy, describe, paths, plugins, service, staging, winecheck
 from bethmm.archive import ArchiveError
 from bethmm.discovery import DiscoveredGame, get_games
 from bethmm.games import GAMES
@@ -57,15 +59,31 @@ from bethmm.gui.dialogs import (
     PlanDialog,
     SettingsDialog,
     VerifyDialog,
+    run_fomod,
 )
-from bethmm.gui.models import COL_CONFLICTS, COL_ENABLED, COL_FILES, COL_NAME, COL_POS, COL_VERSION, ModListModel
+from bethmm.gui.models import (
+    COL_CONFLICTS,
+    COL_ENABLED,
+    COL_FILES,
+    COL_NAME,
+    COL_POS,
+    COL_VERSION,
+    PCOL_ACTIVE,
+    PCOL_FLAGS,
+    PCOL_MOD,
+    PCOL_NAME,
+    PCOL_NOTES,
+    PCOL_POS,
+    ModListModel,
+    PluginListModel,
+)
 from bethmm.gui.tasks import TaskRunner
 
 log = logging.getLogger(__name__)
 
 #: Errors that are explained to the user as they are (no traceback).
 EXPECTED_ERRORS = (deploy.DeployError, staging.StagingError, ManifestError, service.ServiceError, ArchiveError,
-                   SettingsError, ValueError, OSError)
+                   SettingsError, plugins.PluginsError, ValueError, OSError)
 
 #: Game id -> its domain on nexusmods.com.
 NEXUS_DOMAINS = {"fallout4": "fallout4", "skyrimse": "skyrimspecialedition", "skyrim": "skyrim",
@@ -171,6 +189,8 @@ class MainWindow(QMainWindow):
         self.act_refresh = action("Refresh", self.refresh, sp.SP_BrowserReload, "F5")
         self.act_rescan = action("Rescan for games", self.rescan_games)
         self.act_game_settings = action("Game settings...", self.open_game_settings)
+        self.act_sync_plugins = action("Update plugins.txt", self.sync_plugins,
+                                       tip="Add the deployed mods' plugins to plugins.txt (and take out those gone)")
         self.act_settings = action("Settings...", self.open_settings, sp.SP_FileDialogInfoView)
         self.act_enable = action("Enable", lambda: self.set_selected_enabled(True))
         self.act_disable = action("Disable", lambda: self.set_selected_enabled(False))
@@ -190,7 +210,8 @@ class MainWindow(QMainWindow):
         file_menu.addSeparator()
         file_menu.addAction(action("Quit", self.close, shortcut="Ctrl+Q"))
         game_menu = menu.addMenu("&Game")
-        game_menu.addActions([self.act_deploy, self.act_purge, self.act_verify, self.act_check_links])
+        game_menu.addActions([self.act_deploy, self.act_purge, self.act_verify, self.act_check_links,
+                              self.act_sync_plugins])
         game_menu.addSeparator()
         game_menu.addActions([self.act_game_settings, self.act_rescan, self.act_refresh])
         self.mod_menu = menu.addMenu("&Mod")
@@ -239,6 +260,37 @@ class MainWindow(QMainWindow):
             header.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
         self.table.selectionModel().selectionChanged.connect(lambda *_: self._selection_changed())
 
+        self.plugin_model = PluginListModel(self)
+        self.plugin_model.activeRequested.connect(self.set_plugin_active)
+        self.plugin_model.moveRequested.connect(self.move_plugin)
+        self.plugin_table = ModTable()
+        self.plugin_table.setModel(self.plugin_model)
+        self.plugin_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.plugin_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.plugin_table.setDragEnabled(True)
+        self.plugin_table.setAcceptDrops(True)
+        self.plugin_table.setDropIndicatorShown(True)
+        self.plugin_table.setDragDropMode(QAbstractItemView.DragDropMode.DragDrop)
+        self.plugin_table.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.plugin_table.setDragDropOverwriteMode(False)
+        self.plugin_table.verticalHeader().hide()
+        self.plugin_table.setAlternatingRowColors(True)
+        pheader = self.plugin_table.horizontalHeader()
+        pheader.setSectionResizeMode(PCOL_NOTES, QHeaderView.ResizeMode.Stretch)
+        for col in (PCOL_ACTIVE, PCOL_POS, PCOL_NAME, PCOL_MOD, PCOL_FLAGS):
+            pheader.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
+        plugins_page = QWidget()
+        plugins_layout = QVBoxLayout(plugins_page)
+        plugins_layout.setContentsMargins(0, 0, 0, 0)
+        self.plugins_info = QLabel()
+        self.plugins_info.setWordWrap(True)
+        self.plugins_info.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        plugins_layout.addWidget(self.plugins_info)
+        plugins_layout.addWidget(self.plugin_table, 1)
+        self.lists = QTabWidget()
+        self.lists.addTab(self.table, "Mods")
+        self.lists.addTab(plugins_page, "Plugins")
+
         self.details = QTabWidget()
         self.files_tree = QTreeWidget()
         self.files_tree.setHeaderLabels(["File", "In the game folder", "Status"])
@@ -253,7 +305,7 @@ class MainWindow(QMainWindow):
         self.details.addTab(self.info, "Info")
 
         top = QSplitter(Qt.Orientation.Horizontal)
-        top.addWidget(self.table)
+        top.addWidget(self.lists)
         top.addWidget(self.details)
         top.setStretchFactor(0, 3)
         top.setStretchFactor(1, 2)
@@ -408,11 +460,74 @@ class MainWindow(QMainWindow):
             self.table.setAutoScroll(True)
         self.state_label.setText(state_text)
         self.dry_label.setText("<b>DRY-RUN MODE</b>" if self.settings.dry_run else "")
+        self._refresh_plugins(game)
         self.history.clear()
         for e in reversed(history):
             result = e.status if e.status == "done" else f"{e.status}: {e.detail or ''}"
             QTreeWidgetItem(self.history, [e.ts.replace("T", " ")[:19], e.action, e.path or (e.detail or ""), result])
         self._selection_changed()
+
+    def _refresh_plugins(self, game: DiscoveredGame | None) -> None:
+        """Reload the load order shown on the Plugins tab."""
+        rows: list[plugins.PluginInfo] = []
+        names: dict[int, str] = {}
+        if game is None:
+            text = ""
+        else:
+            target = self.target
+            try:
+                with Manifest() as manifest, manifest.snapshot():
+                    rows = plugins.load_order(manifest, target)
+                    names = _names(manifest, game.game_id)
+            except Exception as exc:  # the window stays usable whatever is on disk
+                if not isinstance(exc, (ManifestError, OSError, sqlite3.Error)):
+                    log.error("could not read the load order: %s", "".join(traceback.format_exception(exc)))
+                self.note(f"! could not read the load order: {exc}")
+            where = _escape(str(game.plugins_txt)) if game.plugins_txt else \
+                "not known (set the Wine prefix in Game settings)"
+            text = (f"Load order: later plugins win. Tick to switch a plugin on, drag to move it. "
+                    f"plugins.txt: {where}")
+            if GAMES[game.game_id].timestamp_load_order:
+                text += (". This game loads plugins by file date: the app dates the plugins it installed (after "
+                         "the others), so only those can be moved")
+            problems = sum(bool(p.missing or p.late) for p in rows if p.active)
+            if problems:
+                text += f". <b>{problems} plugin(s) need a master that isn't loaded before them</b>"
+        self.plugin_model.set_rows(rows, names)
+        self.plugins_info.setText(text)
+        self.lists.setTabText(1, f"Plugins ({sum(p.active for p in rows)})" if rows else "Plugins")
+
+    def set_plugin_active(self, name: str, active: bool) -> None:
+        self._plugins_change(lambda manifest, target, dry: plugins.set_active(manifest, target, [name], active,
+                                                                              dry_run=dry))
+
+    def move_plugin(self, name: str, position: int) -> None:
+        self._plugins_change(lambda manifest, target, dry: plugins.move(manifest, target, name, position,
+                                                                        dry_run=dry))
+
+    def sync_plugins(self) -> None:
+        self._plugins_change(lambda manifest, target, dry: plugins.sync(manifest, target, dry_run=dry))
+
+    def _plugins_change(self, change: Callable[[Manifest, deploy.GameTarget, bool], Any]) -> None:
+        self._fresh_settings()
+        target = self.target
+        if target is None:
+            return
+        dry = self.settings.dry_run
+
+        def job() -> plugins.PluginsChange | None:
+            with Manifest(lock=not dry) as manifest:
+                return change(manifest, target, dry)
+
+        def done(result: plugins.PluginsChange | None) -> None:
+            lines = describe.plugins_lines(result) or ["plugins.txt is already as it should be."]
+            lines += [f"! {w}" for w in (result.warnings if result is not None else [])]
+            self.note("\n".join(lines))
+            if dry:
+                self.tell("Dry run", "\n".join(lines) + f"\n\n{DRY_RUN_NOTE}")
+            self.refresh()
+
+        self._run(job, done)
 
     def _busy_changed(self, busy: bool) -> None:
         self.progress.setVisible(busy or self._installing)
@@ -455,6 +570,7 @@ class MainWindow(QMainWindow):
             return
         done = describe.summary(describe.changes(result))
         lines = [f"{title} {done[0].upper() + done[1:]}." if done else f"{title} Nothing needed to change."]
+        lines += describe.plugins_lines(result.plugins)
         lines += [f"! not deployed: {path}: {reason}" for path, reason in result.plan.blocked]
         lines += [f"! {w}" for w in result.warnings]
         lines += [f"! failed: {describe.describe_op(op, names)}: {reason}" for op, reason in result.failed]
@@ -704,6 +820,13 @@ class MainWindow(QMainWindow):
 
         self.tasks.run(prepare, lambda prepared: self._show_install(prepared, replace), failed)
 
+    def _fomod_game(self, prepared: staging.Prepared, replace: ModRecord | None) -> DiscoveredGame | None:
+        """The game a FOMOD installer's conditions are answered from: the mod
+        being updated's, else the one the files are for, else the one shown."""
+        wanted = replace.game_id if replace is not None else \
+            service.detected_game(prepared.plan, self.settings, [g.game_id for g in self.games])
+        return next((g for g in self.games if g.game_id == wanted), None) or self.game
+
     def _show_install(self, prepared: staging.Prepared, replace: ModRecord | None) -> None:
         if self._closing:
             staging.discard(prepared)
@@ -714,9 +837,23 @@ class MainWindow(QMainWindow):
             if replace is not None:  # the mod that was selected, if it is still that mod
                 with Manifest() as manifest:
                     replace = service.current(manifest, [replace])[0]
+            wizard = None
+            if prepared.plan.is_fomod and prepared.plan.fomod_choices is None:
+                ran, wizard, note = run_fomod(prepared, self._fomod_game(prepared, replace), self.run_dialog,
+                                              replace=replace, parent=self)
+                if note:
+                    self.note(note if ran is not prepared else f"! {note}")
+                if ran is None:
+                    staging.discard(prepared)
+                    self.note(f"Cancelled installing {prepared.source.name}.")
+                    self.refresh()
+                    self._next_install()
+                    return
+                prepared = ran
             dialog = InstallDialog(prepared, self.games, self.settings, replace=replace,
                                    current=self.game.game_id if self.game is not None else None,
-                                   can_install=not self.settings.dry_run, why_not=DRY_RUN_NOTE, parent=self)
+                                   can_install=not self.settings.dry_run, why_not=DRY_RUN_NOTE,
+                                   fomod_wizard=wizard, run_dialog=self.run_dialog, parent=self)
         except Exception as exc:
             staging.discard(prepared)
             self.show_error(exc)
