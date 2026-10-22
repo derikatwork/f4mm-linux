@@ -1,5 +1,5 @@
-"""Mod management commands (phase 2): install, list, enable/disable, move,
-uninstall, conflicts, deploy, purge, verify, status, check-links, history, use.
+"""Mod management commands: install, list, enable/disable, move, uninstall,
+conflicts, deploy, purge, verify, status, check-links, history, use, plugins.
 
 Every command that changes a game folder goes through ``deploy`` and accepts
 ``--dry-run`` (also switched on for everything by ``bethmm config --dry-run on``),
@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 from typing import Callable
 
-from bethmm import deploy, describe, fomod, paths, service, staging, winecheck
+from bethmm import deploy, describe, fomod, paths, plugins, service, staging, winecheck
 from bethmm.discovery import DiscoveredGame, get_games
 from bethmm.games import GAMES
 from bethmm.manifest import Manifest, ManifestError, ModRecord
@@ -76,6 +76,40 @@ def register(sub: argparse._SubParsersAction, error: type[Exception]) -> None:
     game_arg(p)
     dry_arg(p)
     p.set_defaults(func=cmd_move)
+
+    p = sub.add_parser("plugins", help="show the load order (plugins.txt); switch plugins on or off, move them")
+    game_arg(p)
+    p.set_defaults(func=cmd_plugins, plugins_cmd="list")
+    psub = p.add_subparsers(dest="plugins_cmd", metavar="")
+
+    def plugin_cmd(name: str, help_text: str):
+        q = psub.add_parser(name, help=help_text)
+        q.add_argument("--game", choices=sorted(GAMES), default=argparse.SUPPRESS,
+                       help="which game (default: the one chosen with 'bethmm use')")
+        return q
+
+    q = plugin_cmd("list", "show the load order (the default)")
+    q.add_argument("--json", action="store_true")
+    for name, word in (("enable", "on"), ("disable", "off")):
+        q = plugin_cmd(name, f"switch plugins {word} in plugins.txt")
+        q.add_argument("plugins", nargs="+", metavar="PLUGIN", help="number from 'bethmm plugins', name or part of it")
+        dry_arg(q)
+    q = plugin_cmd("move", "change a plugin's place in the load order (later loads win)")
+    q.add_argument("plugin", metavar="PLUGIN")
+    where = q.add_mutually_exclusive_group(required=True)
+    where.add_argument("--up", action="store_true", help="one place earlier")
+    where.add_argument("--down", action="store_true", help="one place later")
+    where.add_argument("--top", action="store_true", help="first (after the game's own masters)")
+    where.add_argument("--bottom", action="store_true", help="last")
+    where.add_argument("--to", type=int, metavar="N", help="to position N")
+    where.add_argument("--before", metavar="PLUGIN", help="just before this plugin")
+    where.add_argument("--after", metavar="PLUGIN", help="just after this plugin")
+    dry_arg(q)
+    q = plugin_cmd("sync", "add the deployed mods' plugins to plugins.txt (and take out the ones gone) now")
+    dry_arg(q)
+    q = plugin_cmd("sort", "sort the load order with a sorter such as LOOT (none is available yet)")
+    q.add_argument("--with", dest="sorter", default="loot", metavar="SORTER")
+    dry_arg(q)
 
     p = sub.add_parser("uninstall", help="remove a mod: undeploy it and delete its staged files")
     p.add_argument("mods", nargs="+", metavar="MOD")
@@ -166,7 +200,7 @@ def _context(args) -> tuple[Settings, list[DiscoveredGame]]:
 
 
 def _target(game: DiscoveredGame, settings: Settings) -> deploy.GameTarget:
-    return deploy.GameTarget(game.game_id, game.root, settings.override(game.game_id).link_mode)
+    return deploy.GameTarget(game.game_id, game.root, settings.override(game.game_id).link_mode, game.plugins_txt)
 
 
 def _dry(args, settings: Settings) -> bool:
@@ -230,6 +264,8 @@ def _report(result: deploy.SyncResult | None, manifest: Manifest, *, verbose: bo
         if verbose:
             for op in ops:
                 print(f"  {_describe_op(op, names)}")
+    for line in describe.plugins_lines(result.plugins):
+        print(f"  {line}")
     for path, reason in result.plan.blocked:
         print(f"  ! not deployed: {path}: {reason}")
     for warning in result.warnings:
@@ -557,6 +593,115 @@ def _ask_fomod(wizard: fomod.Wizard) -> bool:
     return True
 
 
+# ---------------------------------------------------------------- plugins
+
+
+def _find_plugin(order: list[plugins.PluginInfo], query: str) -> plugins.PluginInfo:
+    """A plugin by its number in 'bethmm plugins', its name (any case), or a unique part of its name."""
+    q = query.strip()
+    if q.isdecimal():
+        n = int(q)
+        if 1 <= n <= len(order):
+            return order[n - 1]
+        raise CliError(f"there is no plugin number {n} (1-{len(order)})")
+    exact = [p for p in order if p.name.lower() == q.lower()] \
+        or [p for p in order if p.name.rsplit(".", 1)[0].lower() == q.lower()]  # "Foo" for Foo.esp
+    if len(exact) == 1:
+        return exact[0]
+    if exact:
+        raise CliError(f"{query!r} is {' and '.join(p.name for p in exact)}; add the extension")
+    part = [p for p in order if q.lower() in p.name.lower()]
+    if len(part) == 1:
+        return part[0]
+    if not part:
+        raise CliError(f"no plugin matches {query!r}; see 'bethmm plugins'")
+    raise CliError(f"{query!r} matches {len(part)} plugins ({', '.join(p.name for p in part[:5])}); be more exact")
+
+
+def _plugin_notes(plugin: plugins.PluginInfo, names: dict[int, str]) -> str:
+    notes = []
+    if plugin.implicit:
+        notes.append("the game loads it itself")
+    if not plugin.present:
+        notes.append("not in Data")
+    if plugin.missing:
+        notes.append("needs " + ", ".join(plugin.missing) + " (not loaded)")
+    if plugin.late:
+        notes.append("loads before its master(s) " + ", ".join(plugin.late))
+    return "; ".join(notes)
+
+
+def cmd_plugins(args) -> int:
+    settings, games = _context(args)
+    game = _choose_game(args, settings, games)
+    target = _target(game, settings)
+    command = args.plugins_cmd or "list"
+    if command == "list":
+        with Manifest() as manifest:
+            order = plugins.load_order(manifest, target)
+            names = _mod_names(manifest, game.game_id)
+        if getattr(args, "json", False):
+            print(json.dumps([{"position": i + 1, "name": p.name, "active": p.active, "implicit": p.implicit,
+                               "present": p.present, "master": p.master, "light": p.light,
+                               "mod": names.get(p.mod_id) if p.mod_id is not None else None,
+                               "masters": p.masters, "missing": p.missing, "late": p.late}
+                              for i, p in enumerate(order)], indent=2))
+            return 0
+        where = game.plugins_txt or "unknown: set the Wine prefix with 'bethmm override'"
+        print(f"{game.name} -- load order ({len(order)} plugins; later ones win). plugins.txt: {where}")
+        if GAMES[game.game_id].timestamp_load_order:
+            print("  (this game loads plugins by file date: the app dates the plugins it installed, after the others)")
+        width = max((len(p.name) for p in order), default=0)
+        for i, p in enumerate(order, start=1):
+            box = "[*]" if p.implicit else "[x]" if p.active else "[ ]"
+            flag = "M" if p.master else " "
+            mod = names.get(p.mod_id, "?") if p.mod_id is not None else ""
+            print(f"{i:>4} {box} {flag} {p.name:<{width}}  {mod:<24}  {_plugin_notes(p, names)}".rstrip())
+        return 0 if not any(p.missing for p in order) else 1
+
+    dry = _dry(args, settings)
+    with Manifest(lock=not dry) as manifest:
+        try:
+            if command == "sync":
+                result = plugins.sync(manifest, target, dry_run=dry)
+            elif command == "sort":
+                result = plugins.sort(manifest, target, args.sorter, dry_run=dry)
+            else:
+                order = plugins.load_order(manifest, target)
+                if command in ("enable", "disable"):
+                    chosen = [_find_plugin(order, q).name for q in args.plugins]
+                    result = plugins.set_active(manifest, target, chosen, command == "enable", dry_run=dry)
+                else:
+                    plugin = _find_plugin(order, args.plugin)
+                    here = order.index(plugin)
+                    if args.up or args.down:
+                        to = here - 1 if args.up else here + 1
+                    elif args.top:
+                        to = sum(p.implicit for p in order)
+                    elif args.bottom:
+                        to = len(order)
+                    elif args.to is not None:
+                        to = args.to - 1
+                    else:
+                        other = order.index(_find_plugin(order, args.before or args.after))
+                        to = other - (other > here) + (1 if args.after else 0)
+                    result = plugins.move(manifest, target, plugin.name, to, dry_run=dry)
+        except plugins.PluginsError as exc:
+            raise CliError(str(exc)) from None
+    if result is None or not result.changed:
+        print("plugins.txt is already as it should be." if not dry else "Dry run: nothing would change.")
+        for warning in result.warnings if result is not None else ():
+            print(f"  ! {warning}")
+        return 0
+    if dry:
+        print("Dry run: nothing was changed.")
+    for line in describe.plugins_lines(result):
+        print(line)
+    for warning in result.warnings:
+        print(f"  ! {warning}")
+    return 0
+
+
 def _find(manifest: Manifest, game_id: str, query: str) -> ModRecord:
     try:
         return manifest.find_mod(game_id, query)
@@ -693,7 +838,9 @@ def cmd_purge(args) -> int:
             if root is None:
                 print(f"{GAMES[game_id].name}: nothing recorded.")
                 continue
-            target = deploy.GameTarget(game_id, Path(root), settings.override(game_id).link_mode)
+            found = by_id.get(game_id)
+            target = deploy.GameTarget(game_id, Path(root), settings.override(game_id).link_mode,
+                                       found.plugins_txt if found is not None else None)
             print(f"{GAMES[game_id].name}:")
             try:
                 result = deploy.purge(manifest, target, dry_run=dry, forget_missing=args.forget_missing)

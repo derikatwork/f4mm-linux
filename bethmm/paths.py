@@ -57,6 +57,11 @@ def backups_dir(game_id: str | None = None) -> Path:
     return base / game_id if game_id else base
 
 
+def plugins_backups_dir(game_id: str) -> Path:
+    """Copies of a game's plugins.txt, made before each change the app makes to it."""
+    return data_dir() / "plugins-backups" / game_id
+
+
 def tmp_dir() -> Path:
     return data_dir() / "tmp"
 

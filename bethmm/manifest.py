@@ -15,6 +15,10 @@ did to each game folder.
   it is gone;
 * ``games``: per game, the root the deployment belongs to and whether mods are
   currently deployed (``purge`` clears it);
+* ``plugins``: per game, the plugins whose plugins.txt lines the app manages
+  (those of the mods it deployed): whether the line is there, whether it is
+  active, and -- for a line the app took out because the plugin was no longer
+  deployed -- the plugin it came after, so it goes back to the same place;
 * ``journal``: an append-only history of every file operation.
 
 Paths inside a game folder are stored relative to the game root, in the exact
@@ -42,8 +46,8 @@ from typing import Iterator, Sequence
 from bethmm import paths
 from bethmm.pathresolve import fold_path
 
-#: 2 added ``left_alone`` and ``deployed.size`` / ``deployed.mtime_ns``.
-SCHEMA_VERSION = 2
+#: 2 added ``left_alone`` and ``deployed.size`` / ``deployed.mtime_ns``; 3 added ``plugins``.
+SCHEMA_VERSION = 3
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -118,6 +122,15 @@ CREATE TABLE IF NOT EXISTS journal (
     status TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS journal_unfinished ON journal (status) WHERE status = 'intent';
+CREATE TABLE IF NOT EXISTS plugins (
+    game_id TEXT NOT NULL,
+    name_key TEXT NOT NULL,
+    name TEXT NOT NULL,
+    listed INTEGER NOT NULL DEFAULT 1,
+    active INTEGER NOT NULL DEFAULT 1,
+    after TEXT,
+    PRIMARY KEY (game_id, name_key)
+);
 """
 
 
@@ -163,6 +176,24 @@ class ModRecord:
 
     def staging_dir(self) -> Path:
         return paths.mods_dir(self.game_id) / self.folder
+
+
+@dataclass(frozen=True)
+class PluginRecord:
+    """A plugin whose plugins.txt line the app manages."""
+
+    game_id: str
+    name: str
+    #: Its line is in plugins.txt (as far as the app knows).
+    listed: bool = True
+    active: bool = True
+    #: Lower-case name of the plugin it came after when the app took its line
+    #: out ("" = it was the first); None while it is listed.
+    after: str | None = None
+
+    @property
+    def key(self) -> str:
+        return self.name.lower()
 
 
 @dataclass(frozen=True)
@@ -618,6 +649,20 @@ class Manifest:
 
     def forget_link(self, game_id: str, path: str) -> None:
         self._db.execute("DELETE FROM deployed WHERE game_id = ? AND path_key = ?", (game_id, fold_path(path)))
+
+    def plugin_records(self, game_id: str) -> dict[str, PluginRecord]:
+        rows = self._db.execute("SELECT * FROM plugins WHERE game_id = ?", (game_id,))
+        return {r["name_key"]: PluginRecord(r["game_id"], r["name"], bool(r["listed"]), bool(r["active"]), r["after"])
+                for r in rows}
+
+    def record_plugin(self, record: PluginRecord) -> None:
+        self._db.execute(
+            "INSERT OR REPLACE INTO plugins (game_id, name_key, name, listed, active, after) VALUES (?, ?, ?, ?, ?, ?)",
+            (record.game_id, record.key, record.name, int(record.listed), int(record.active), record.after),
+        )
+
+    def forget_plugin(self, game_id: str, name: str) -> None:
+        self._db.execute("DELETE FROM plugins WHERE game_id = ? AND name_key = ?", (game_id, name.lower()))
 
     def backups(self, game_id: str) -> dict[str, BackupRecord]:
         rows = self._db.execute("SELECT * FROM backups WHERE game_id = ?", (game_id,))

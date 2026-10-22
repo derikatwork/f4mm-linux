@@ -55,7 +55,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from typing import Iterable
 
-from bethmm import paths
+from bethmm import paths, plugins
 from bethmm.games import GAMES
 from bethmm.manifest import (
     BackupRecord,
@@ -106,6 +106,9 @@ class GameTarget:
     game_id: str
     root: Path
     link_mode: str = "symlink"
+    #: The game's plugins.txt (in its Wine prefix), kept in line with the
+    #: deployed plugins after each deploy and purge; None: not known.
+    plugins_txt: Path | None = None
 
     def __post_init__(self) -> None:
         if self.link_mode not in LINK_MODES:
@@ -143,6 +146,8 @@ class SyncPlan:
     #: Ids of journal entries an interrupted run left unfinished; this plan
     #: reconciles them, so they are closed when it runs without failures.
     unfinished: list[int] = field(default_factory=list)
+    #: The game's plugins.txt, brought in line once the plan has run (None: not known).
+    plugins_txt: Path | None = None
 
     @property
     def changes(self) -> list[Op]:
@@ -159,6 +164,8 @@ class SyncResult:
     #: Ops that could not be carried out, with the reason.
     failed: list[tuple[Op, str]] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    #: What changed in plugins.txt (or, in a dry run, would); None: nothing known about it.
+    plugins: plugins.PluginsChange | None = None
     #: purge(forget_missing): what the app forgot about a game folder that is gone.
     forgotten: list[str] = field(default_factory=list)
 
@@ -590,7 +597,8 @@ def plan_sync(manifest: Manifest, target: GameTarget, *, purge: bool = False) ->
     game_id = target.game_id
     root, root_warnings, switch_from = _check_root(manifest, target, purge=purge)
 
-    plan = SyncPlan(game_id, root, target.link_mode, purge=purge, warnings=root_warnings, switch_from=switch_from)
+    plan = SyncPlan(game_id, root, target.link_mode, purge=purge, warnings=root_warnings, switch_from=switch_from,
+                    plugins_txt=target.plugins_txt)
     desired: dict[str, tuple[ModRecord, ModFile]] = {}
     for key, candidates in ({} if purge else _candidates(manifest, game_id)).items():
         if len(candidates) > 1:
@@ -1011,6 +1019,7 @@ def apply_plan(manifest: Manifest, plan: SyncPlan, *, dry_run: bool = False) -> 
     result = SyncResult(plan, dry_run, warnings=list(plan.warnings))
     if dry_run:
         result.done = list(plan.ops)
+        _sync_plugins(manifest, plan, result, _deployed_after(manifest, plan))
         return result
     if plan.switch_from is not None:
         result.warnings.extend(forget_game(manifest, plan.game_id, aside=PREVIOUS_FOLDER_DIR))
@@ -1060,7 +1069,36 @@ def apply_plan(manifest: Manifest, plan: SyncPlan, *, dry_run: bool = False) -> 
                 continue
             if fold_path(entry.path or "") in handled or not _unreconciled_link(entry, plan.root, deployed):
                 manifest.finish_journal(entry.id, "abandoned", "cleaned up by a later run")
+    _sync_plugins(manifest, plan, result)
     return result
+
+
+def _deployed_after(manifest: Manifest, plan: SyncPlan) -> dict[str, DeployedFile]:
+    """The app's links as they will be once *plan* has run."""
+    out = dict(manifest.deployed(plan.game_id))
+    for op in plan.ops:
+        if op.kind in ("unlink", "forget"):
+            out.pop(fold_path(op.path), None)
+        elif op.kind == "link":
+            out[fold_path(op.path)] = DeployedFile(plan.game_id, op.path, op.mod_id or 0, op.source or "",
+                                                    plan.link_mode)
+    return out
+
+
+def _sync_plugins(manifest: Manifest, plan: SyncPlan, result: SyncResult,
+                  deployed: dict[str, DeployedFile] | None = None) -> None:
+    """Bring plugins.txt in line with the plugins now linked into Data. A
+    problem with it is a warning: the game folder itself is done."""
+    target = GameTarget(plan.game_id, plan.root, plan.link_mode, plan.plugins_txt)
+    try:
+        result.plugins = plugins.sync(manifest, target, dry_run=result.dry_run, deployed=deployed)
+    except (OSError, plugins.PluginsError) as exc:
+        reason = f"{exc.strerror}: {exc.filename}" if isinstance(exc, OSError) and exc.strerror else str(exc)
+        log.error("could not update plugins.txt (%s): %s", plan.plugins_txt, reason)
+        result.warnings.append(f"plugins.txt wasn't updated: {reason}")
+        return
+    if result.plugins is not None:
+        result.warnings.extend(result.plugins.warnings)
 
 
 def _unreconciled_link(entry: JournalEntry, root: Path, deployed: dict[str, DeployedFile]) -> bool:

@@ -65,7 +65,7 @@ def check_unchanged(manifest: Manifest, game_id: str, shown: list[ModRecord]) ->
 
 
 def target_for(game: DiscoveredGame, settings: Settings) -> deploy.GameTarget:
-    return deploy.GameTarget(game.game_id, game.root, settings.override(game.game_id).link_mode)
+    return deploy.GameTarget(game.game_id, game.root, settings.override(game.game_id).link_mode, game.plugins_txt)
 
 
 class _Rollback(Exception):
@@ -206,7 +206,7 @@ def fomod_file_state(game: DiscoveredGame | None) -> fomod.FileStateFn:
     if game is None or not game.data_dir.is_dir():
         return lambda _path: fomod.FileState.MISSING
     gdef = GAMES[game.game_id]
-    active = plugins.active_keys(plugins.read(game.plugins_txt, gdef.plugins_format), gdef)
+    active = plugins.active_keys(plugins.read(game.plugins_txt, gdef.plugins_format), gdef, game.root)
     resolver = CaseResolver(game.data_dir)
 
     def state(path: str) -> fomod.FileState:

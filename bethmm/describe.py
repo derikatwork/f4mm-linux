@@ -3,7 +3,7 @@ command line and the GUI)."""
 
 from __future__ import annotations
 
-from bethmm import deploy
+from bethmm import deploy, plugins
 
 #: op kind -> (done, would, noun) for summaries like "linked 3 files".
 VERBS = {
@@ -55,3 +55,27 @@ def summary(ops: list[deploy.Op], *, dry_run: bool = False) -> str:
 def changes(result: deploy.SyncResult) -> list[deploy.Op]:
     """The operations of *result* that change something on disk."""
     return [op for op in result.done if op.kind != "forget"]
+
+
+def _names(names: list[str], limit: int = 6) -> str:
+    return ", ".join(names[:limit]) + (f" and {len(names) - limit} more" if len(names) > limit else "")
+
+
+def plugins_lines(change: plugins.PluginsChange | None) -> list[str]:
+    """What happened to plugins.txt, one line per kind of change (empty: nothing)."""
+    if change is None or not change.changed:
+        return []
+    would = change.dry_run
+    out = []
+    for done, maybe, names in (("added", "would add", change.added), ("put back", "would put back", change.restored),
+                               ("removed", "would remove", change.removed),
+                               ("switched", "would switch", change.switched),
+                               ("moved", "would move", change.moved)):
+        if names:
+            out.append(f"plugins.txt: {maybe if would else done} {_names(names)}")
+    if change.dated:
+        out.append(f"{'would set' if would else 'set'} the file date of {_names(change.dated)} "
+                   "(this game's load order goes by file dates)")
+    if change.backup is not None:
+        out.append(f"(the previous plugins.txt is kept as {change.backup})")
+    return out
