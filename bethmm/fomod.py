@@ -34,6 +34,7 @@ that would leave it is refused. The older C# script installers
 
 from __future__ import annotations
 
+import bisect
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
@@ -667,6 +668,7 @@ def resolve_files(items: Iterable[FileItem], root: str, files: Iterable[str]) ->
     index: dict[str, str] = {}
     for f in files:
         index.setdefault(_folded(f), f)
+    keys = sorted(index)  # a folder's files are one run of these
     prefix = f"{root}/" if root else ""
     warnings: list[str] = []
     entries: dict[str, tuple[int, int, str, str]] = {}  # folded dest -> (priority, seq, source, dest)
@@ -692,7 +694,11 @@ def resolve_files(items: Iterable[FileItem], root: str, files: Iterable[str]) ->
         if item.is_folder:
             folder = _folded(prefix + item.source).rstrip("/")
             start = f"{folder}/" if folder else ""
-            found = sorted((key, actual) for key, actual in index.items() if key.startswith(start))
+            found = []
+            for key in keys[bisect.bisect_left(keys, start):]:
+                if not key.startswith(start):
+                    break
+                found.append((key, index[key]))
             found = [(k, a) for k, a in found
                      if not (not item.source and k[len(start):].startswith("FOMOD/"))
                      and not any(_is_junk(part) for part in a.split("/"))]
