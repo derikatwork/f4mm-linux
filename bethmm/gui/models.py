@@ -5,11 +5,19 @@ reloads the rows."""
 
 from __future__ import annotations
 
+import html
+
 from PySide6.QtCore import QAbstractTableModel, QMimeData, QModelIndex, QPersistentModelIndex, Qt, Signal
 from PySide6.QtGui import QBrush, QPalette
 from PySide6.QtWidgets import QApplication
 
 from bethmm.service import ModRow
+
+
+def _tooltip(text: str) -> str:
+    """*text* as a tooltip that shows it as it is: Qt renders a tooltip that
+    looks like markup (mod, archive and plugin names can) as HTML."""
+    return f"<p style='white-space:pre'>{html.escape(text, quote=False)}</p>"
 
 MIME_TYPE = "application/x-bethmm-mod-id"
 
@@ -85,10 +93,10 @@ class ModListModel(QAbstractTableModel):
                     lines.append("Overwrites files of: " + ", ".join(row.overwrites))
                 if row.overwritten_by:
                     lines.append("Overwritten by: " + ", ".join(row.overwritten_by))
-                return "\n".join(lines)
+                return _tooltip("\n".join(lines))
             if col == COL_NAME:
-                return f"{mod.name}\nfolder: {mod.staging_dir()}" + (
-                    f"\nfrom: {mod.source_archive}" if mod.source_archive else "")
+                return _tooltip(f"{mod.name}\nfolder: {mod.staging_dir()}" + (
+                    f"\nfrom: {mod.source_archive}" if mod.source_archive else ""))
         if role == Qt.ItemDataRole.ForegroundRole and not mod.enabled:
             return QBrush(QApplication.palette().color(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text))
         if role == Qt.ItemDataRole.TextAlignmentRole and col in (COL_POS, COL_FILES):
@@ -234,7 +242,7 @@ class PluginListModel(QAbstractTableModel):
             if col == PCOL_NOTES:
                 return self.notes(plugin)
         if role == Qt.ItemDataRole.ToolTipRole and col == PCOL_NAME and plugin.masters:
-            return "Masters: " + ", ".join(plugin.masters)
+            return _tooltip("Masters: " + ", ".join(plugin.masters))
         if role == Qt.ItemDataRole.ForegroundRole:
             if plugin.missing or plugin.late or not plugin.present:
                 return QBrush(Qt.GlobalColor.red)

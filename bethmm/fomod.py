@@ -42,7 +42,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable, Iterable, Sequence
 
-from bethmm.placement import FileMapping, _is_junk
+from bethmm.placement import FileMapping, _is_junk, has_control_char
 
 #: Larger than any real installer; refuses to parse anything bigger.
 MAX_XML_BYTES = 16 * 1024 * 1024
@@ -659,9 +659,10 @@ def _folded(path: str) -> str:
 
 
 def _destination(dest: str) -> str | None:
-    """A destination relative to Data, or None when it would leave it."""
+    """A destination relative to Data, or None when it would leave it (or
+    has a character no file name can have)."""
     parts = [p for p in dest.replace("\\", "/").split("/") if p not in ("", ".")]
-    if any(p == ".." for p in parts) or re.match(r"^[A-Za-z]:", dest):
+    if any(p == ".." for p in parts) or re.match(r"^[A-Za-z]:", dest) or has_control_char(dest):
         return None
     return "/".join(parts)
 
@@ -694,7 +695,8 @@ def resolve_files(items: Iterable[FileItem], root: str, files: Iterable[str]) ->
         wanted = item.destination if item.destination is not None else item.source
         dest = _destination(wanted)
         if dest is None:
-            warnings.append(f"{item.source!r} would be installed outside Data ({wanted!r}); not installed")
+            warnings.append(f"{item.source!r} would be installed outside Data or under an impossible name "
+                            f"({wanted!r}); not installed")
             continue
         if item.is_folder:
             folder = _folded(prefix + item.source).rstrip("/")

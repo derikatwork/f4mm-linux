@@ -342,12 +342,18 @@ def _names(items: Sequence[str], limit: int = 4) -> str:
     return shown if len(items) <= limit else f"{shown} and {len(items) - limit} more"
 
 
+def has_control_char(path: str) -> bool:
+    """Whether *path* has a control character (a newline, ...): no Windows
+    file name can, and one would split a line of plugins.txt or the log."""
+    return any(ord(c) < 32 or ord(c) == 127 for c in path)
+
+
 def _normalize_files(files: Iterable[str]) -> tuple[list[str], list[str]]:
     """POSIX-style, de-duplicated, sorted file paths, plus warnings.
 
     Entries ending in a separator are directories and are dropped, as are
-    empty ones; entries with ``..`` components are unsafe and dropped with a
-    warning.
+    empty ones; entries with ``..`` components or control characters are
+    unsafe and dropped with a warning.
     """
     seen: dict[str, None] = {}
     warnings: list[str] = []
@@ -358,7 +364,7 @@ def _normalize_files(files: Iterable[str]) -> tuple[list[str], list[str]]:
         parts = [p for p in path.split("/") if p not in ("", ".")]
         if not parts:
             continue
-        if ".." in parts:
+        if ".." in parts or has_control_char(path):
             warnings.append(f"ignored unsafe path {str(raw)!r}")
             continue
         seen.setdefault("/".join(parts), None)

@@ -152,6 +152,22 @@ def test_starfield_plugin_flags_are_not_called_esl(home, tmp_path, capsys):
     assert "light/ESL" not in out and "flags ESM, 0x200" in out
 
 
+def test_control_characters_in_names_never_reach_the_terminal_or_the_log(home, tmp_path, capsys):
+    """A plugin header (or an archive's file name) can hold ESC sequences that
+    retitle the terminal, erase lines or set the clipboard."""
+    import logging
+
+    esp = tmp_path / "Esc.esp"
+    esp.write_bytes(make_plugin(["Fallout4.esm", "\x1b]0;PWNED\x07Evil\x1b[2K.esm"]))
+    assert main(["plugin-info", str(esp)]) == 0
+    out = capsys.readouterr().out
+    assert "\x1b" not in out and "\x07" not in out
+    assert "\\x1b]0;PWNED\\x07Evil\\x1b[2K.esm" in out
+    logging.getLogger("bethmm.test").warning("odd name %s", "a\x1b[2Kb\rc\x9bd")
+    log_text = paths.log_path().read_text(encoding="utf-8")
+    assert "a\\x1b[2Kb\\x0dc\\x9bd" in log_text and "\x1b" not in log_text
+
+
 def test_override_and_config_commands(home, tmp_path, capsys):
     gog_game(home, "fallout-4", "Fallout 4", "Fallout4.exe", ["Data/"])
     manual = make_tree(tmp_path / "elsewhere" / "FO4", ["Fallout4.exe", "Data/"])

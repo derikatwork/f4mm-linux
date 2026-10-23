@@ -1045,3 +1045,26 @@ def test_verify_offers_to_bring_an_out_of_date_game_folder_in_line(qtbot, window
             for i in range(dialog.findChild(QTreeWidget).topLevelItem(0).childCount())]
     assert any("not up to date with the mod list" in r for r in rows) and dialog.repair_button is not None
     assert not os.path.lexists(fo4 / "Data" / "ArmorPack.esp")  # repaired: the disabled mod's files are gone
+
+
+def test_names_that_look_like_markup_are_shown_as_they_are(qtbot, home, fo4, tmp_path):
+    """An archive's file names can look like HTML; Qt would render them in a
+    label, a message box or a tooltip (and hide or restyle what is around them)."""
+    from bethmm import staging
+    from bethmm.gui import main_window, models
+
+    loud = "<font size=7 color=green>Verified safe</font>"
+    dialog = _dialog(qtbot, tmp_path, "Loud-1-1-0.zip", {f"{loud}.esp": esp()})
+    try:
+        for label in (dialog.placement_info, dialog.game_info, dialog.mod_info, dialog.problem_label):
+            if label.textFormat() == Qt.TextFormat.RichText:
+                assert "<font" not in label.text(), label.text()
+            else:
+                assert label.textFormat() == Qt.TextFormat.PlainText
+        assert "&lt;font" in dialog.placement_info.text()
+    finally:
+        staging.discard(dialog.prepared)
+    box = main_window._message_box(main_window.QMessageBox.Icon.Warning, "x", f"could not read {loud}.esp", None)
+    assert box.textFormat() == Qt.TextFormat.PlainText
+    assert models._tooltip(f"Masters: {loud}.esm") == (
+        "<p style='white-space:pre'>Masters: &lt;font size=7 color=green&gt;Verified safe&lt;/font&gt;.esm</p>")

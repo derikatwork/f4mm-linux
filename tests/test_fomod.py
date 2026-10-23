@@ -240,9 +240,10 @@ def test_unsafe_or_missing_paths_are_left_out_with_a_warning():
         <file source="missing.esp" />
         <folder source="Nope" destination="" />
         <file source="00 Core\Cool.esp" destination="C:\Windows\x.esp" />
+        <file source="00 Core\Cool.esp" destination="Cool.esp&#10;*Other.esp" />
       </requiredInstallFiles>""")
     out = Wizard(fomod.parse_module(data)).outcome(FILES)
-    assert out.mappings == [] and len(out.warnings) == 5
+    assert out.mappings == [] and len(out.warnings) == 6
 
 
 def test_the_whole_root_as_a_folder_leaves_out_the_installer_itself():

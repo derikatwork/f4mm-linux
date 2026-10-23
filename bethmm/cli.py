@@ -39,7 +39,7 @@ from bethmm.service import ResolvedFile, ServiceError, link_owners, resolve_agai
 from bethmm.staging import StagingError, remove_stale_extractions
 from bethmm.discovery import DiscoveredGame, cache_is_current, get_games
 from bethmm.games import GAMES
-from bethmm.log import setup_logging
+from bethmm.log import setup_logging, visible_controls
 from bethmm.placement import (
     Confidence,
     PlacementPlan,
@@ -59,11 +59,42 @@ class CliError(Exception):
     pass
 
 
+class _VisibleControls:
+    """A text stream writing control characters as visible ``\\xNN`` (see
+    ``log.VISIBLE_CONTROLS``): the names the commands print come from archives
+    and plugin headers, and must not drive the terminal."""
+
+    def __init__(self, stream) -> None:
+        self._stream = stream
+
+    def write(self, text: str) -> int:
+        self._stream.write(visible_controls(text))
+        return len(text)
+
+    def writelines(self, lines) -> None:
+        for line in lines:
+            self.write(line)
+
+    def __getattr__(self, name: str):
+        return getattr(self._stream, name)
+
+
 def main(argv: list[str] | None = None) -> int:
     # File names from archives need not be valid UTF-8; never crash printing them.
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(errors="backslashreplace")
+    if isinstance(sys.stdout, _VisibleControls):  # called from within a command
+        return _main(argv)
+    out, err = sys.stdout, sys.stderr
+    sys.stdout, sys.stderr = _VisibleControls(out), _VisibleControls(err)
+    try:
+        return _main(argv)
+    finally:
+        sys.stdout, sys.stderr = out, err
+
+
+def _main(argv: list[str] | None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if not getattr(args, "func", None):

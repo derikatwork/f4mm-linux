@@ -94,6 +94,15 @@ ARCHIVE_FILTER = "Mod archives (*.zip *.7z *.rar *.tar *.gz *.bz2 *.xz *.tgz);;A
 DRY_RUN_NOTE = "Dry-run mode is on, so nothing is changed (turn it off in Settings)."
 
 
+def _message_box(icon: QMessageBox.Icon, title: str, text: str, parent: QWidget,
+                 buttons: QMessageBox.StandardButton = QMessageBox.StandardButton.Ok) -> QMessageBox:
+    """A message box showing *text* as it is: the names and errors in it can
+    look like markup, which Qt would otherwise render."""
+    box = QMessageBox(icon, title, text, buttons, parent)
+    box.setTextFormat(Qt.TextFormat.PlainText)
+    return box
+
+
 def _names(manifest: Manifest, game_id: str) -> dict[int, str]:
     return {m.id: m.name for m in manifest.mods(game_id)}
 
@@ -146,12 +155,19 @@ class MainWindow(QMainWindow):
     def ask(self, title: str, text: str) -> bool:
         if self._closing:
             return False
-        return QMessageBox.question(self, title, text) == QMessageBox.StandardButton.Yes
+        box = _message_box(QMessageBox.Icon.Question, title, text, self,
+                           QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        try:
+            return box.exec() == QMessageBox.StandardButton.Yes
+        finally:
+            box.deleteLater()
 
     def tell(self, title: str, text: str, *, warning: bool = False) -> None:
         if self._closing:
             return
-        (QMessageBox.warning if warning else QMessageBox.information)(self, title, text)
+        box = _message_box(QMessageBox.Icon.Warning if warning else QMessageBox.Icon.Information, title, text, self)
+        box.exec()
+        box.deleteLater()
 
     # ------------------------------------------------------------ building
 
@@ -328,6 +344,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(main)
 
         self.state_label = QLabel()
+        self.state_label.setTextFormat(Qt.TextFormat.PlainText)  # it shows the game's folder
         self.dry_label = QLabel()
         self.progress = QProgressBar()
         self.progress.setRange(0, 0)
@@ -597,7 +614,7 @@ class MainWindow(QMainWindow):
             log.error("unexpected error: %s", detail)
             self.note(f"! unexpected error: {exc!r}")
             if not self._closing:
-                box = QMessageBox(QMessageBox.Icon.Critical, "Unexpected error", f"{exc!r}", parent=self)
+                box = _message_box(QMessageBox.Icon.Critical, "Unexpected error", f"{exc!r}", self)
                 box.setDetailedText(detail)
                 box.exec()
                 box.deleteLater()

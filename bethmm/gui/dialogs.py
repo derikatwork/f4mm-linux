@@ -59,8 +59,12 @@ def _escape(text: str) -> str:
     return html.escape(text, quote=False)
 
 
-def _label(text: str, *, wrap: bool = True, selectable: bool = True) -> QLabel:
+def _label(text: str, *, rich: bool = False, wrap: bool = True, selectable: bool = True) -> QLabel:
+    """A label showing *text* as it is -- or, with *rich*, as HTML: then every
+    name or message in it must be escaped (an archive's file names can look
+    like markup, and Qt would render it)."""
     label = QLabel(text)
+    label.setTextFormat(Qt.TextFormat.RichText if rich else Qt.TextFormat.PlainText)
     label.setWordWrap(wrap)
     if selectable:
         label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -101,14 +105,14 @@ class PlanDialog(QDialog):
         if result is not None and not result.forgotten:
             changes = describe.changes(result)
             done = describe.summary(changes, dry_run=True)
-            layout.addWidget(_label(f"<b>{done[0].upper() + done[1:]}</b> in {result.plan.root}." if done
-                                    else "<b>Nothing in the game folder would change.</b>"))
+            layout.addWidget(_label(f"<b>{_escape(done[0].upper() + done[1:])}</b> in {_escape(str(result.plan.root))}."
+                                    if done else "<b>Nothing in the game folder would change.</b>", rich=True))
         text = QPlainTextEdit(_ops_text(result, names))
         text.setReadOnly(True)
         text.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         layout.addWidget(text, 1)
         if not can_apply and why_not:
-            layout.addWidget(_label(f"<i>{why_not}</i>"))
+            layout.addWidget(_label(f"<i>{_escape(why_not)}</i>", rich=True))
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
         if can_apply:
             self.apply_button = buttons.addButton(apply_text, QDialogButtonBox.ButtonRole.AcceptRole)
@@ -140,11 +144,11 @@ class VerifyDialog(QDialog):
             QTreeWidgetItem(parent_item, [what, where])
 
         if report.root_missing:
-            layout.addWidget(_label(f"<b>The game folder can't be used</b> ({report.missing_reason}), so nothing was "
-                                    "checked. If it is on a drive that isn't mounted, mount it and verify again. If "
-                                    "you moved or reinstalled the game, Game > Rescan for games finds it again. If "
-                                    "that install is gone, use Purge with 'the game is gone' to forget the app's "
-                                    "links there."))
+            layout.addWidget(_label(f"<b>The game folder can't be used</b> ({_escape(report.missing_reason)}), so "
+                                    "nothing was checked. If it is on a drive that isn't mounted, mount it and verify "
+                                    "again. If you moved or reinstalled the game, Game > Rescan for games finds it "
+                                    "again. If that install is gone, use Purge with 'the game is gone' to forget the "
+                                    "app's links there.", rich=True))
         for record in report.missing:
             add(problems, "missing link", record.path)
         for record in report.foreign:
@@ -191,7 +195,8 @@ class VerifyDialog(QDialog):
         if not report.root_missing:
             layout.addWidget(_label("<b>Everything the app deployed is in place.</b>" if not found.problems
                                     else f"<b>Found {problems.childCount()} problem(s).</b> Repair fixes what is "
-                                         "safe to fix, then redeploys (or purges again, for a purged game)."))
+                                         "safe to fix, then redeploys (or purges again, for a purged game).",
+                                    rich=True))
         layout.addWidget(tree, 1)
         self.release_held = QCheckBox("Stop tracking originals kept because a newer file is at their path "
                                       "(e.g. after a game update; they are moved to backups/.superseded)")
@@ -230,10 +235,11 @@ class FomodDialog(QDialog):
         layout = QVBoxLayout(self)
         about = ", ".join(x for x in (f"version {module.info.version}" if module.info.version else "",
                                       f"by {module.info.author}" if module.info.author else "") if x)
-        layout.addWidget(_label(f"<b>{_escape(module.name)}</b>" + (f" ({_escape(about)})" if about else "")))
+        layout.addWidget(_label(f"<b>{_escape(module.name)}</b>" + (f" ({_escape(about)})" if about else ""),
+                                rich=True))
         if note:
             layout.addWidget(_label(note))
-        self.step_label = _label("")
+        self.step_label = _label("", rich=True)
         layout.addWidget(self.step_label)
         split = QSplitter(Qt.Orientation.Horizontal)
         self.scroll = QScrollArea()
@@ -251,7 +257,7 @@ class FomodDialog(QDialog):
         split.setStretchFactor(0, 3)
         split.setStretchFactor(1, 2)
         layout.addWidget(split, 1)
-        self.problem_label = _label("")
+        self.problem_label = _label("", rich=True)
         layout.addWidget(self.problem_label)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
         self.back_button = buttons.addButton("Back", QDialogButtonBox.ButtonRole.ActionRole)
@@ -459,7 +465,7 @@ class InstallDialog(QDialog):
         form.addRow("Game:", self.game_combo)
         self.game_info = _label("")
         form.addRow("", self.game_info)
-        self.placement_info = _label("")
+        self.placement_info = _label("", rich=True)
         form.addRow("Goes into:", self.placement_info)
         layout.addLayout(form)
 
@@ -485,7 +491,7 @@ class InstallDialog(QDialog):
         self.apply_choice = QPushButton("Use this choice")
         target_row.addWidget(self.apply_choice)
         choose.addLayout(target_row)
-        self.choice_error = _label("")
+        self.choice_error = _label("", rich=True)
         choose.addWidget(self.choice_error)
         self.choose_toggle = QCheckBox("Choose the folders myself")
         toggle_row = QHBoxLayout()
@@ -529,7 +535,7 @@ class InstallDialog(QDialog):
         self.tabs.addTab(self.warnings_list, "Notes")
         layout.addWidget(self.tabs, 2)
 
-        self.problem_label = _label("")
+        self.problem_label = _label("", rich=True)
         layout.addWidget(self.problem_label)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
         self.install_button = buttons.addButton("Install", QDialogButtonBox.ButtonRole.AcceptRole)
@@ -694,7 +700,7 @@ class InstallDialog(QDialog):
         try:
             self.prepared = staging.replan(self.prepared, roots or None, target, installed_games=self.installed)
         except ValueError as exc:
-            self.choice_error.setText(f"<span style='color:#c0392b'>{exc}</span>")
+            self.choice_error.setText(f"<span style='color:#c0392b'>{_escape(str(exc))}</span>")
             self._choice_pending = True
             self._show_pending()
             return
@@ -733,10 +739,10 @@ class InstallDialog(QDialog):
         problem = service.installable_problem(plan)
         if problem is None:
             reasons = "; ".join(plan.reasons)
-            self.placement_info.setText(f"{_TARGET_TEXT[plan.target]} ({plan.confidence.name.lower()} confidence)"
-                                        + (f" -- {reasons}" if reasons else ""))
+            self.placement_info.setText(_escape(f"{_TARGET_TEXT[plan.target]} ({plan.confidence.name.lower()} "
+                                                f"confidence)" + (f" -- {reasons}" if reasons else "")))
         else:
-            self.placement_info.setText(f"<span style='color:#c0392b'>{problem}</span>")
+            self.placement_info.setText(f"<span style='color:#c0392b'>{_escape(problem)}</span>")
         self.warnings_list.clear()
         for warning in [*plan.warnings, *prepared.warnings]:
             self.warnings_list.addItem(warning)
@@ -756,7 +762,7 @@ class InstallDialog(QDialog):
         self.update_combo.setEnabled(self.as_update.isChecked())
         if not why_not and not self.can_install:
             why_not = self._why_not
-        self.problem_label.setText(f"<span style='color:#c0392b'>{why_not}</span>" if why_not else "")
+        self.problem_label.setText(f"<span style='color:#c0392b'>{_escape(why_not)}</span>" if why_not else "")
         self.install_button.setEnabled(not why_not)
         self.install_button.setText("Update" if self.choice is not None and self.choice.existing else "Install")
         if self._choice_pending:

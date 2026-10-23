@@ -251,3 +251,36 @@ def test_real_truncated_7z_message(tmp_path):
         extract_archive(cut, tmp_path / "out")
     msg = str(exc.value)
     assert "download it again" in msg and "password" not in msg and str(tmp_path) not in msg
+
+
+@needs_7z
+def test_an_archive_bigger_than_the_free_space_is_refused_before_extracting(tmp_path, monkeypatch):
+    src = _zip(tmp_path / "big.zip", {"Data/a.esp": b"x" * 5000})
+    real = shutil.disk_usage
+    monkeypatch.setattr(archive.shutil, "disk_usage", lambda p: real(p)._replace(free=4000))
+    with pytest.raises(ArchiveError, match="unpacks to .*but only .* is free"):
+        extract_archive(src, tmp_path / "out")
+    assert list((tmp_path / "out").iterdir()) == []
+
+
+@needs_7z
+@pytest.mark.parametrize("target", ["absolute", "relative"])
+def test_a_link_to_a_folder_outside_cannot_be_written_through(tmp_path, target):
+    """The archive's link is created (or not) before the file "under" it: 7z
+    must not write that file into the folder the link points to."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    src = tmp_path / "through.zip"
+    with zipfile.ZipFile(src, "w") as zf:
+        info = zipfile.ZipInfo("Data/lnk")
+        info.create_system = 3
+        info.external_attr = (stat.S_IFLNK | 0o777) << 16
+        zf.writestr(info, str(outside) if target == "absolute" else "../../outside")
+        zf.writestr("Data/lnk/pwned.txt", b"x")
+    try:
+        result = extract_archive(src, tmp_path / "out")
+    except ArchiveError:
+        result = None
+    assert list(outside.iterdir()) == []
+    if result is not None:
+        assert not (tmp_path / "out" / "Data" / "lnk").is_symlink()

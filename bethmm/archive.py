@@ -193,9 +193,10 @@ def _unsafe(path: str) -> bool:
 def extract_archive(archive: str | Path, dest: str | Path, sevenzip: str | None = None) -> ExtractResult:
     """Extract *archive* into *dest*, which must not exist or be empty.
 
-    Archives containing absolute paths or ``..`` are refused before anything
-    is extracted. Symlinks that 7z creates from the archive are removed (a
-    mod has no business shipping links) and reported in ``warnings``.
+    Archives containing absolute paths or ``..``, or that unpack to more
+    than the free disk space, are refused before anything is extracted.
+    Symlinks that 7z creates from the archive are removed (a mod has no
+    business shipping links) and reported in ``warnings``.
     """
     archive = Path(archive)
     dest = Path(dest)
@@ -206,6 +207,7 @@ def extract_archive(archive: str | Path, dest: str | Path, sevenzip: str | None 
     if dest.exists() and any(dest.iterdir()):
         raise ArchiveError(f"extraction folder {dest} is not empty")
     dest.mkdir(parents=True, exist_ok=True)
+    _check_space(archive, entries, dest)
 
     exe = find_sevenzip(sevenzip)
     log.info("EXTRACT %s -> %s", archive.resolve(), dest)
@@ -243,6 +245,23 @@ def extract_archive(archive: str | Path, dest: str | Path, sevenzip: str | None 
     for warning in warnings:
         log.warning("%s: %s", archive.name, warning)
     return ExtractResult(files, warnings)
+
+
+def _check_space(archive: Path, entries: list[ArchiveEntry], dest: Path) -> None:
+    """Refuse an archive that can't fit: 7z would fill the disk before failing
+    (and every other program on it would run out of space meanwhile)."""
+    needed = sum(e.size for e in entries if not e.is_dir)
+    try:
+        free = shutil.disk_usage(dest).free
+    except OSError:
+        return  # 7z reports it, if it comes to that
+    if needed > free:
+        raise ArchiveError(f"{archive.name} unpacks to {_gigabytes(needed)}, but only {_gigabytes(free)} is free "
+                           f"in {dest.parent}. Free some space and try again.")
+
+
+def _gigabytes(size: int) -> str:
+    return f"{size / 1024 ** 3:.1f} GB" if size >= 1024 ** 3 / 10 else f"{size / 1024 ** 2:.1f} MB"
 
 
 def _split_backslash_names(dest: Path, warnings: list[str]) -> None:
