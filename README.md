@@ -52,6 +52,8 @@ Keep the cloned folder: the app runs from it. To update, `git pull && ./install.
    app's links, or whether that game needs hardlinks (see
    [Does the game see the links?](#does-the-game-see-the-links)).
 3. Drag a mod archive from `~/Downloads` onto the window and click **Install**.
+4. Fallout 4 only: set the INI lines shown under
+   [Plugins and load order](#plugins-and-load-order) once, or the game ignores mods.
 
 Not sure yet? Switch on dry-run mode (*Settings*, or `bethmm config --dry-run on`)
 and the app only shows what it would do.
@@ -299,7 +301,14 @@ plugins it put into `Data`:
   file's encoding and line endings are left as they are;
 * before every change, `plugins.txt` is copied to
   `~/.local/share/beth-mod-manager/plugins-backups/<game>/` (the first copy and the
-  latest 30 are kept), and the new file replaces the old one in one step.
+  latest 30 are kept), and the new file replaces the old one in one step. When
+  `plugins.txt` is a link to a file you keep elsewhere, that file is updated and
+  the link stays.
+
+If the app doesn't know the game's Wine prefix (or Wine user), it leaves
+`plugins.txt` alone and says so when a deploy has plugins to add: set them in
+*Game ▸ Game settings* or with `bethmm override <game> --prefix ... --wine-user ...`,
+then run `bethmm plugins sync`.
 
 ```bash
 bethmm plugins                       # the load order: on/off, which mod, missing masters
@@ -413,6 +422,61 @@ bethmm plugin-info SomeMod.esp
 ```
 
 Prints the plugin's masters, header version and the game it was made for.
+
+## Troubleshooting
+
+* **A game isn't found**: `bethmm games --rescan`; if it's still missing, set it by
+  hand with `bethmm override` or *Game ▸ Game settings* (see
+  [Find your games](#find-your-games)).
+* **A mod doesn't show up in the game**, check in this order:
+  1. `bethmm verify` (*Game ▸ Verify*): is the game folder up to date with the mod list?
+  2. `bethmm check-links <game>` (*Game ▸ Check links*): does Wine see the links? If
+     not, switch the game to hardlinks (see
+     [Does the game see the links?](#does-the-game-see-the-links)).
+  3. Is its plugin switched on (*Plugins* tab, `bethmm plugins`) and loaded after its
+     masters? Fallout 4 also needs the INI lines in
+     [Plugins and load order](#plugins-and-load-order).
+  4. Script extender plugins (`F4SE/`, `SKSE/` folders) only load when the game is
+     started through the loader: in Lutris, set the game's executable
+     (*Configure ▸ Game options*) to `f4se_loader.exe`, `skse64_loader.exe`, ...
+* **The app (or the computer) stopped in the middle of a change**: run
+  `bethmm verify --repair` (or *Game ▸ Verify*, then *Repair*). Every step is
+  recorded before it happens, so it can be finished or undone.
+* **"another bethmm process is changing mods right now"**: another window or command
+  is making a change; only one runs at a time. Wait for it, then try again.
+* **You want an older `plugins.txt` back**: copy one from
+  `~/.local/share/beth-mod-manager/plugins-backups/<game>/` (named by date and time;
+  `plugins-first.txt` is how it was before the app first changed it) over the
+  game's `plugins.txt`, then run `bethmm plugins sync`.
+* **Back to vanilla**: `bethmm purge` (*Game ▸ Purge*) removes every link and puts
+  back every original game file; your mods stay installed for later.
+* **What did it do?** `bethmm history` lists the latest file operations, and the log
+  (`~/.local/share/beth-mod-manager/logs/bethmm.log`) has every one of them.
+* **The desktop app doesn't start**: see the end of [The desktop app](#the-desktop-app).
+
+## Known limitations
+
+* **No LOOT sorting yet.** `bethmm plugins sort` is where a sorter will plug in.
+  You can run LOOT yourself (it has a Linux version) and run `bethmm plugins sync`
+  afterwards; the app keeps the order of the lines in `plugins.txt` that you or LOOT set.
+* **FOMOD installers written in C#** (`fomod/script.cs`, rare and old) can't run:
+  choose the folders to install yourself (*Choose the folders myself*, or
+  `--root`/`--target`).
+* **Load order by file date** (Oblivion, Fallout 3, New Vegas, Skyrim LE): the app
+  only changes the dates of plugins it installed, so it can't move the game's own
+  plugins or ones you put into `Data` yourself. It dates its plugins in the order of
+  their lines in `plugins.txt`: a tool that changes only their dates, without
+  rewriting `plugins.txt`, is undone at the next deploy.
+* **No INI editing.** Fallout 4's lines (see [Plugins and load order](#plugins-and-load-order))
+  and archive invalidation for loose files in the older games are yours to set.
+* **Downloads are manual**: no "Mod Manager Download" (`nxm://` links) or Nexus
+  login. Use "Manual Download" and install the archive.
+* **One mod list per game**: no profiles.
+* **Files that tools write into `Data`** (xEdit, BodySlide, ...) are real files the
+  app doesn't manage; it leaves them alone.
+* **Very large mods** (tens of thousands of files) take a while: every file is its
+  own link, and the install dialog takes a few seconds to show such an archive.
+* **Hardlinks** need the game and `~/.local/share` on the same disk.
 
 ## Where things are kept
 
