@@ -224,6 +224,13 @@ class CaseResolver:
         # Every folded prefix of every cached key -> the cached keys below it.
         self._cached_under: dict[_Key, set[_Key]] = {}
         self._planned: dict[_Key, _Listing] = {}
+        # Entries on disk that a plan removes (exact spelling): resolved as absent.
+        self._gone: set[_Key] = set()
+
+    def forget(self, rel: str | PurePosixPath) -> None:
+        """Resolve the entry at *rel* (its exact spelling on disk) as absent from
+        now on: a plan removes it before what is resolved next is created."""
+        self._gone.add(_split(rel))
 
     def resolve(self, rel: str | PurePosixPath, *, is_dir: bool = False, plan: bool = False) -> ResolvedPath:
         """Resolve *rel* (POSIX separators; backslashes are also accepted and
@@ -255,14 +262,22 @@ class CaseResolver:
             planned = self._planned.get(key, _EMPTY) if parent_known else _EMPTY
 
             folded = _fold(comp)
-            matches = sorted(set(disk.matches(folded)) | set(planned.matches(folded)))
+            on_disk_names = [m for m in disk.matches(folded) if (*key, m) not in self._gone]
+            if (*key, comp) in self._gone and on_disk_names:
+                # Re-created exactly where the plan removes it (the app's own link
+                # switching mods) -- not onto another entry spelled in another case.
+                where = "/".join(key) or "."
+                others = ", ".join(repr(m) for m in on_disk_names)
+                ambiguous.append(f"{where!r} also has {others}, differing only in case from {comp!r}; using {comp!r}")
+                on_disk_names = []
+            matches = sorted(set(on_disk_names) | set(planned.matches(folded)))
             if matches:
                 name = comp if comp in matches else matches[0]
                 if len(matches) > 1:
                     where = "/".join(key) or "."
                     names = ", ".join(repr(m) for m in matches)
                     ambiguous.append(f"{where!r} has entries differing only in case: {names}; using {name!r}")
-                on_disk = name in disk.entries
+                on_disk = name in on_disk_names
                 entry_is_dir = disk.entries[name] if on_disk else planned.entries[name]
                 if entry_is_dir != want_dir:
                     type_conflict = True

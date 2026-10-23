@@ -858,3 +858,277 @@ def test_plugin_hotfix_of_a_two_file_mod_is_separate(home, fo4, tmp_path, capsys
     with Manifest() as m:
         assert len(m.mods("fallout4")) == 2
     assert (fo4 / "Data" / "ArmorMod - Main.ba2").is_file()
+
+
+# ---------------------------------------------------------------- QA round 1
+
+
+def test_dry_runs_never_create_or_upgrade_the_manifest(home, fo4, tmp_path, capsys):
+    import sqlite3
+
+    a = mod_zip(tmp_path, "Armor-1000-1-0-1700000000.zip", {"Armor.esp": esp()})
+    assert not paths.manifest_path().exists()
+    assert main(["install", str(a), "--dry-run"]) == 0
+    assert main(["deploy", "--dry-run"]) == 0
+    assert not paths.manifest_path().exists()
+    assert main(["install", str(a), "--yes"]) == 0
+    # A manifest an older version wrote: a dry run reads it, but leaves it as it is.
+    db = sqlite3.connect(paths.manifest_path())
+    db.execute("PRAGMA journal_mode = DELETE")  # as the version that wrote schema 1 had it
+    db.execute("DROP TABLE left_alone")
+    db.execute("UPDATE meta SET value = '1' WHERE key = 'schema_version'")
+    db.commit()
+    db.close()
+
+    def files() -> dict[str, bytes]:
+        return {p.name: p.read_bytes() for p in paths.manifest_path().parent.glob("manifest.db*")}
+
+    before = files()
+    assert main(["disable", "Armor", "--dry-run"]) == 0
+    assert main(["purge", "--dry-run"]) == 0
+    assert files() == before
+    assert main(["deploy"]) == 0  # a real change upgrades it
+    db = sqlite3.connect(paths.manifest_path())
+    assert db.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()[0] != "1"
+    db.close()
+
+
+def test_ctrl_d_at_a_question_means_no(home, fo4, tmp_path, capsys, monkeypatch):
+    import sys
+
+    a = mod_zip(tmp_path, "Armor-1000-1-0-1700000000.zip", {"Armor.esp": esp()})
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True, raising=False)
+
+    def eof(_prompt=""):
+        raise EOFError
+
+    monkeypatch.setattr("builtins.input", eof)
+    assert main(["install", str(a)]) == 1
+    out = capsys.readouterr()
+    assert "Traceback" not in out.err and "Cancelled" in out.out
+    assert not os.path.lexists(fo4 / "Data" / "Armor.esp")
+
+
+def test_an_install_killed_after_moving_its_files_is_cleaned_up_by_repair(home, fo4, tmp_path, capsys):
+    import subprocess
+    import sys
+
+    a = mod_zip(tmp_path, "Big Mod-1000-1-0-1700000000.zip", {"Big.esp": esp(), "textures/b.dds": b"b"})
+    # The process dies (no exception handler runs) right after the files moved, before the mod is recorded.
+    script = (
+        "import os, sys\n"
+        "from bethmm import manifest\n"
+        "manifest.Manifest.add_mod = lambda *a, **k: os._exit(9)\n"
+        "from bethmm.cli import main\n"
+        "main(['install', sys.argv[1], '--yes'])\n"
+    )
+    proc = subprocess.run([sys.executable, "-c", script, str(a)], cwd=Path(__file__).resolve().parent.parent,
+                          capture_output=True, text=True)
+    assert proc.returncode == 9, proc.stderr
+    left = paths.mods_dir("fallout4") / "Big Mod"
+    assert left.is_dir()
+    capsys.readouterr()
+    assert main(["verify"]) == 1
+    assert "interrupted install" in capsys.readouterr().out
+    assert main(["verify", "--repair"]) == 0
+    assert not left.exists()
+    assert main(["install", str(a), "--yes"]) == 0
+    assert sorted(os.listdir(paths.mods_dir("fallout4"))) == ["Big Mod"]  # not "Big Mod (2)"
+    assert not (left / ".bethmm-retired").exists()  # an installed mod's folder carries no mark
+
+
+def test_an_update_whose_old_files_cant_be_deleted_still_succeeds(home, fo4, tmp_path, capsys, monkeypatch):
+    from bethmm import staging
+
+    v1 = mod_zip(tmp_path, "Cool-555-1-0-1700000000.zip", {"Cool.esp": esp(), "old.dds": b"o"})
+    v2 = mod_zip(tmp_path, "Cool-555-2-0-1700000100.zip", {"Cool.esp": esp(), "new.dds": b"n"})
+    assert main(["install", str(v1), "--yes"]) == 0
+    real = staging.remove_staging
+
+    def denied(folder):
+        raise PermissionError(13, "Permission denied", str(folder))
+
+    monkeypatch.setattr(staging, "remove_staging", denied)
+    capsys.readouterr()
+    assert main(["install", str(v2), "--yes"]) == 0
+    out = capsys.readouterr().out
+    assert "Updated 'Cool'" in out or "Cool" in out
+    assert "could not delete the previous files" in out
+    assert (fo4 / "Data" / "new.dds").is_symlink() and not os.path.lexists(fo4 / "Data" / "old.dds")
+    monkeypatch.setattr(staging, "remove_staging", real)
+    assert main(["verify", "--repair"]) == 0
+    assert [p.name for p in paths.mods_dir("fallout4").iterdir()] == [m.folder for m in Manifest().mods("fallout4")]
+
+
+def test_names_that_are_not_utf8_get_a_useful_message(home, fo4, tmp_path, capsys):
+    folder = tmp_path / "Old Zip Mod"
+    (folder / "textures").mkdir(parents=True)
+    (folder / "Old.esp").write_bytes(esp())
+    (folder / os.fsdecode(b"textures/caf\x82.dds")).write_bytes(b"x")
+    assert main(["install", str(folder), "--yes"]) == 1
+    err = capsys.readouterr().err
+    assert "aren't valid UTF-8" in err and "code page" in err and "Traceback" not in err
+
+
+def test_a_moved_game_suggests_a_rescan(home, fo4, tmp_path, capsys):
+    a = mod_zip(tmp_path, "A-1-1-0.zip", {"A.esp": esp()})
+    assert main(["install", str(a), "--yes"]) == 0
+    shutil.move(str(fo4), str(fo4.with_name("Fallout 4 moved")))
+    capsys.readouterr()
+    assert main(["deploy"]) == 1
+    assert "games --rescan" in capsys.readouterr().err
+
+
+def test_install_preview_calls_a_file_folder_clash_with_a_mod_an_override(home, fo4, tmp_path, capsys):
+    a = mod_zip(tmp_path, "A-1-1-0.zip", {"A.esp": esp(), "textures/x": b"a file"})
+    assert main(["install", str(a), "--yes"]) == 0
+    b = mod_zip(tmp_path, "B-2-1-0.zip", {"B.esp": esp(), "textures/x/in.dds": b"in"})
+    capsys.readouterr()
+    assert main(["install", str(b), "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert "overrides A" in out and "other type already exists" not in out
+
+
+def test_repair_goes_on_past_a_folder_it_cant_delete(home, fo4, tmp_path, capsys, monkeypatch):
+    from bethmm import staging
+
+    for name in ("Aaa", "Zzz"):
+        assert main(["install", str(mod_zip(tmp_path, f"{name}-1-1-0.zip", {f"{name}.esp": esp()})), "--yes"]) == 0
+    real = staging.remove_staging
+    monkeypatch.setattr(staging, "remove_staging", lambda folder: (_ for _ in ()).throw(PermissionError(1, "no")))
+    assert main(["uninstall", "Aaa", "Zzz", "--yes"]) == 0  # both folders stay behind
+    calls = []
+
+    def first_fails(folder):
+        calls.append(folder)
+        if len(calls) == 1:
+            raise PermissionError(1, "Operation not permitted", str(folder))
+        real(folder)
+
+    monkeypatch.setattr(staging, "remove_staging", first_fails)
+    capsys.readouterr()
+    assert main(["verify", "--repair"]) == 1
+    out = capsys.readouterr().out
+    assert len(calls) == 2 and "deleted" in out and "could not delete" in out
+
+
+def test_override_link_mode_says_the_links_change_on_deploy(home, fo4, tmp_path, capsys):
+    a = mod_zip(tmp_path, "A-1-1-0.zip", {"A.esp": esp()})
+    assert main(["install", str(a), "--yes"]) == 0
+    capsys.readouterr()
+    assert main(["override", "fallout4", "--link-mode", "hardlink"]) == 0
+    assert "relinks them as hardlinks" in capsys.readouterr().out
+
+
+def test_dry_run_switched_on_at_a_question_stops_the_change(home, fo4, tmp_path, capsys, monkeypatch):
+    import sys
+
+    a = mod_zip(tmp_path, "Cee-1-1-0.zip", {"Cee.esp": esp()})
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True, raising=False)
+
+    def answer(_prompt=""):
+        assert main(["config", "--dry-run", "on"]) == 0  # meanwhile, in another terminal
+        return "y"
+
+    monkeypatch.setattr("builtins.input", answer)
+    assert main(["install", str(a)]) == 1
+    assert "nothing was changed" in capsys.readouterr().err
+    assert not os.path.lexists(fo4 / "Data" / "Cee.esp")
+
+
+def _file_line(out: str, source: str) -> str:
+    """The install preview's line for one of the mod's files."""
+    return next(x for x in out.splitlines() if x.strip().startswith(f"{source}  ->  "))
+
+
+def test_install_preview_says_conflict_when_the_games_own_folder_is_in_the_way(home, fo4, tmp_path, capsys):
+    # A's file sits in the game's own textures folder; B has a file called 'textures'.
+    a = mod_zip(tmp_path, "A-1-1-0.zip", {"A.esp": esp(), "textures/shared.dds": b"a"})
+    assert main(["install", str(a), "--yes"]) == 0
+    b = mod_zip(tmp_path, "B-2-1-0.zip", {"B.esp": esp(), "textures": b"a file named textures"})
+    capsys.readouterr()
+    assert main(["install", str(b), "--dry-run"]) == 0
+    line = _file_line(capsys.readouterr().out, "textures")
+    assert "other type already exists" in line and "overrides" not in line
+    # A folder that holds only what the app put there does give way.
+    c = mod_zip(tmp_path, "C-3-1-0.zip", {"C.esp": esp(), "meshes/newdir/c.nif": b"c"})
+    assert main(["install", str(c), "--yes"]) == 0
+    d = mod_zip(tmp_path, "D-4-1-0.zip", {"D.esp": esp(), "meshes/newdir": b"a file"})
+    capsys.readouterr()
+    assert main(["install", str(d), "--dry-run"]) == 0
+    line = _file_line(capsys.readouterr().out, "meshes/newdir")
+    assert "overrides C" in line
+
+
+def test_update_preview_says_which_mod_lower_in_the_list_keeps_winning(home, fo4, tmp_path, capsys):
+    a = mod_zip(tmp_path, "A-1-1-0.zip", {"A.esp": esp(), "textures/x.dds": b"a1", "textures/y/in.dds": b"a1"})
+    z = mod_zip(tmp_path, "Z-2-1-0.zip", {"Z.esp": esp(), "textures/x.dds": b"z", "textures/y": b"z file"})
+    assert main(["install", str(a), "--yes"]) == 0
+    assert main(["install", str(z), "--yes"]) == 0
+    a2 = mod_zip(tmp_path, "A-1-2-0.zip", {"A.esp": esp(), "textures/x.dds": b"a2", "textures/y/in.dds": b"a2"})
+    capsys.readouterr()
+    assert main(["install", str(a2), "--replace", "A", "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert "overrides Z" not in out
+    assert "loses to Z, lower in the list" in _file_line(out, "textures/x.dds")
+    assert "loses to Z, lower in the list" in _file_line(out, "textures/y/in.dds")
+    assert main(["install", str(a2), "--replace", "A", "--yes"]) == 0
+    assert (fo4 / "Data" / "textures" / "x.dds").read_bytes() == b"z"
+
+
+def test_override_saves_even_when_the_manifest_cant_be_read(home, fo4, tmp_path, capsys):
+    a = mod_zip(tmp_path, "A-1-1-0.zip", {"A.esp": esp()})
+    assert main(["install", str(a), "--yes"]) == 0
+    paths.manifest_path().write_bytes(b"this is not a database" * 100)
+    for suffix in ("-wal", "-shm"):
+        Path(str(paths.manifest_path()) + suffix).unlink(missing_ok=True)
+    capsys.readouterr()
+    assert main(["override", "fallout4", "--link-mode", "hardlink"]) == 0
+    assert "could not read the mod list" in capsys.readouterr().err
+    assert load_settings().override("fallout4").link_mode == "hardlink"
+
+
+def test_override_offers_no_relink_on_a_purged_game(home, fo4, tmp_path, capsys, monkeypatch):
+    a = mod_zip(tmp_path, "A-1-1-0.zip", {"A.esp": esp(), "B.esp": esp()})
+    assert main(["install", str(a), "--yes"]) == 0
+    real_unlink = os.unlink
+
+    def failing_unlink(path, *args, **kwargs):
+        if str(path).endswith("A.esp"):
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "unlink", failing_unlink)
+    main(["purge", "--yes"])  # one link stays behind
+    monkeypatch.setattr(os, "unlink", real_unlink)
+    with Manifest() as manifest:
+        assert not manifest.game_state("fallout4").deployed and manifest.deployed("fallout4")
+    capsys.readouterr()
+    assert main(["override", "fallout4", "--link-mode", "hardlink"]) == 0
+    assert "relinks them" not in capsys.readouterr().out
+
+
+def test_verify_repair_finishes_an_update_stopped_before_its_deploy(home, fo4, tmp_path, capsys, monkeypatch):
+    from bethmm import deploy
+
+    v1 = mod_zip(tmp_path, "Cool-1234-1-0-1700000000.zip", {"Cool.esp": esp(), "meshes/old.nif": b"v1"})
+    assert main(["install", str(v1), "--yes"]) == 0
+    v2 = mod_zip(tmp_path, "Cool-1234-2-0-1700000001.zip", {"Cool.esp": esp(), "meshes/new.nif": b"v2"})
+
+    def stopped(*_args, **_kwargs):
+        raise KeyboardInterrupt  # the app stopped right after the update was saved
+
+    with monkeypatch.context() as mp:
+        mp.setattr(deploy, "refresh", stopped)
+        assert main(["install", str(v2), "--replace", "Cool", "--yes"]) != 0
+    assert (fo4 / "Data" / "meshes" / "old.nif").read_bytes() == b"v1"  # still version 1 in the game
+    capsys.readouterr()
+    assert main(["verify"]) == 1
+    assert "not up to date with the mod list" in capsys.readouterr().out
+    assert main(["verify", "--repair"]) == 0
+    out = capsys.readouterr().out
+    assert (fo4 / "Data" / "meshes" / "new.nif").read_bytes() == b"v2"
+    assert not os.path.lexists(fo4 / "Data" / "meshes" / "old.nif")
+    assert "deleted" in out  # version 1's folder: nothing uses it any more
+    assert sorted(p.name for p in paths.mods_dir("fallout4").iterdir()) == ["Cool (2)"]
+    assert main(["verify"]) == 0

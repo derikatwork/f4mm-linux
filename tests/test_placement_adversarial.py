@@ -232,3 +232,12 @@ def test_manual_plan_does_not_depend_on_input_order():
     expected = plan_for_roots(files, roots).to_dict()
     shuffled = list(reversed(files))
     assert plan_for_roots(shuffled, roots).to_dict() == expected
+
+
+def test_a_name_with_a_control_character_is_never_installed():
+    """No Windows file name can hold one, and a newline would split a line of plugins.txt."""
+    files = ["Data/Cool.esp", "Data/Evil.esp\n*Other.esp", "Data/textures/a\tb.dds"]
+    for plan in (analyze_files(files, header_reader=lambda _p: FO4),
+                 plan_for_roots(files, [""], Target.GAME_ROOT, header_reader=lambda _p: FO4)):
+        assert [m.source for m in plan.mappings] == ["Data/Cool.esp"]
+        assert sum("ignored unsafe path" in w for w in plan.warnings) == 2

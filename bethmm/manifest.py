@@ -15,6 +15,10 @@ did to each game folder.
   it is gone;
 * ``games``: per game, the root the deployment belongs to and whether mods are
   currently deployed (``purge`` clears it);
+* ``plugins``: per game, the plugins whose plugins.txt lines the app manages
+  (those of the mods it deployed): whether the line is there, whether it is
+  active, and -- for a line the app took out because the plugin was no longer
+  deployed -- the plugin it came after, so it goes back to the same place;
 * ``journal``: an append-only history of every file operation.
 
 Paths inside a game folder are stored relative to the game root, in the exact
@@ -32,6 +36,7 @@ import fcntl
 import json
 import os
 import sqlite3
+import urllib.parse
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -41,8 +46,8 @@ from typing import Iterator, Sequence
 from bethmm import paths
 from bethmm.pathresolve import fold_path
 
-#: 2 added ``left_alone`` and ``deployed.size`` / ``deployed.mtime_ns``.
-SCHEMA_VERSION = 2
+#: 2 added ``left_alone`` and ``deployed.size`` / ``deployed.mtime_ns``; 3 added ``plugins``.
+SCHEMA_VERSION = 3
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -117,6 +122,15 @@ CREATE TABLE IF NOT EXISTS journal (
     status TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS journal_unfinished ON journal (status) WHERE status = 'intent';
+CREATE TABLE IF NOT EXISTS plugins (
+    game_id TEXT NOT NULL,
+    name_key TEXT NOT NULL,
+    name TEXT NOT NULL,
+    listed INTEGER NOT NULL DEFAULT 1,
+    active INTEGER NOT NULL DEFAULT 1,
+    after TEXT,
+    PRIMARY KEY (game_id, name_key)
+);
 """
 
 
@@ -162,6 +176,24 @@ class ModRecord:
 
     def staging_dir(self) -> Path:
         return paths.mods_dir(self.game_id) / self.folder
+
+
+@dataclass(frozen=True)
+class PluginRecord:
+    """A plugin whose plugins.txt line the app manages."""
+
+    game_id: str
+    name: str
+    #: Its line is in plugins.txt (as far as the app knows).
+    listed: bool = True
+    active: bool = True
+    #: Lower-case name of the plugin it came after when the app took its line
+    #: out ("" = it was the first); None while it is listed.
+    after: str | None = None
+
+    @property
+    def key(self) -> str:
+        return self.name.lower()
 
 
 @dataclass(frozen=True)
@@ -223,16 +255,25 @@ def _is_locked(exc: BaseException) -> bool:
 
 class Manifest:
     def __init__(self, path: str | Path | None = None, *, lock: bool = False) -> None:
+        """With *lock*, for changes. Without it, a view -- for reading, and for
+        previews made in a transaction that is rolled back -- that never
+        creates or upgrades the file (a dry run changes nothing): a missing or
+        older manifest is read into memory and upgraded there."""
         self.path = Path(path) if path is not None else paths.manifest_path()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock_fd: int | None = None
         self._db: sqlite3.Connection | None = None
         if lock:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
             self._acquire_lock()
         try:
-            self._db = sqlite3.connect(self.path, timeout=10, isolation_level=None)
+            if lock or self._current_on_disk():
+                self._db = sqlite3.connect(self.path, timeout=10, isolation_level=None)
+            else:
+                self._db = self._in_memory()
             self._db.row_factory = sqlite3.Row
             self._db.execute("PRAGMA foreign_keys = ON")
+            if lock:
+                self._fast_commits()
             self._migrate()
         except BaseException as exc:
             if self._db is not None:
@@ -245,6 +286,52 @@ class Manifest:
             raise
 
     # ------------------------------------------------------------ lifecycle
+
+    def _fast_commits(self) -> None:
+        """Write-ahead log, synced at checkpoints rather than on every commit:
+        the journal entry of each file operation (three commits) costs
+        microseconds instead of milliseconds, and an entry is still safe the
+        moment it is committed if the app is killed or crashes (only a power
+        cut can lose the last few -- which 'verify --repair' recovers from like
+        any interrupted run). Readers no longer wait for a writer, either."""
+        try:
+            self._db.execute("PRAGMA journal_mode = WAL")
+            self._db.execute("PRAGMA synchronous = NORMAL")
+        except sqlite3.OperationalError as exc:  # busy: this run keeps the slower default
+            if not _is_locked(exc):
+                raise
+
+    def _read_only(self) -> sqlite3.Connection:
+        uri = "file:" + urllib.parse.quote(str(self.path.absolute())) + "?mode=ro"
+        return sqlite3.connect(uri, uri=True, timeout=10, isolation_level=None)
+
+    def _current_on_disk(self) -> bool:
+        """Whether the file exists with this version's schema (or a newer one,
+        which ``_migrate`` refuses), so a view can use it as it is."""
+        if not self.path.exists():
+            return False
+        db = self._read_only()
+        try:
+            if not db.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta'").fetchone():
+                return False
+            row = db.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
+            try:
+                return row is not None and int(row[0]) >= SCHEMA_VERSION
+            except ValueError:
+                return True  # _migrate says what is wrong with it
+        finally:
+            db.close()
+
+    def _in_memory(self) -> sqlite3.Connection:
+        """A copy of the file (or an empty manifest) to upgrade without writing it."""
+        mem = sqlite3.connect(":memory:", isolation_level=None)
+        if self.path.exists():
+            disk = self._read_only()
+            try:
+                disk.backup(mem)
+            finally:
+                disk.close()
+        return mem
 
     def _acquire_lock(self) -> None:
         lock_path = self.path.with_name(self.path.name + ".lock")
@@ -302,6 +389,25 @@ class Manifest:
                         raise
         self._db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?)",
                          (str(SCHEMA_VERSION),))
+
+    @contextmanager
+    def snapshot(self) -> Iterator[None]:
+        """Read several things as of one moment (another process may be
+        changing the manifest meanwhile). Changes nothing."""
+        if self._db.in_transaction:
+            yield
+            return
+        self._db.execute("BEGIN")
+        try:
+            yield
+        except BaseException:
+            try:
+                self._db.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass  # the error that got here is the one worth reporting
+            raise
+        else:
+            self._db.execute("COMMIT")
 
     @contextmanager
     def transaction(self) -> Iterator[None]:
@@ -388,7 +494,10 @@ class Manifest:
             cur = self._db.execute(
                 "INSERT INTO mods (game_id, name, folder, priority, enabled, version, nexus_id, source_archive, "
                 "installed_at, plan) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (game_id, name, folder, top + 1, int(enabled), version, nexus_id, source_archive, now(),
+                # To the microsecond: with the id and folder, it tells this mod
+                # apart from one installed later under a freed id and folder name.
+                (game_id, name, folder, top + 1, int(enabled), version, nexus_id, source_archive,
+                 datetime.now(timezone.utc).isoformat(timespec="microseconds"),
                  json.dumps(plan or {}, sort_keys=True)),
             )
             mod_id = cur.lastrowid
@@ -540,6 +649,20 @@ class Manifest:
 
     def forget_link(self, game_id: str, path: str) -> None:
         self._db.execute("DELETE FROM deployed WHERE game_id = ? AND path_key = ?", (game_id, fold_path(path)))
+
+    def plugin_records(self, game_id: str) -> dict[str, PluginRecord]:
+        rows = self._db.execute("SELECT * FROM plugins WHERE game_id = ?", (game_id,))
+        return {r["name_key"]: PluginRecord(r["game_id"], r["name"], bool(r["listed"]), bool(r["active"]), r["after"])
+                for r in rows}
+
+    def record_plugin(self, record: PluginRecord) -> None:
+        self._db.execute(
+            "INSERT OR REPLACE INTO plugins (game_id, name_key, name, listed, active, after) VALUES (?, ?, ?, ?, ?, ?)",
+            (record.game_id, record.key, record.name, int(record.listed), int(record.active), record.after),
+        )
+
+    def forget_plugin(self, game_id: str, name: str) -> None:
+        self._db.execute("DELETE FROM plugins WHERE game_id = ? AND name_key = ?", (game_id, name.lower()))
 
     def backups(self, game_id: str) -> dict[str, BackupRecord]:
         rows = self._db.execute("SELECT * FROM backups WHERE game_id = ?", (game_id,))

@@ -10,6 +10,8 @@ from pathlib import Path
 
 import pytest
 
+from bethmm.gui import desktop
+
 SCRIPT = Path(__file__).resolve().parent.parent / "install.sh"
 
 
@@ -31,7 +33,7 @@ def test_shellcheck():
 def test_help(shell):
     result = run("--help", shell=shell)
     assert result.returncode == 0, result.stderr
-    assert "--uninstall" in result.stdout and "--force" in result.stdout
+    assert "--uninstall" in result.stdout and "--force" in result.stdout and "--no-gui" in result.stdout
     assert "set -euo" not in result.stdout and "BASH_VERSION" not in result.stdout
 
 
@@ -40,9 +42,10 @@ def test_unknown_option():
     assert result.returncode != 0 and "unknown option" in result.stderr
 
 
-def fake_install(tmp_path: Path, exit_code: int, output: str) -> dict:
+def fake_install(tmp_path: Path, exit_code: int, output: str, *, gui: bool = False) -> dict:
     """A home with an installed app whose 'bethmm status --deployed-only'
-    prints *output* and exits with *exit_code*."""
+    prints *output* and exits with *exit_code* (with *gui*, also the
+    bethmm-gui command and the menu entry)."""
     home = tmp_path / "home"
     venv = home / ".local/share/beth-mod-manager/venv"
     (venv / "bin").mkdir(parents=True)
@@ -54,6 +57,12 @@ def fake_install(tmp_path: Path, exit_code: int, output: str) -> dict:
     bethmm.chmod(0o755)
     (home / ".local/bin").mkdir(parents=True)
     (home / ".local/bin/bethmm").symlink_to(bethmm)
+    if gui:
+        (venv / "bin" / "bethmm-gui").write_text("#!/bin/sh\nexit 0\n")
+        (home / ".local/bin/bethmm-gui").symlink_to(venv / "bin" / "bethmm-gui")
+        (home / ".local/share/applications").mkdir(parents=True)
+        (home / ".local/share/applications/beth-mod-manager.desktop").write_text(
+            desktop.desktop_entry(str(venv / "bin" / "bethmm-gui"), "/repo/icon.svg"))
     env = {k: v for k, v in os.environ.items() if not k.startswith("XDG_")}
     env["HOME"] = str(home)
     return env
@@ -158,3 +167,104 @@ def test_uninstall_refuses_when_the_command_belongs_to_another_install(tmp_path)
     result = run("--uninstall", env=env)
     assert result.returncode == 1 and "points at /opt/other" in result.stderr
     assert (home / ".local/share/beth-mod-manager/venv").exists()
+
+
+def test_uninstall_removes_the_gui_command_and_menu_entry(tmp_path):
+    env = fake_install(tmp_path, 0, "", gui=True)
+    home = Path(env["HOME"])
+    (home / ".local/share/applications/other.desktop").write_text("[Desktop Entry]\n")
+    result = run("--uninstall", env=env)
+    assert result.returncode == 0, result.stderr
+    assert not os.path.lexists(home / ".local/bin/bethmm-gui")
+    assert not os.path.lexists(home / ".local/share/applications/beth-mod-manager.desktop")
+    assert (home / ".local/share/applications/other.desktop").exists()
+
+
+def test_uninstall_leaves_a_menu_entry_and_command_it_did_not_make(tmp_path):
+    env = fake_install(tmp_path, 0, "", gui=True)
+    home = Path(env["HOME"])
+    entry = home / ".local/share/applications/beth-mod-manager.desktop"
+    entry.write_text("[Desktop Entry]\nName=Mine\nExec=/opt/mine\n")
+    (home / ".local/bin/bethmm-gui").unlink()
+    (home / ".local/bin/bethmm-gui").symlink_to("/opt/other/bethmm-gui")
+    result = run("--uninstall", env=env)
+    assert result.returncode == 0, result.stderr
+    assert entry.read_text() == "[Desktop Entry]\nName=Mine\nExec=/opt/mine\n"
+    assert os.readlink(home / ".local/bin/bethmm-gui") == "/opt/other/bethmm-gui"
+
+
+def test_uninstall_finds_a_leftover_menu_entry(tmp_path):
+    env = fake_install(tmp_path, 0, "", gui=True)
+    home = Path(env["HOME"])
+    shutil.rmtree(home / ".local/share/beth-mod-manager/venv")
+    (home / ".local/bin/bethmm").unlink()
+    result = run("--uninstall", env=env)
+    assert result.returncode == 0, result.stderr
+    assert not os.path.lexists(home / ".local/share/applications/beth-mod-manager.desktop")
+
+
+def test_the_script_and_the_app_agree_on_the_menu_entry_marker():
+    assert f'DESKTOP_MARKER="{desktop.MARKER}"' in SCRIPT.read_text()
+
+
+def _exec_argv(entry: str) -> list[str]:
+    """What a desktop environment runs for the entry's Exec line (string
+    escapes, then field codes, then the quoting), with no files given."""
+    (line,) = [x for x in entry.splitlines() if x.startswith("Exec=")]
+    value, out, i = line[len("Exec="):], [], 0
+    while i < len(value):
+        if value[i] == "\\":
+            out.append({"s": " ", "n": "\n", "t": "\t", "r": "\r", "\\": "\\"}[value[i + 1]])
+            i += 2
+        else:
+            out.append(value[i])
+            i += 1
+    value = "".join(out)
+    assert value.endswith(" %F")
+    value = value[:-3].replace("%%", "%")
+    # The spec's quoting: inside "...", a backslash escapes " ` $ and itself.
+    args, current, quoted, i = [], None, False, 0
+    while i < len(value):
+        c = value[i]
+        if quoted and c == "\\" and value[i + 1] in '"`$\\':
+            current += value[i + 1]
+            i += 1
+        elif c == '"':
+            quoted, current = not quoted, current or ""
+        elif c == " " and not quoted:
+            if current is not None:
+                args.append(current)
+            current = None
+        else:
+            current = (current or "") + c
+        i += 1
+    assert not quoted
+    return args + ([current] if current is not None else [])
+
+
+@pytest.mark.parametrize("exe", [
+    "/home/me/.local/share/beth-mod-manager/venv/bin/bethmm-gui",
+    "/home/Jo Smith/.local/share/beth-mod-manager/venv/bin/bethmm-gui",
+    '/home/odd $HOME `x` "q" 100% back\\slash/venv/bin/bethmm-gui',
+])
+def test_menu_entry_runs_the_gui_whatever_the_path(exe):
+    entry = desktop.desktop_entry(exe, "/repo/bethmm/gui/icon.svg")
+    assert _exec_argv(entry) == [exe]
+    assert entry.startswith("[Desktop Entry]\n") and desktop.MARKER in entry.splitlines()
+    assert "Icon=/repo/bethmm/gui/icon.svg" in entry.splitlines()
+
+
+def test_menu_entry_command_line(capsys):
+    assert desktop.main(["/x/bethmm-gui", "/x/icon.svg"]) == 0
+    assert "Exec=\"/x/bethmm-gui\" %F" in capsys.readouterr().out
+    assert desktop.main([]) == 2
+
+
+def test_the_test_tools_install_without_qt():
+    """--dev --no-gui: pytest-qt refuses to start without a Qt binding, so it
+    comes only with the GUI's test extra."""
+    import tomllib
+    extras = tomllib.loads((SCRIPT.parent / "pyproject.toml").read_text())["project"]["optional-dependencies"]
+    assert not any("pytest-qt" in r for r in extras["dev"])
+    assert any("pytest-qt" in r for r in extras["gui-dev"])
+    assert "EXTRA_NAMES+=(gui-dev)" in SCRIPT.read_text()

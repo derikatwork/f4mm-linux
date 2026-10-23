@@ -72,8 +72,9 @@ from __future__ import annotations
 
 import os
 import stat
+import unicodedata
 from collections import deque
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 from typing import Callable, Iterable, Iterator, Sequence
@@ -107,7 +108,7 @@ KNOWN_DATA_DIRS = frozenset({
 
 #: Folders that belong in the game root (next to the exe).
 GAME_ROOT_DIRS = frozenset({
-    "enbseries", "enbcache", "reshade-shaders", "reshade", "injector",
+    "enbseries", "enbcache", "reshade-shaders",
 })
 
 #: Exact file names that belong in the game root.
@@ -224,6 +225,9 @@ class PlacementPlan:
     unplaced: list[str] = field(default_factory=list)
     #: Source path of fomod/ModuleConfig.xml when the mod is a FOMOD installer.
     fomod_config: str | None = None
+    #: The choices made in the installer (``fomod.Wizard.choices``) once it
+    #: has run and the mappings are its files; None before.
+    fomod_choices: list[dict] | None = None
     candidate_roots: list[RootCandidate] = field(default_factory=list)
     game: GameGuess = field(default_factory=lambda: GameGuess(None, Confidence.NONE))
     nexus: NexusInfo | None = None
@@ -247,6 +251,7 @@ class PlacementPlan:
             "unplaced": list(self.unplaced),
             "fomod_config": self.fomod_config,
             "is_fomod": self.is_fomod,
+            "fomod_choices": self.fomod_choices,
             "candidate_roots": [
                 {"path": c.path, "target": c.target.value, "rule": c.rule.value}
                 for c in self.candidate_roots
@@ -338,12 +343,18 @@ def _names(items: Sequence[str], limit: int = 4) -> str:
     return shown if len(items) <= limit else f"{shown} and {len(items) - limit} more"
 
 
+def has_control_char(path: str) -> bool:
+    """Whether *path* has a control character (a newline, ESC, ...): a game
+    can't use such a file, and one would split a line of plugins.txt."""
+    return any(unicodedata.category(c) == "Cc" for c in path)
+
+
 def _normalize_files(files: Iterable[str]) -> tuple[list[str], list[str]]:
     """POSIX-style, de-duplicated, sorted file paths, plus warnings.
 
     Entries ending in a separator are directories and are dropped, as are
-    empty ones; entries with ``..`` components are unsafe and dropped with a
-    warning.
+    empty ones; entries with ``..`` components or control characters are
+    unsafe and dropped with a warning.
     """
     seen: dict[str, None] = {}
     warnings: list[str] = []
@@ -354,7 +365,7 @@ def _normalize_files(files: Iterable[str]) -> tuple[list[str], list[str]]:
         parts = [p for p in path.split("/") if p not in ("", ".")]
         if not parts:
             continue
-        if ".." in parts:
+        if ".." in parts or has_control_char(path):
             warnings.append(f"ignored unsafe path {str(raw)!r}")
             continue
         seen.setdefault("/".join(parts), None)
@@ -477,7 +488,9 @@ def _signals(node: _Dir) -> _Signals:
         if low == "data":
             s.data_dirs.append(name)
         elif low == "fomod":
-            config = next((src for n, src in sub.files.items() if n.lower() == "moduleconfig.xml"), None)
+            # The XML installer, or the older C# one (FOMM): either chooses what to install.
+            config = next((src for n, src in sub.files.items() if n.lower() == "moduleconfig.xml"), None) \
+                or next((src for n, src in sub.files.items() if n.lower() == "script.cs"), None)
             if s.fomod_config is None:
                 s.fomod_config = config
         elif low in KNOWN_DATA_DIRS:
@@ -508,8 +521,17 @@ def _ignorable_file(name: str) -> bool:
 def _wrapper_child(node: _Dir) -> _Dir | None:
     """The folder to descend into when *node* is only a wrapper (rule 1)."""
     dirs = [d for n, d in node.dirs.items() if not _is_junk(n) and n.lower() not in DOC_DIRS]
-    if len(dirs) != 1 or dirs[0].name.lower() in _RECOGNISED_DIRS:
+    if len(dirs) != 1:
         return None
+    # A recognised folder (textures/, F4SE/ with Plugins/ ...) is the mod's
+    # content -- unless it wraps a script extender's loader (a repacked
+    # "F4SE/f4se_loader.exe") or a Data folder ("Tools/Data/x.esp"): no
+    # folder of that name holds those.
+    low = dirs[0].name.lower()
+    if low in _RECOGNISED_DIRS:
+        inner = _signals(dirs[0])
+        if low in ("data", "fomod") or not (inner.loaders or inner.data_dirs):
+            return None
     if not all(_ignorable_file(name) for name in node.files):
         return None
     return dirs[0]
@@ -747,6 +769,20 @@ def _common_parent(paths: Sequence[str]) -> str:
             break
         common.append(parts[0])
     return "/".join(common)
+
+
+def plan_for_fomod(plan: PlacementPlan, files: Iterable[str], mappings: Sequence[FileMapping],
+                   choices: list[dict], *, warnings: Sequence[str] = (), chosen: Sequence[str] = ()) -> PlacementPlan:
+    """*plan* (a FOMOD plan) with the files its installer chose: they go into
+    Data; everything else in the archive is not installed."""
+    mapped = {m.source for m in mappings}
+    reasons = ["you ran its FOMOD installer"
+               + (f" and chose {', '.join(repr(c) for c in chosen[:8])}" + (", ..." if len(chosen) > 8 else "")
+                  if chosen else "")]
+    return replace(plan, target=Target.DATA, rule=Rule.FOMOD, confidence=Confidence.HIGH,
+                   reasons=reasons, warnings=list(plan.warnings) + list(warnings), mappings=list(mappings),
+                   skipped=sorted(f for f in files if f not in mapped), unplaced=[], candidate_roots=[],
+                   fomod_choices=list(choices))
 
 
 def plan_for_roots(

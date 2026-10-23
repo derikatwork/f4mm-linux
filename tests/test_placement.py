@@ -1183,3 +1183,32 @@ def test_unknown_and_fomod_plans_list_unplaced_files():
     fomod = analyze_files(["fomod/ModuleConfig.xml", "00 Core/a.esp", "01 Opt/b.esp"])
     assert fomod.unplaced == ["00 Core/a.esp", "01 Opt/b.esp"]
     assert analyze_files(["a.esp"]).unplaced == []
+
+
+def test_a_script_extender_repacked_in_its_own_named_folder_goes_to_the_game_folder():
+    plan = analyze_files(["F4SE/f4se_loader.exe", "F4SE/f4se_1_10_163.dll", "F4SE/Data/Scripts/a.pex"])
+    assert plan.target is Target.GAME_ROOT
+    assert {m.dest for m in plan.mappings} == {"f4se_loader.exe", "f4se_1_10_163.dll", "Data/Scripts/a.pex"}
+    plan = analyze_files(["F4SE/Plugins/x.dll"])  # a plugin for it is Data content as before
+    assert [m.dest for m in plan.mappings] == ["Data/F4SE/Plugins/x.dll"]
+
+
+def test_a_scripted_fomod_installer_is_an_installer():
+    """FOMM's C# installers (fomod/script.cs) choose what to install, like ModuleConfig.xml ones."""
+    plan = analyze_files(["fomod/info.xml", "fomod/script.cs", "A.esp", "A - Hardcore.esp", "Optional/textures/a.dds"])
+    assert plan.is_fomod and plan.fomod_config == "fomod/script.cs" and plan.mappings == []
+    plan = analyze_files(["fomod/info.xml", "A.esp"])  # info.xml alone is only a description
+    assert not plan.is_fomod and [m.dest for m in plan.mappings] == ["Data/A.esp"]
+
+
+@pytest.mark.parametrize("wrapper", ["ReShade", "Injector"])
+def test_a_shader_injector_in_its_own_folder_goes_next_to_the_exe(wrapper):
+    plan = analyze_files([f"{wrapper}/dxgi.dll", f"{wrapper}/ReShade.ini", f"{wrapper}/reshade-shaders/Shaders/a.fx",
+                          "Readme.txt"])
+    assert plan.target is Target.GAME_ROOT
+    assert {m.dest for m in plan.mappings} == {"dxgi.dll", "ReShade.ini", "reshade-shaders/Shaders/a.fx"}
+
+
+def test_a_known_folder_wrapping_a_data_folder_is_stepped_into():
+    plan = analyze_files(["Tools/Data/MyTool.esp"])
+    assert [m.dest for m in plan.mappings] == ["Data/MyTool.esp"]

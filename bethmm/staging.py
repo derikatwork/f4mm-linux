@@ -20,7 +20,8 @@ or, when *roots*/*target* are given, ``placement.plan_for_roots``.
 move across filesystems) and records the mod in the manifest with one
 ``ModFile`` per plan mapping (``source`` relative to the staging folder,
 ``dest`` relative to the game root). Files the plan skipped (readmes ...) stay
-in the staging folder but are never deployed.
+in the staging folder but are never deployed -- except for a FOMOD installer's
+plan: only the files its chosen options install are kept.
 
 With *replace* (an existing ``ModRecord`` of the same game) the existing
 record is updated in place -- same priority, same enabled state, new folder,
@@ -43,12 +44,14 @@ Every file operation is logged.
 from __future__ import annotations
 
 import errno
+import fcntl
 import logging
 import os
 import re
 import shutil
 import stat
 import tempfile
+import time
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -88,6 +91,35 @@ class StagingError(Exception):
 
 
 @dataclass
+class InUse:
+    """A shared lock on an extraction folder for as long as this process uses
+    it: ``remove_stale_extractions`` (in any process) leaves it alone, however
+    long an install dialog or prompt stays open. Without file locking (some
+    network filesystems) only the folder's age protects it."""
+
+    def __init__(self, folder: Path) -> None:
+        self._fd: int | None = None
+        try:
+            fd = os.open(folder, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        except OSError as exc:
+            log.debug("can't lock %s: %s", folder, exc)
+            return
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH)
+        except OSError as exc:
+            log.debug("can't lock %s: %s", folder, exc)
+            os.close(fd)
+            return
+        self._fd = fd
+
+    def release(self) -> None:
+        """Safe to call twice (several Prepared share one after replan)."""
+        fd, self._fd = self._fd, None
+        if fd is not None:
+            os.close(fd)
+
+
+@dataclass
 class Prepared:
     #: The archive or folder the user picked.
     source: Path
@@ -99,6 +131,8 @@ class Prepared:
     files: list[str]
     plan: PlacementPlan
     warnings: list[str] = field(default_factory=list)
+    #: Held until ``discard``.
+    in_use: InUse | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass
@@ -111,6 +145,46 @@ class CommitResult:
 
 
 # ---------------------------------------------------------------- prepare
+
+
+#: A temporary extraction untouched this long, and not locked by a running
+#: copy of the app (see ``InUse``), was left by a run that was killed.
+STALE_SECONDS = 6 * 3600
+
+
+def remove_stale_extractions(tmp: Path | None = None) -> None:
+    """Remove analyze-*/install-* folders that runs which never finished left
+    in the app's temporary folder."""
+    tmp = paths.tmp_dir() if tmp is None else tmp
+    cutoff = time.time() - STALE_SECONDS
+    try:
+        entries = list(os.scandir(tmp))
+    except OSError:
+        return
+    for entry in entries:
+        try:
+            stale = entry.name.startswith(("analyze-", _WORKDIR_PREFIX)) and entry.is_dir(follow_symlinks=False) \
+                and entry.stat(follow_symlinks=False).st_mtime < cutoff
+        except OSError:
+            continue
+        if not stale:
+            continue
+        try:
+            fd = os.open(entry.path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        except OSError:
+            continue
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                continue  # a running install is still using it
+            except OSError:
+                pass  # no file locking here: the age decides
+            _remove_tree(Path(entry.path), tmp, 1, "the app's temporary folder")
+        except (OSError, StagingError) as exc:
+            log.warning("could not delete %s: %s", entry.path, exc)
+        finally:
+            os.close(fd)
 
 
 def prepare(
@@ -140,10 +214,12 @@ def prepare(
 
     tmp = paths.tmp_dir()
     _mkdir(tmp)
+    remove_stale_extractions(tmp)
     if is_folder and _inside_or_same(os.path.realpath(tmp), os.path.realpath(source)):
         raise StagingError(f"can't install {source}: it contains the app's own data folder")
     workdir = Path(tempfile.mkdtemp(prefix=_WORKDIR_PREFIX, dir=tmp))
     log.info("MKDIR %s", workdir)
+    in_use = InUse(workdir)
     files_dir = workdir / "x"
     try:
         warnings: list[str] = []
@@ -167,8 +243,26 @@ def prepare(
             _remove_tree(workdir, paths.tmp_dir(), 1, "the app's temporary folder")
         except (OSError, StagingError) as exc:
             log.error("could not remove the temporary folder %s: %s", workdir, exc)
+        in_use.release()
         raise
-    return Prepared(source, workdir, files_dir, sorted(files), plan, warnings)
+    return Prepared(source, workdir, files_dir, sorted(files), plan, warnings, in_use)
+
+
+def replan(prepared: Prepared, roots: Sequence[str] | None, target: Target | None, *,
+           installed_games: Sequence[str] = ()) -> Prepared:
+    """*prepared* with a new plan for the chosen *roots* and *target* (the
+    files stay where they were extracted; ``None`` for both: automatic).
+    Raises ``ValueError`` from ``plan_for_roots`` for an invalid choice."""
+    files, reader, _warnings = placement.scan_directory(prepared.files_dir)
+    options = dict(header_reader=reader, installed_games=installed_games, archive_name=prepared.source.name)
+    if not roots and target is None:
+        plan = placement.analyze_files(files, **options)
+    else:
+        if not roots:
+            roots = [placement.analyze_files(files).root]
+        plan = placement.plan_for_roots(files, roots, target, **options)
+    return Prepared(prepared.source, prepared.workdir, prepared.files_dir, sorted(files), plan,
+                    list(prepared.warnings), prepared.in_use)
 
 
 def _copy_folder(source: Path, dest: Path) -> list[str]:
@@ -398,6 +492,17 @@ def unretire(folder: Path) -> None:
         log.error("could not remove %s: %s", marker, exc)
 
 
+def _mark_installing(files_dir: Path) -> None:
+    """Mark the extracted files before they move into the mods folder: if the
+    app dies before the mod is recorded, 'verify --repair' knows the folder
+    is its own (no mod uses it) and deletes it. ``commit`` takes it off again."""
+    marker = files_dir / RETIRED_MARKER
+    if os.path.lexists(marker):  # a mod shipping a file of that name keeps it
+        return
+    marker.write_text("This folder is being installed. If that was interrupted, the app deletes it.\n")
+    log.info("WRITE %s", marker)
+
+
 def is_retired(folder: Path) -> bool:
     """Whether *folder* is one the app no longer needs: marked retired, or
     left by an interrupted deletion."""
@@ -424,7 +529,8 @@ def commit(
     UNKNOWN (the user must choose a root/target first), when the plan is a
     FOMOD without mappings, when *replace* belongs to another game, or when
     ``prepared.files_dir`` is not an install folder made by ``prepare``. A
-    failure or interruption before the manifest is saved moves the files back.
+    failure or interruption before the manifest is saved moves the files back
+    (for a FOMOD plan, only the chosen ones: the rest is deleted first).
     The manifest's ``plan`` field stores ``{"root", "target", "rule",
     "wrapper_dirs", "skipped": <count>}`` from the PlacementPlan.
 
@@ -487,6 +593,7 @@ def commit(
             "rule": plan.rule.value,
             "wrapper_dirs": list(plan.wrapper_dirs),
             "skipped": len(plan.skipped),
+            **({"fomod": {"choices": plan.fomod_choices}} if plan.fomod_choices is not None else {}),
         },
     )
 
@@ -495,6 +602,10 @@ def commit(
         # Marked before the switch, so even if the app dies during the redeploy
         # that follows, 'verify --repair' deletes it once no link uses it.
         retire(old_folder)
+    if plan.fomod_choices is not None:
+        _keep_only(prepared.files_dir, {m.source for m in plan.mappings})
+    shipped_marker = os.path.lexists(prepared.files_dir / RETIRED_MARKER)
+    _mark_installing(prepared.files_dir)
     _move(prepared.files_dir, staging)
     try:
         # One transaction around the write and its read-back: an interruption
@@ -516,9 +627,32 @@ def commit(
         if old_folder is not None:
             unretire(old_folder)
         raise
+    if not shipped_marker:
+        unretire(staging)  # recorded: the folder is the mod's now
     log.info("%s mod %r (#%d) for %s in %s with %d files", "UPDATED" if result.replaced else "INSTALLED",
              mod.name, mod.id, game_id, staging, len(files))
     return result
+
+
+def _keep_only(folder: Path, keep: set[str]) -> None:
+    """Delete the extracted files that aren't in *keep* (what a FOMOD
+    installer's unchosen options would have installed): only the chosen files
+    are kept with the mod. Only ever inside the app's temporary folder."""
+    _check_location(folder, paths.tmp_dir(), 2, "the app's temporary folder")
+    removed = 0
+    for dirpath, dirnames, filenames in os.walk(folder, topdown=False):
+        for name in filenames:
+            full = os.path.join(dirpath, name)
+            if os.path.relpath(full, folder).replace(os.sep, "/") not in keep:
+                os.unlink(full)
+                removed += 1
+        for name in dirnames:
+            full = os.path.join(dirpath, name)
+            try:
+                os.unlink(full) if os.path.islink(full) else os.rmdir(full)
+            except OSError:
+                pass  # still holds chosen files
+    log.info("DELETE %d file(s) in %s that the installer's choices don't install", removed, folder)
 
 
 def checked_files(prepared: Prepared) -> list[ModFile]:
@@ -527,13 +661,18 @@ def checked_files(prepared: Prepared) -> list[ModFile]:
     base = os.path.realpath(prepared.files_dir)
     files: list[ModFile] = []
     bad: list[str] = []
+    not_utf8: list[str] = []
     for m in prepared.plan.mappings:
+        try:
+            m.source.encode("utf-8")
+            m.dest.encode("utf-8")
+        except UnicodeEncodeError:
+            not_utf8.append(m.source)
+            continue
         try:
             fold_path(m.source)
             fold_path(m.dest)
-            m.source.encode("utf-8")
-            m.dest.encode("utf-8")
-        except (ValueError, UnicodeEncodeError):
+        except ValueError:
             bad.append(m.source)
             continue
         full = os.path.join(prepared.files_dir, m.source)
@@ -545,10 +684,18 @@ def checked_files(prepared: Prepared) -> list[ModFile]:
             bad.append(m.source)
             continue
         files.append(ModFile(source=m.source, dest=m.dest))
+    def listed(names: list[str]) -> str:
+        more = f" and {len(names) - 5} more" if len(names) > 5 else ""
+        return ", ".join(repr(_clean_path(Path(n))) for n in names[:5]) + more
+
+    if not_utf8:
+        raise StagingError(
+            f"these file names aren't valid UTF-8: {listed(not_utf8)}. Archives made on Windows sometimes store "
+            "names in a local code page; extract it with a tool that lets you choose the code page (for a zip: "
+            "unzip -O CP437, or CP866 for Cyrillic names) and install the extracted folder"
+        )
     if bad:
-        shown = ", ".join(repr(b) for b in bad[:5])
-        more = f" and {len(bad) - 5} more" if len(bad) > 5 else ""
-        raise StagingError(f"can't install these files (missing, not regular files or unusable names): {shown}{more}")
+        raise StagingError(f"can't install these files (missing, not regular files or unusable names): {listed(bad)}")
     return files
 
 
@@ -577,6 +724,8 @@ def discard(prepared: Prepared) -> None:
         _remove_tree(prepared.workdir, paths.tmp_dir(), 1, "the app's temporary folder")
     except OSError as exc:
         log.error("could not remove the temporary folder %s: %s", prepared.workdir, exc)
+    if prepared.in_use is not None:
+        prepared.in_use.release()
 
 
 #: A staging folder being deleted is renamed to ".<name>" + this first, so a

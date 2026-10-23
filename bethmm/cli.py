@@ -29,18 +29,17 @@ import signal
 import sqlite3
 import sys
 import tempfile
-import time
 from pathlib import Path
 
 from bethmm import APP_NAME, __version__, deploy, paths
 from bethmm.archive import ArchiveError, extract_archive
 from bethmm.deploy import DeployError
 from bethmm.manifest import BUSY_MESSAGE, Manifest, ManifestError
-from bethmm.staging import StagingError
+from bethmm.service import ResolvedFile, ServiceError, link_owners, resolve_against_game
+from bethmm.staging import StagingError, remove_stale_extractions
 from bethmm.discovery import DiscoveredGame, cache_is_current, get_games
 from bethmm.games import GAMES
-from bethmm.log import setup_logging
-from bethmm.pathresolve import CaseResolver, fold_path
+from bethmm.log import setup_logging, visible_controls
 from bethmm.placement import (
     Confidence,
     PlacementPlan,
@@ -55,12 +54,29 @@ from bethmm.settings import LINK_MODES, GameOverride, Settings, SettingsError, l
 
 log = logging.getLogger(__name__)
 
-#: Leftover analyze-* extraction folders older than this are removed.
-STALE_TMP_SECONDS = 6 * 3600
-
 
 class CliError(Exception):
     pass
+
+
+class _VisibleControls:
+    """A text stream writing control characters as visible ``\\xNN`` (see
+    ``log.VISIBLE_CONTROLS``): the names the commands print come from archives
+    and plugin headers, and must not drive the terminal."""
+
+    def __init__(self, stream) -> None:
+        self._stream = stream
+
+    def write(self, text: str) -> int:
+        self._stream.write(visible_controls(text))
+        return len(text)
+
+    def writelines(self, lines) -> None:
+        for line in lines:
+            self.write(line)
+
+    def __getattr__(self, name: str):
+        return getattr(self._stream, name)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -68,6 +84,17 @@ def main(argv: list[str] | None = None) -> int:
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(errors="backslashreplace")
+    if isinstance(sys.stdout, _VisibleControls):  # called from within a command
+        return _main(argv)
+    out, err = sys.stdout, sys.stderr
+    sys.stdout, sys.stderr = _VisibleControls(out), _VisibleControls(err)
+    try:
+        return _main(argv)
+    finally:
+        sys.stdout, sys.stderr = out, err
+
+
+def _main(argv: list[str] | None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if not getattr(args, "func", None):
@@ -80,7 +107,7 @@ def main(argv: list[str] | None = None) -> int:
     previous = {sig: signal.signal(sig, _exit_on_signal) for sig in (signal.SIGTERM, signal.SIGHUP)}
     try:
         return args.func(args) or 0
-    except (CliError, ArchiveError, SettingsError, DeployError, ManifestError, StagingError) as exc:
+    except (CliError, ArchiveError, SettingsError, DeployError, ManifestError, StagingError, ServiceError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     except sqlite3.Error as exc:
@@ -109,6 +136,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="bethmm", description=f"{APP_NAME} {__version__}")
     parser.add_argument("--version", action="version", version=f"{APP_NAME} {__version__}")
     sub = parser.add_subparsers(metavar="command")
+
+    p = sub.add_parser("gui", help="open the desktop GUI")
+    p.add_argument("archives", nargs="*", help="archives or folders to install once it is open")
+    p.set_defaults(func=cmd_gui)
 
     p = sub.add_parser("games", help="list the Bethesda games found under Lutris")
     p.add_argument("--rescan", action="store_true", help="ignore the cache and search again")
@@ -150,7 +181,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     from bethmm import cli_mods
 
-    cli_mods.register(sub, CliError)
+    cli_mods.register(sub)
     return parser
 
 
@@ -219,12 +250,12 @@ def cmd_analyze(args) -> int:
 
     game_id = args.game or plan.game.game_id
     game = next((g for g in games if g.game_id == game_id), None)
-    resolved = _resolve_against_game(plan, game, link_owners(game.game_id)) if game else []
+    resolved = resolve_against_game(plan, game, link_owners(game.game_id)) if game else []
 
     if args.json:
         data = plan.to_dict()
         data["checked_against"] = str(game.root) if game else None
-        data["resolved"] = resolved
+        data["resolved"] = [r.to_dict() for r in resolved]
         print(json.dumps(data, indent=2))
     else:
         print(format_plan(plan, game_id, game, resolved, installed=installed, source=str(args.path)))
@@ -251,7 +282,7 @@ def _plan(folder: Path, args, installed: list[str], archive_name: str) -> Placem
 def _analyze_archive(archive: Path, args, settings: Settings, installed: list[str]) -> PlacementPlan:
     tmp = paths.tmp_dir()
     tmp.mkdir(parents=True, exist_ok=True)
-    _remove_stale_extractions(tmp)
+    remove_stale_extractions(tmp)
     workdir = Path(tempfile.mkdtemp(prefix="analyze-", dir=tmp))
     log.info("MKDIR %s (temporary extraction)", workdir)
     try:
@@ -270,86 +301,6 @@ def _remove_tree(folder: Path) -> None:
 
     shutil.rmtree(folder, onerror=on_error)
     log.info("DELETE %s (temporary extraction)", folder)
-
-
-def _remove_stale_extractions(tmp: Path) -> None:
-    """Remove analyze-*/install-* folders left behind by a run that was killed."""
-    cutoff = time.time() - STALE_TMP_SECONDS
-    try:
-        entries = list(os.scandir(tmp))
-    except OSError:
-        return
-    for entry in entries:
-        try:
-            stale = entry.name.startswith(("analyze-", "install-")) and entry.is_dir(follow_symlinks=False) \
-                and entry.stat(follow_symlinks=False).st_mtime < cutoff
-        except OSError:
-            continue
-        if stale:
-            _remove_tree(Path(entry.path))
-
-
-def link_owners(game_id: str, manifest: Manifest | None = None) -> dict[str, tuple[int, str]]:
-    """Folded path -> (id, name) of the installed mod whose link the app put
-    there (read-only; empty when nothing was ever installed)."""
-    if manifest is None:
-        if not paths.manifest_path().exists():
-            return {}
-        try:
-            with Manifest() as opened:
-                return link_owners(game_id, opened)
-        except ManifestError:
-            return {}
-    names = {m.id: m.name for m in manifest.mods(game_id)}
-    return {key: (d.mod_id, names.get(d.mod_id, "another mod")) for key, d in manifest.deployed(game_id).items()}
-
-
-def _resolve_against_game(plan: PlacementPlan, game: DiscoveredGame,
-                          owners: dict[str, tuple[int, str]] | None = None,
-                          replacing: int | None = None) -> list[dict]:
-    """Where each mapping would land in the real game folder (read-only).
-    *owners* (from :func:`link_owners`) tells the app's links from game
-    files; *replacing* is the mod this one updates."""
-    if not game.root.is_dir():
-        return []
-    resolver = CaseResolver(game.root)
-    owners = owners or {}
-    out = []
-    for m in plan.mappings:
-        r = resolver.resolve(m.dest, plan=True)
-        owner = owners.get(fold_path(str(r.rel)))
-        if r.type_conflict:
-            status = "conflict: a folder/file of the other type already exists there"
-        elif r.exists_on_disk and owner is not None and owner[0] == replacing:
-            status = "replaces the previous version's file"
-        elif r.exists_on_disk and owner is not None:
-            status = f"overrides {owner[1]} (its file stays installed)"
-        elif r.exists_on_disk:
-            status = "replaces an existing game file (it would be backed up)"
-        elif r.exists:
-            status = "duplicate within this mod"
-        else:
-            status = "new"
-        out.append({
-            "source": m.source,
-            "dest": str(r.rel),
-            "case_adjusted": _case_note(m.dest, r.rel, game.root),
-            "status": status,
-            "new_dirs": [str(d) for d in r.new_dirs],
-            "notes": list(r.ambiguous),
-        })
-    return out
-
-
-def _case_note(wanted: str, rel, root: Path) -> str | None:
-    """Why the resolved path is spelled differently from the mod's, if it is."""
-    wanted_parts = wanted.replace("\\", "/").split("/")
-    reasons = set()
-    for i, (mine, actual) in enumerate(zip(wanted_parts, rel.parts)):
-        if mine != actual:
-            on_disk = os.path.lexists(root.joinpath(*rel.parts[: i + 1]))
-            reasons.add("case matched to existing folder" if on_disk else "new folder spelled like the game's folders")
-    return "; ".join(sorted(reasons)) or None
 
 
 _RULE_TEXT = {
@@ -372,7 +323,7 @@ def format_plan(
     plan: PlacementPlan,
     game_id: str | None,
     game: DiscoveredGame | None,
-    resolved: list[dict],
+    resolved: list[ResolvedFile],
     *,
     installed: list[str] | None = None,
     source: str = "<archive>",
@@ -414,10 +365,10 @@ def format_plan(
     for warning in plan.warnings:
         out.append(f"  ! {warning}")
 
-    if plan.is_fomod:
+    if plan.is_fomod and plan.fomod_choices is None:
         out.append("")
-        out.append(f"This is a FOMOD installer ({plan.fomod_config}). The guided installer arrives in a later")
-        out.append("phase; until then you pick which sub-folders to install.")
+        out.append(f"This is a FOMOD installer ({plan.fomod_config}): 'bethmm install' runs it and asks for its")
+        out.append("options. To install folders of your choice instead, add --root (and --target).")
 
     if plan.candidate_roots:
         out.append("")
@@ -439,13 +390,13 @@ def format_plan(
         where = f" in {game.root}" if game and resolved else ""
         out.append(f"Files ({len(plan.mappings)}){where}:")
         if resolved:
-            for note in dict.fromkeys(n for r in resolved for n in r["notes"]):
+            for note in dict.fromkeys(n for r in resolved for n in r.notes):
                 out.append(f"  ! {note}")
             for r in resolved:
-                note = "" if r["status"] == "new" else f"   [{r['status']}]"
-                if r["case_adjusted"]:
-                    note += f"   [{r['case_adjusted']}]"
-                out.append(f"  {r['source']}  ->  {r['dest']}{note}")
+                note = "" if r.status == "new" else f"   [{r.status}]"
+                if r.case_adjusted:
+                    note += f"   [{r.case_adjusted}]"
+                out.append(f"  {r.source}  ->  {r.dest}{note}")
         else:
             for m in plan.mappings:
                 out.append(f"  {m.source}  ->  {m.dest}")
@@ -527,6 +478,12 @@ def cmd_plugin_info(args) -> int:
 # ---------------------------------------------------------------- settings
 
 
+def cmd_gui(args) -> int:
+    from bethmm.gui import main as gui_main
+
+    return gui_main(list(args.archives))
+
+
 def cmd_config(args) -> int:
     settings = load_settings()
     changed = False
@@ -582,6 +539,19 @@ def cmd_override(args) -> int:
                 deploy.check_link_mode(deploy.GameTarget(args.game, match.root, mode))
             except deploy.DeployError as exc:
                 print(f"warning: {exc}", file=sys.stderr)
+        other = 0
+        if paths.manifest_path().exists():
+            try:
+                with Manifest() as manifest, manifest.snapshot():
+                    state = manifest.game_state(args.game)
+                    # A purged game is left alone: a deploy would put every mod back.
+                    if state is None or state.deployed:
+                        other = sum(d.link_type != mode for d in manifest.deployed(args.game).values())
+            except (ManifestError, sqlite3.Error) as exc:  # the settings are saved all the same
+                print(f"warning: could not read the mod list: {exc}", file=sys.stderr)
+            if other:
+                print(f"  {other} mod file(s) in the game folder are still linked the other way; "
+                      f"'bethmm deploy --game {args.game}' relinks them as {mode}s.")
     else:
         print(f"{GAMES[args.game].name} is not currently listed (not found, or ignored).")
     for w in warnings:

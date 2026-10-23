@@ -1355,17 +1355,22 @@ def test_file_and_folder_collision_between_mods(world):
     a = add_mod(world.manifest, "A", {"Data/Thing": "a file"})
     b = add_mod(world.manifest, "B", {"Data/thing/inside.txt": "in a folder"})
     world.deploy()
-    # One of them is blocked; nothing crashes and repeated deploys are stable.
+    # The mod lower in the list wins, as in any conflict; repeated deploys are stable.
+    assert world.path("Data/thing/inside.txt").is_symlink() and not world.path("Data/thing").is_symlink()
+    assert world.plan().changes == []
+    world.manifest.set_enabled(b.id, False)
+    world.refresh()  # one run: the folder goes, the file comes
     assert world.path("Data/Thing").is_symlink()
     assert world.plan().changes == []
-    world.manifest.set_enabled(a.id, False)
-    world.refresh()
-    world.deploy()  # the folder can only be made once the file link is gone
-    assert world.path("Data/thing/inside.txt").is_symlink() or world.path("Data/Thing/inside.txt").is_symlink()
-    world.manifest.set_enabled(a.id, True)
+    world.manifest.set_enabled(b.id, True)
     world.manifest.set_order(GAME, [b.id, a.id])
     world.refresh()
+    assert world.path("Data/Thing").is_symlink()
+    assert world.plan().changes == []
+    world.manifest.set_order(GAME, [a.id, b.id])
     world.refresh()
+    assert world.path("Data/thing/inside.txt").is_symlink()
+    assert_deployed(world)
     world.purge()
     assert_vanilla(world)
 
@@ -1450,3 +1455,119 @@ def test_root_files_and_game_root_symlinked(tmp_path, monkeypatch):
 def test_make_tree_helper_sanity(tmp_path):
     make_tree(tmp_path, {"a/b.txt": "x"})
     assert (tmp_path / "a/b.txt").read_text() == "x"
+
+
+
+@pytest.mark.parametrize("after", [False, True], ids=["before-call", "after-call"])
+@pytest.mark.parametrize("file_wins", [True, False], ids=["folder-gives-way", "file-gives-way"])
+def test_killed_while_a_file_and_a_folder_swap(tmp_path, monkeypatch, file_wins, after):
+    """One mod's file where another's folder was (an app-made folder removed
+    first), killed at every file operation: repair and the next deploy end
+    in the right state, and purge in vanilla."""
+    def setup(base: Path):
+        world = fresh_world(base, monkeypatch, mode="symlink")
+        m = world.manifest
+        as_file = add_mod(m, "FileMod", {"Data/textures/clash": "a file", "Data/Fallout4.esm": "F esm"})
+        as_dir = add_mod(m, "DirMod", {"Data/Textures/Clash/in.dds": "in", "Data/Textures/Clash/d/m.dds": "m"})
+        order = [as_file.id, as_dir.id]
+        m.set_order(GAME, order if file_wins else order[::-1])
+        world.deploy()
+        m.set_order(GAME, order[::-1] if file_wins else order)
+        return world
+
+    world = setup(tmp_path / "count")
+    injector = Injector()
+    with injector.active(monkeypatch):
+        world.deploy()
+    total = injector.calls
+    world.manifest.close()
+    assert total > 3
+    for n in range(1, total + 1):
+        world = setup(tmp_path / f"n{n}")
+        try:
+            run_killable(Injector(n, Killed, after), monkeypatch, world.deploy)
+            reopen(world)
+            verify_and_repair(world)
+            result = world.deploy()
+            assert not result.failed and not result.plan.blocked, (result.failed, result.plan.blocked)
+            assert_deployed(world)
+            assert not world.purge().failed
+            assert_vanilla(world)
+        except AssertionError as exc:
+            raise AssertionError(f"killed at call {n}/{total} ({'after' if after else 'before'}): {exc}") from exc
+        finally:
+            world.manifest.close()
+
+
+@pytest.mark.parametrize("mode", ["symlink", "hardlink"])
+def test_a_leftover_link_of_a_killed_run_makes_room_for_a_winning_folder(tmp_path, monkeypatch, mode):
+    """A killed run linked FileMod's file at Data/clash and died before
+    recording it; now DirMod (a folder there) wins: one deploy settles it."""
+    world = fresh_world(tmp_path / "w", monkeypatch, mode=mode)
+    m = world.manifest
+    a = add_mod(m, "FileMod", {"Data/clash": "file"})
+    b = add_mod(m, "DirMod", {"Data/Clash/in.dds": "in"})
+    m.set_order(GAME, [b.id, a.id])
+    source = staged(a, "Data/clash")
+    m.journal(GAME, "link", "Data/clash", str(source), status="intent")
+    (os.symlink if mode == "symlink" else os.link)(source, world.path("Data/clash"))
+    m.set_order(GAME, [a.id, b.id])
+    result = world.deploy()
+    assert not result.failed and not result.plan.blocked, (result.failed, result.plan.blocked)
+    assert_deployed(world)
+    world.purge()
+    assert_vanilla(world)
+
+
+@pytest.mark.parametrize("mode", ["symlink", "hardlink"])
+def test_a_folder_made_just_before_a_crash_gives_way_to_a_winning_file(world, monkeypatch, mode):
+    """Stopped right after making a folder (not recorded yet) where another
+    mod's file goes once that mod wins again: one deploy puts the file there."""
+    world.mode = mode
+    as_file = add_mod(world.manifest, "FileMod", {"Data/textures/clash": "a file"})
+    as_dir = add_mod(world.manifest, "DirMod", {"Data/Textures/Clash/in.dds": "in", "Data/Textures/Clash/d/m.dds": "m"})
+    world.manifest.set_order(GAME, [as_dir.id, as_file.id])
+    world.deploy()
+    world.manifest.set_order(GAME, [as_file.id, as_dir.id])  # the folder wins
+    with monkeypatch.context() as mp:
+        fail_once(mp, Manifest, "record_dir")
+        with pytest.raises(Boom):
+            world.deploy()
+    assert world.path("Data/Textures/Clash").is_dir()
+    world.manifest.set_order(GAME, [as_dir.id, as_file.id])  # the file wins again
+    result = world.deploy()
+    assert not result.failed and not result.plan.blocked, (result.failed, result.plan.blocked)
+    record = world.manifest.deployed(GAME)["DATA/TEXTURES/CLASH"]
+    assert record.mod_id == as_file.id and world.path(record.path).read_text() == "a file"
+    assert [op.kind for op in world.plan().ops] == []
+    world.purge()
+    assert_vanilla(world)
+
+
+@pytest.mark.parametrize("stopped_at", ["record_link", "forget_link"])
+@pytest.mark.parametrize("mode", ["symlink", "hardlink"])
+def test_a_relink_stopped_next_to_a_users_case_sibling(world, monkeypatch, mode, stopped_at):
+    """A's link Data/Sub/Bar.dds is switched to B's next to the user's own
+    Data/Sub/BAR.dds, and the app stops right after making B's link (or right
+    after removing A's): the next deploy links B's file at Bar.dds again and
+    never takes the user's file for the app's."""
+    world.mode = mode
+    add_mod(world.manifest, "A", {"Data/Sub/Bar.dds": "A bar"})
+    b = add_mod(world.manifest, "B", {"Data/sub/bar.dds": "B bar"}, enabled=False)
+    world.deploy()
+    mine = world.root / "Data" / "Sub" / "BAR.dds"
+    mine.write_text("the user's")
+    world.manifest.set_enabled(b.id, True)
+    with monkeypatch.context() as mp:
+        fail_once(mp, Manifest, stopped_at)
+        with pytest.raises(Boom):
+            world.deploy()
+    result = world.deploy()
+    assert not result.failed and not result.plan.blocked, (result.failed, result.plan.blocked)
+    assert mine.read_text() == "the user's" and not world.manifest.backups(GAME)
+    record = world.manifest.deployed(GAME)["DATA/SUB/BAR.DDS"]
+    assert record.path == "Data/Sub/Bar.dds" and record.mod_id == b.id
+    assert world.path("Data/Sub/Bar.dds").read_text() == "B bar"
+    world.purge()
+    assert not os.path.lexists(world.path("Data/Sub/Bar.dds")) and mine.read_text() == "the user's"
+    assert deploy.verify(world.manifest, world.target()).ok

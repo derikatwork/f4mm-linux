@@ -703,7 +703,7 @@ def _discover_raw(
             best.root,
             best.exe,
             source="lutris" if best.lutris else "scan",
-            prefix_hints=(best.lutris.prefix,) if best.lutris else (),
+            lutris_prefix=best.lutris.prefix if best.lutris else None,
         )
         if best.lutris:
             game.lutris_slug = best.lutris.slug or None
@@ -715,9 +715,24 @@ def _discover_raw(
     return games, warnings
 
 
+def _on_disk(path: Path) -> Path | None:
+    """*path* as spelled on disk, also when the case of some of its folders
+    differs (typed by hand, or renamed): Lutris runs such a game all the same."""
+    if os.path.isdir(path):
+        return path
+    current = Path(path.anchor or "/")
+    for part in path.parts[1:]:
+        found = _child(current, part, want_dir=True)
+        if found is None:
+            return None
+        current = found
+    return current
+
+
 def _scan_lutris_game(lg: LutrisGame, scanner: _Scanner, depth: int) -> list[tuple[str, Path, bool]]:
     hits: list[tuple[str, Path, bool]] = []
     for folder in (lg.exe.parent if lg.exe else None, lg.working_dir):
+        folder = _on_disk(folder) if folder is not None else None
         if folder is not None:
             hits.extend((gid, exe, True) for gid, exe in scanner.scan(folder, 0))
     for folder in (lg.prefix, lg.directory):
@@ -736,6 +751,7 @@ def _build_game(
     exe: Path,
     *,
     source: str,
+    lutris_prefix: Path | None = None,
     prefix_hints: tuple[Path | None, ...] = (),
     prefix_override: Path | None = None,
     user_override: str | None = None,
@@ -754,12 +770,18 @@ def _build_game(
         if not os.path.isdir(prefix / "drive_c"):
             warnings.append(f"Wine prefix {prefix} (manual) has no drive_c folder")
     else:
-        prefix = next((p for p in prefix_hints if p is not None and _is_within(root, p)), None)
-        prefix = prefix or find_wine_prefix(root)
-        # Lutris can run a game kept outside its prefix (e.g. on another disk).
-        prefix = prefix or next(
-            (p for p in prefix_hints if p is not None and os.path.isdir(p / "drive_c")), None
-        )
+        # The prefix Lutris runs this game with is where Wine keeps its
+        # plugins.txt, also when the game is kept elsewhere (on another disk, or
+        # in the prefix its installer ran in). Otherwise the prefix the folder
+        # is in, or (for a game moved out of one) a hint.
+        if lutris_prefix is not None and os.path.isdir(lutris_prefix / "drive_c"):
+            prefix: Path | None = lutris_prefix
+        else:
+            prefix = next((p for p in prefix_hints if p is not None and _is_within(root, p)), None)
+            prefix = prefix or find_wine_prefix(root)
+            prefix = prefix or next(
+                (p for p in prefix_hints if p is not None and os.path.isdir(p / "drive_c")), None
+            )
         if prefix is None:
             warnings.append(f"no Wine prefix found above {root}; plugins.txt location unknown")
 
@@ -832,6 +854,8 @@ def _apply_overrides(
             root,
             exe,
             source=source,
+            # The same folder keeps the prefix discovery chose (Lutris's, if it runs the game).
+            lutris_prefix=current.prefix if same and current is not None else None,
             prefix_hints=(current.prefix,) if current is not None else (),
             prefix_override=prefix_override,
             user_override=user_override,

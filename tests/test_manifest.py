@@ -22,7 +22,7 @@ GAME = "fallout4"
 
 @pytest.fixture
 def m():
-    with Manifest() as manifest:
+    with Manifest(lock=True) as manifest:
         yield manifest
 
 
@@ -34,7 +34,7 @@ def files(*dests: str) -> list[ModFile]:
 
 
 def test_creates_schema_in_data_dir():
-    with Manifest() as manifest:
+    with Manifest(lock=True) as manifest:
         assert manifest.path == paths.manifest_path()
     assert paths.manifest_path().is_file()
     db = sqlite3.connect(paths.manifest_path())
@@ -44,9 +44,19 @@ def test_creates_schema_in_data_dir():
     db.close()
 
 
+def test_a_view_never_creates_the_manifest(tmp_path):
+    """Opened without the lock (to look, or for a dry run), nothing is written."""
+    path = tmp_path / "sub" / "m.db"
+    with Manifest(path) as view:
+        assert view.mods(GAME) == []
+        with view.transaction():  # a preview: rolled back by the caller, here kept in memory only
+            view.add_mod(GAME, "A", "A", files("Data/a.esp"))
+    assert not path.exists() and not path.parent.exists()
+
+
 def test_reopen_keeps_data(tmp_path):
     path = tmp_path / "sub" / "m.db"
-    with Manifest(path) as manifest:
+    with Manifest(path, lock=True) as manifest:
         manifest.add_mod(GAME, "A", "A", files("Data/a.esp"))
     with Manifest(path) as manifest:
         assert [mod.name for mod in manifest.mods(GAME)] == ["A"]
@@ -100,7 +110,7 @@ def test_older_schema_without_version_row_gets_one(tmp_path):
     db.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
     db.commit()
     db.close()
-    with Manifest(path):
+    with Manifest(path, lock=True):
         pass
     db = sqlite3.connect(path)
     assert db.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()[0] == str(SCHEMA_VERSION)
@@ -410,7 +420,7 @@ def test_left_alone_crud_with_folded_keys(m):
 
 def test_schema_1_is_upgraded(tmp_path):
     path = tmp_path / "m.db"
-    with Manifest(path) as manifest:
+    with Manifest(path, lock=True) as manifest:
         manifest.add_mod(GAME, "A", "A", files("Data/a.esp"))
     db = sqlite3.connect(path)
     db.execute("DROP TABLE left_alone")
@@ -423,7 +433,12 @@ def test_schema_1_is_upgraded(tmp_path):
     db.execute("UPDATE meta SET value = '1' WHERE key = 'schema_version'")
     db.commit()
     db.close()
-    with Manifest(path) as manifest:
+    view_before = path.read_bytes()
+    with Manifest(path) as view:  # a view (dry run) upgrades a copy, never the file
+        assert [mod.name for mod in view.mods(GAME)] == ["A"]
+        assert view.deployed(GAME)["DATA/OLD.ESP"].size is None
+    assert path.read_bytes() == view_before
+    with Manifest(path, lock=True) as manifest:
         assert [mod.name for mod in manifest.mods(GAME)] == ["A"]
         manifest.record_left_alone(GAME, "Data/x")
         old = manifest.deployed(GAME)["DATA/OLD.ESP"]
@@ -496,9 +511,10 @@ def test_history_is_oldest_first_and_limited(m):
 
 def test_journal_intent_survives_a_crash(tmp_path):
     path = tmp_path / "m.db"
-    manifest = Manifest(path)
+    manifest = Manifest(path, lock=True)
     entry = manifest.journal(GAME, "link", "Data/a.esp", status="intent")
     # Simulate the process dying: no close, no commit call.
+    manifest._release_lock()
     del manifest
     with Manifest(path) as again:
         assert [e.id for e in again.unfinished_journal(GAME)] == [entry]
@@ -582,7 +598,7 @@ def test_nested_transaction_rolls_back_everything(m):
 
 def test_transaction_commits(tmp_path):
     path = tmp_path / "m.db"
-    with Manifest(path) as manifest:
+    with Manifest(path, lock=True) as manifest:
         with manifest.transaction():
             manifest.record_dir(GAME, "Data/X")
     with Manifest(path) as manifest:

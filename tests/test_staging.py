@@ -5,6 +5,7 @@ import logging
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import zipfile
 from pathlib import Path
@@ -83,7 +84,7 @@ def _fake_prepared(tmp_path: Path, source_name: str, files: dict[str, bytes] | N
 
 @pytest.fixture
 def manifest():
-    m = Manifest()
+    m = Manifest(lock=True)
     yield m
     m.close()
 
@@ -919,7 +920,7 @@ def test_nothing_outside_tmp_and_mods_is_written(tmp_path, monkeypatch):
     make_tree(downloads / "Loose Mod", {"Data/Loose.esp": FO4_PLUGIN, "Data/Textures/l.dds": b"l"})
     os.symlink(downloads / "CoolMod-1234-1-2-1680000000.zip", downloads / "Loose Mod" / "link.zip")
     make_tree(home / "Games" / "fallout-4" / "drive_c" / "Fallout 4", {"Fallout4.exe": b"exe", "Data/Fallout4.esm": b"esm"})
-    manifest = Manifest()  # created up front: the manifest is not staging's to write
+    manifest = Manifest(lock=True)  # created up front: the manifest is not staging's to write
     manifest.close()
 
     def allowed(rel: str) -> bool:
@@ -930,7 +931,7 @@ def test_nothing_outside_tmp_and_mods_is_written(tmp_path, monkeypatch):
         return {k: v for k, v in _snapshot(home).items() if not allowed(k)}
 
     before = outside_snapshot()
-    with Manifest() as manifest:
+    with Manifest(lock=True) as manifest:
         for source in (downloads / "CoolMod-1234-1-2-1680000000.zip", downloads / "Loose Mod"):
             prepared = prepare(source)
             try:
@@ -966,3 +967,37 @@ def test_only_the_apps_own_deleting_folders_count_as_retired():
     from bethmm.staging import DELETING_SUFFIX, is_retired
     assert is_retired(Path("/x/.Cool Mod" + DELETING_SUFFIX))
     assert not is_retired(Path("/x/My Mod" + DELETING_SUFFIX))
+
+
+def test_prepare_removes_extractions_a_killed_run_left(tmp_path):
+    tmp = paths.tmp_dir()
+    old = make_tree(tmp / "install-old", ["x/a.esp"])
+    recent = make_tree(tmp / "install-recent", ["x/a.esp"])
+    other = make_tree(tmp / "not-ours", ["a"])
+    os.utime(old, (1_000_000, 1_000_000))
+    os.utime(other, (1_000_000, 1_000_000))
+    prepared = staging.prepare(_zip(tmp_path / "m.zip", COOL_MOD))
+    try:
+        assert not old.exists() and recent.exists() and other.exists()
+    finally:
+        staging.discard(prepared)
+
+
+def test_an_extraction_in_use_is_never_stale(tmp_path):
+    """An install dialog or prompt left open overnight: another run's sweep
+    (here: another process) must not delete the files it is about to install."""
+    prepared = staging.prepare(_zip(tmp_path / "m.zip", COOL_MOD))
+    try:
+        os.utime(prepared.workdir, (1_000_000, 1_000_000))
+        sweep = "from bethmm import staging; staging.remove_stale_extractions()"
+        subprocess.run([sys.executable, "-c", sweep], check=True, cwd=Path(__file__).resolve().parent.parent)
+        assert prepared.files_dir.is_dir()
+        again = staging.replan(prepared, None, None)
+        staging.discard(again)
+        assert not prepared.workdir.exists()
+    finally:
+        staging.discard(prepared)  # twice: the shared lock is released once
+    old = make_tree(paths.tmp_dir() / "install-left-by-a-killed-run", ["x/a.esp"])
+    os.utime(old, (1_000_000, 1_000_000))
+    staging.remove_stale_extractions()
+    assert not old.exists()
