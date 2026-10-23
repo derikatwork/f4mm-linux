@@ -505,19 +505,24 @@ class Wizard:
 
     def selection(self, step: int, flags: dict[str, str] | None = None) -> dict[int, list[int]]:
         """The chosen options of each group of *step*: the user's choice, or
-        the installer's default for a group not chosen yet."""
+        the installer's default for a group not chosen yet -- or whose choice
+        isn't allowed any more (a choice in an earlier step made an option
+        unusable, or another one required)."""
         flags = self.flags_before(step) if flags is None else flags
         chosen = self.selections.get(step, {})
-        return {g: list(chosen[g]) if g in chosen else self.default(step, g, flags)
+        return {g: list(chosen[g]) if g in chosen and self._problem(step, g, chosen[g], flags) is None
+                else self.default(step, g, flags)
                 for g in range(len(self.module.steps[step].groups))}
 
     def problem(self, step: int, group: int, options: Sequence[int]) -> str | None:
         """Why choosing *options* in a group isn't allowed (None: it is)."""
+        return self._problem(step, group, options, self.flags_before(step))
+
+    def _problem(self, step: int, group: int, options: Sequence[int], flags: dict[str, str]) -> str | None:
         g = self.module.steps[step].groups[group]
         options = sorted(set(options))
         if any(not 0 <= o < len(g.options) for o in options):
             return "no such option"
-        flags = self.flags_before(step)
         kinds = [o.type.resolve(flags, self.file_state) for o in g.options]
         usable = [i for i, k in enumerate(kinds) if k is not OptionType.NOT_USABLE]
         name = g.name or "this group"

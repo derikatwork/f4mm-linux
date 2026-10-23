@@ -298,3 +298,38 @@ def test_module_dependencies_are_reported():
                   '</moduleDependencies>')
     assert Wizard(fomod.parse_module(data)).unmet_dependencies() == "Needed.esm is active"
     assert Wizard(fomod.parse_module(data), lambda p: FileState.ACTIVE).unmet_dependencies() is None
+
+
+CHANGING = config("""
+  <installSteps order="Explicit">
+    <installStep name="Base">
+      <optionalFileGroups><group name="Edition" type="SelectExactlyOne"><plugins order="Explicit">
+        <plugin name="Full"><conditionFlags><flag name="ed">full</flag></conditionFlags>
+          <typeDescriptor><type name="Optional" /></typeDescriptor></plugin>
+        <plugin name="Lite"><conditionFlags><flag name="ed">lite</flag></conditionFlags>
+          <typeDescriptor><type name="Optional" /></typeDescriptor></plugin>
+      </plugins></group></optionalFileGroups>
+    </installStep>
+    <installStep name="Extras">
+      <optionalFileGroups><group name="Extras" type="SelectAny"><plugins order="Explicit">
+        <plugin name="Big extra"><typeDescriptor><dependencyType><defaultType name="Optional" />
+          <patterns><pattern><dependencies><flagDependency flag="ed" value="lite" /></dependencies>
+          <type name="NotUsable" /></pattern></patterns></dependencyType></typeDescriptor></plugin>
+        <plugin name="Core extra"><typeDescriptor><dependencyType><defaultType name="Optional" />
+          <patterns><pattern><dependencies><flagDependency flag="ed" value="lite" /></dependencies>
+          <type name="Required" /></pattern></patterns></dependencyType></typeDescriptor></plugin>
+      </plugins></group></optionalFileGroups>
+    </installStep>
+  </installSteps>""")
+
+
+def test_a_choice_that_an_earlier_step_made_impossible_is_not_kept():
+    """Big extra chosen with Full; then Lite is chosen in the first step, which
+    makes Big extra unusable and Core extra required: the second step falls
+    back to what the installer allows instead of a choice nobody can fix."""
+    w = Wizard(fomod.parse_module(CHANGING))
+    w.choose(0, 0, [0])
+    w.choose(1, 0, [0])
+    w.choose(0, 0, [1])
+    assert w.selection(1) == {0: [1]} and w.step_problems(1) == []
+    assert w.choices()[1] == {"step": "Extras", "groups": [{"group": "Extras", "options": ["Core extra"]}]}

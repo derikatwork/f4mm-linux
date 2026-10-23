@@ -442,7 +442,10 @@ def _backup(path: Path, game_id: str) -> Path | None:
 
 
 def _write(path: Path, content: bytes) -> None:
-    """Replace plugins.txt in one step (a new file renamed over it)."""
+    """Replace plugins.txt in one step (a new file renamed over it). When it
+    is a link to a file kept elsewhere, that file is replaced and the link stays."""
+    if path.is_symlink():
+        path = Path(os.path.realpath(path))
     if not path.parent.is_dir():
         if not path.parent.parent.is_dir():
             raise PluginsError(f"{path.parent.parent} doesn't exist; has the game been started once?")

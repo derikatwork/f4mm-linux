@@ -266,3 +266,17 @@ def test_stopped_while_updating_plugins_txt_the_next_deploy_gets_it_right(home, 
     assert ("*A.esp" if game == "fo4" else "A.esp") in listed
     assert main(["deploy", *args]) == 0
     assert lines(txt) == listed
+
+
+def test_a_plugins_txt_that_is_a_link_stays_a_link(home, fo4, tmp_path):
+    """Some people keep plugins.txt elsewhere and link to it: the app writes
+    the file the link points to, and the link stays."""
+    real = tmp_path / "shared" / "plugins.txt"
+    real.parent.mkdir()
+    real.write_bytes(b"*Mine.esp\r\n")
+    txt = plugins_txt(home)
+    txt.parent.mkdir()
+    txt.symlink_to(real)
+    assert main(["install", str(mod_zip(tmp_path, "A-1-1-0.zip", {"A.esp": esp()})), "--yes"]) == 0
+    assert txt.is_symlink() and os.readlink(txt) == str(real)
+    assert real.read_bytes() == b"*Mine.esp\r\n*A.esp\r\n"
