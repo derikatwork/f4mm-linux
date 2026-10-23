@@ -181,7 +181,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     from bethmm import cli_mods
 
-    cli_mods.register(sub, CliError)
+    cli_mods.register(sub)
     return parser
 
 

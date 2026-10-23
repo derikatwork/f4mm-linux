@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Callable
 
 from bethmm import deploy, describe, fomod, plugins, service, staging, winecheck
+from bethmm.cli import CliError, format_plan
 from bethmm.discovery import DiscoveredGame, get_games
 from bethmm.games import GAMES
 from bethmm.manifest import Manifest, ManifestError, ModRecord
@@ -24,10 +25,7 @@ from bethmm.settings import Settings, load_settings, save_settings
 TARGETS = {"data": Target.DATA, "game": Target.GAME_ROOT}
 
 
-def register(sub: argparse._SubParsersAction, error: type[Exception]) -> None:
-    global CliError
-    CliError = error
-
+def register(sub: argparse._SubParsersAction) -> None:
     def game_arg(p: argparse.ArgumentParser) -> None:
         p.add_argument("--game", choices=sorted(GAMES), help="which game (default: the one chosen with 'bethmm use')")
 
@@ -169,8 +167,6 @@ def register(sub: argparse._SubParsersAction, error: type[Exception]) -> None:
     p.set_defaults(func=cmd_history)
 
 
-CliError: type[Exception] = Exception
-
 #: Exit status of 'status --deployed-only' when a purge has something to do
 #: (install.sh tells it apart from the app failing to run).
 DEPLOYED_STATUS = 3
@@ -288,8 +284,6 @@ def cmd_use(args) -> int:
 
 
 def cmd_install(args) -> int:
-    from bethmm.cli import format_plan
-
     settings, games = _context(args)
     installed = [g.game_id for g in games]
     source = Path(args.source).expanduser()
@@ -618,7 +612,7 @@ def _find_plugin(order: list[plugins.PluginInfo], query: str) -> plugins.PluginI
     raise CliError(f"{query!r} matches {len(part)} plugins ({', '.join(p.name for p in part[:5])}); be more exact")
 
 
-def _plugin_notes(plugin: plugins.PluginInfo, names: dict[int, str]) -> str:
+def _plugin_notes(plugin: plugins.PluginInfo) -> str:
     notes = []
     if plugin.implicit:
         notes.append("the game loads it itself")
@@ -656,7 +650,7 @@ def cmd_plugins(args) -> int:
             box = "[*]" if p.implicit else "[x]" if p.active else "[ ]"
             flag = "M" if p.master else " "
             mod = names.get(p.mod_id, "?") if p.mod_id is not None else ""
-            print(f"{i:>4} {box} {flag} {p.name:<{width}}  {mod:<24}  {_plugin_notes(p, names)}".rstrip())
+            print(f"{i:>4} {box} {flag} {p.name:<{width}}  {mod:<24}  {_plugin_notes(p)}".rstrip())
         return 0 if not any(p.missing for p in order) else 1
 
     dry = _dry(args, settings)
@@ -985,7 +979,7 @@ def cmd_status(args) -> int:
     with Manifest() as manifest:
         game_ids = manifest.game_ids()
         if args.deployed_only:
-            return _deployed_only(manifest, game_ids)
+            return _deployed_only(manifest)
         if not game_ids:
             print("No mods installed yet.")
             return 0
@@ -1001,7 +995,7 @@ def cmd_status(args) -> int:
     return 0
 
 
-def _deployed_only(manifest: Manifest, game_ids: list[str]) -> int:
+def _deployed_only(manifest: Manifest) -> int:
     """What the app still has in game folders; DEPLOYED_STATUS if a purge has anything to do."""
     busy = False
     for fp in service.footprints(manifest):

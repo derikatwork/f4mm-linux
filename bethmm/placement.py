@@ -72,6 +72,7 @@ from __future__ import annotations
 
 import os
 import stat
+import unicodedata
 from collections import deque
 from dataclasses import asdict, dataclass, field, replace
 from enum import Enum
@@ -343,9 +344,9 @@ def _names(items: Sequence[str], limit: int = 4) -> str:
 
 
 def has_control_char(path: str) -> bool:
-    """Whether *path* has a control character (a newline, ...): no Windows
-    file name can, and one would split a line of plugins.txt or the log."""
-    return any(ord(c) < 32 or ord(c) == 127 for c in path)
+    """Whether *path* has a control character (a newline, ESC, ...): a game
+    can't use such a file, and one would split a line of plugins.txt."""
+    return any(unicodedata.category(c) == "Cc" for c in path)
 
 
 def _normalize_files(files: Iterable[str]) -> tuple[list[str], list[str]]:

@@ -282,6 +282,10 @@ bethmm override fallout4 --link-mode hardlink
 bethmm deploy
 ```
 
+When the game's folder name has one of `& | < > ^ %` (Wine's `cmd` would read it as part
+of a command), the check doesn't run and says so; test by hand then (install a small
+mod, start the game, see if it shows up).
+
 Hardlinks are real directory entries inside the game folder, so sandboxes see them,
 but they only work when the game and `~/.local/share` are on the same disk; the app
 checks this when you switch (and before every change) and tells you if they aren't.

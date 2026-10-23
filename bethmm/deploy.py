@@ -70,7 +70,6 @@ from bethmm.pathresolve import CaseResolver, fold_path
 log = logging.getLogger(__name__)
 
 LINK_MODES = ("symlink", "hardlink")
-OP_KINDS = ("rerecord", "unlink", "forget", "restore", "dropbackup", "mkdir", "backup", "reclaim", "link", "rmdir")
 #: Name prefix of the temporary file a move across filesystems copies into.
 TEMP_PREFIX = ".bethmm-move-"
 #: Folder under ``backups/<game>/`` where originals the app no longer needs
