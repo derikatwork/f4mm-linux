@@ -322,7 +322,7 @@ if [ "$GUI" -eq 1 ]; then
     # Can Qt start? Offscreen first (the toolkit itself), then what its X11 plugin links to.
     if ! qt_error="$(QT_QPA_PLATFORM=offscreen "$VENV/bin/python" -I -c 'import sys; from PySide6 import QtWidgets; from bethmm.gui import pyside_problem; p = pyside_problem(); sys.exit(p) if p else None' 2>&1)"; then
         warn "the GUI can't load Qt: ${qt_error##*$'\n'}"
-        warn "the command line works; see \"If the GUI doesn't start\" in the README"
+        warn "the command line works; see \"The desktop app doesn't start\" under Troubleshooting in the README"
     else
         qt_dir="$("$VENV/bin/python" -I -c 'import os, PySide6; print(os.path.join(os.path.dirname(PySide6.__file__), "Qt"))')"
         xcb_missing="$(ldd "$qt_dir/plugins/platforms/libqxcb.so" 2>/dev/null | awk '/not found/ { print $1 }' | sort -u | tr '\n' ' ')"
