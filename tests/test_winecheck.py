@@ -52,7 +52,9 @@ if path is not None and os.path.lexists(path):
     call["nlink"] = st.st_nlink
 calls = json.load(open(RECORD)) if os.path.exists(RECORD) else []
 calls.append(call)
-json.dump(calls, open(RECORD, "w"))
+with open(RECORD + ".tmp", "w") as fh:
+    json.dump(calls, fh)
+os.replace(RECORD + ".tmp", RECORD)  # in one step: the tests read it while Wine runs
 
 if MODE == "sleep":
     time.sleep(30)
