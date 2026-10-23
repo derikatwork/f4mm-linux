@@ -986,3 +986,21 @@ def test_leftover_cleanup_removes_only_stale_partial_files(home, tmp_path):
 
     assert sorted(os.listdir(test_dir)) == ["bethmm-linktest-feedface.txt.tmp"]  # fresh: a check may own it
     assert (game.data_dir / "bethmm-linktest-0badf00d.txt").read_text() == "someone else's"
+
+
+def test_a_game_folder_with_a_character_cmd_reads_specially_is_not_checked(home, tmp_path):
+    """Without a space Wine doesn't quote the path, and cmd.exe would split
+    'type C:\\...\\Fallout&Friends\\...' into two commands."""
+    import dataclasses
+
+    game = make_game(tmp_path)
+    odd = game.root.with_name("Fallout4&Friends")
+    game.root.rename(odd)
+    game = dataclasses.replace(game, root=odd, exe=odd / "Fallout4.exe", data_dir=odd / "Data")
+    wine = fake_wine(tmp_path)
+    before = snapshot(game.prefix)
+
+    result = check_links(game, wine=str(wine), home=home)
+
+    assert result.ok is None and "(&)" in result.message and "Fallout4&Friends" in result.message
+    assert calls(wine) == [] and leftovers(game) == [] and snapshot(game.prefix) == before

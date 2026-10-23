@@ -72,6 +72,9 @@ LINK_MODES = ("symlink", "hardlink")
 LINK_PREFIX = "bethmm-linktest-"
 TEST_DIR = ".linktest"
 FLATPAK_ID = "net.lutris.Lutris"
+#: Characters cmd.exe gives a meaning to in a command line.
+_CMD_SPECIAL = "&|<>^%"
+
 #: Where a runner's wine binary sits below ``runners/``, for a given version.
 _RUNNER_LAYOUTS = (
     ("wine", "bin/wine"),
@@ -336,6 +339,15 @@ def check_links(
     name = f"{LINK_PREFIX}{_random_token(4)}.txt"
     link = data_dir / name
     win = windows_path(link, prefix)
+    special = sorted(set(win) & set(_CMD_SPECIAL))
+    if special:
+        # cmd.exe would read them as part of a command (Wine quotes a path only
+        # when it has a space), and the check would mean nothing.
+        folder = win.rsplit("\\", 2)[0]
+        return LinkCheck(None, f"The game's folder ({folder}) has a character the check can't "
+                               f"pass to Wine's cmd ({' '.join(special)}), so it didn't run. To test by hand: "
+                               "install and deploy a small mod (one that adds a single plugin or texture), start "
+                               "the game from Lutris and see if the mod shows up.", wine, win)
     try:
         if _name_taken(data_dir, name):
             return LinkCheck(None, f"{link} already exists; it was left alone and the check did not run. "
