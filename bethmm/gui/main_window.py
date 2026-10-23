@@ -538,7 +538,7 @@ class MainWindow(QMainWindow):
         has_game = self.game is not None
         selected = self.selected_mods()
         for act in (self.act_install, self.act_install_folder, self.act_deploy, self.act_purge, self.act_verify,
-                    self.act_check_links):
+                    self.act_check_links, self.act_sync_plugins):
             act.setEnabled(idle and has_game)
         # Game settings also sets up a game that wasn't found, or brings back a hidden one.
         for act in (self.act_settings, self.act_rescan, self.act_refresh, self.act_game_settings):
@@ -550,7 +550,9 @@ class MainWindow(QMainWindow):
                     self.act_top, self.act_bottom):
             act.setEnabled(one)
         self.act_nexus.setEnabled(one and selected[0].nexus_id is not None)
+        # A change made meanwhile would wait for the running job, then act on the list as it was before it.
         self.table.setEnabled(idle)
+        self.plugin_table.setEnabled(idle)
         self.game_combo.setEnabled(idle)
 
     # ------------------------------------------------------------ messages

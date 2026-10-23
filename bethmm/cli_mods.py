@@ -684,6 +684,8 @@ def cmd_plugins(args) -> int:
                         to = args.to - 1
                     else:
                         other = order.index(_find_plugin(order, args.before or args.after))
+                        if other == here:
+                            raise CliError(f"can't move {plugin.name} before or after itself")
                         to = other - (other > here) + (1 if args.after else 0)
                     result = plugins.move(manifest, target, plugin.name, to, dry_run=dry)
         except plugins.PluginsError as exc:

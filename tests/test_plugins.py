@@ -188,6 +188,9 @@ def test_plain_list_with_the_games_masters_and_dates_in_order(home, fnv, tmp_pat
     assert main(["plugins", "move", "B", "--before", "A"]) == 0
     a, b = (os.stat(fnv / "Data" / f"{n}.esp").st_mtime for n in "AB")
     assert b < a and lines(txt)[2:] == ["B.esp", "A.esp"]
+    capsys.readouterr()
+    assert main(["plugins", "move", "B", "--after", "b.esp"]) == 1
+    assert "before or after itself" in capsys.readouterr().err and lines(txt)[2:] == ["B.esp", "A.esp"]
     assert os.stat(fnv / "Data" / "FalloutNV.esm").st_mtime == 1_300_000_000  # never the game's own
     capsys.readouterr()
     assert main(["plugins", "move", "FalloutNV.esm", "--bottom"]) == 1

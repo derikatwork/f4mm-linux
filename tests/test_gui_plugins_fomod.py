@@ -185,3 +185,15 @@ def test_a_missing_master_is_pointed_out(qtbot, window, tmp_path, fo4):
     window.refresh()
     assert "need a master" in window.plugins_info.text()
     assert "needs Needed.esm" in window.plugin_model.notes(window.plugin_model.rows[plugin_row(window, "A.esp")])
+
+
+def test_the_plugins_tab_waits_while_a_job_runs(qtbot, window, tmp_path, fo4):
+    two_mods(tmp_path)
+    window.refresh()
+    assert window.plugin_table.isEnabled() and window.act_sync_plugins.isEnabled()
+    window._installing = True  # as while an install is under way
+    window._update_actions()
+    assert not window.plugin_table.isEnabled() and not window.act_sync_plugins.isEnabled()
+    window._installing = False
+    window._update_actions()
+    assert window.plugin_table.isEnabled() and window.act_sync_plugins.isEnabled()
