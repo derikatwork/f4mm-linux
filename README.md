@@ -104,13 +104,17 @@ games live somewhere other than `~/Games`, set that in *Settings ▸ Settings...
 
 Choose *Game ▸ Check links*. The app puts a test file into the game's `Data`
 folder through a link, asks Wine (the same one Lutris uses for the game) to read
-it, and removes it again.
+it, and removes it again. With the **Flatpak** version of Lutris, Wine runs inside
+Lutris's Flatpak, just as the game does.
 
 * **It works:** nothing to do, the default (symlinks) is right for you.
-* **It fails:** this is likely with the **Flatpak** version of Lutris, whose sandbox
+* **It fails:** this is likely with the Flatpak version of Lutris, whose sandbox
   can't follow the links. Open *Game ▸ Game settings...*, set **Link mode** to
   `hardlink`, and run the check again. Hardlinks only work when the game and your
   home folder are on the same disk; the app tells you if they aren't.
+* **It couldn't run:** the check says why, for example a Wine that can't start
+  outside Lutris. The links weren't tested then: install a small mod, start the
+  game and see if it shows up.
 
 ### 4. Fallout 4 only: let the game load mods (once)
 
@@ -425,8 +429,11 @@ bethmm override fallout4 --link-mode hardlink    # if it fails, then:
 bethmm deploy
 ```
 
-Wine follows symlinks normally. The check can fail with the Flatpak version of
-Lutris, whose sandbox may not see `~/.local/share`. Hardlinks are real entries
+Wine follows symlinks normally. For a game of the Flatpak version of Lutris, the
+check runs Wine inside that Flatpak (`flatpak run --command=<wine> net.lutris.Lutris`),
+because the sandbox decides what Wine can see; a Wine outside your home folder, such
+as a system Wine, runs on the system instead, and the result says so. The check can
+fail with the Flatpak version of Lutris, whose sandbox may not see `~/.local/share`. Hardlinks are real entries
 inside the game folder, so sandboxes see them, but they only work when the game
 and `~/.local/share` are on the same disk. The app checks this when you switch,
 and before every change.
@@ -544,6 +551,12 @@ root's place is detected on its own.
      through the loader ([step 10](#10-play)).
 * **The app (or the computer) stopped in the middle of a change:** *Game ▸ Verify...*
   then **Repair** (`bethmm verify --repair`).
+* **Check links says Wine "couldn't start", with a missing `GLIBC_...`:** that Wine
+  is a Proton build (such as GE-Proton) made for newer system libraries than your
+  system has. Lutris runs it inside the Steam Linux Runtime or its Flatpak, where
+  it works, so the game isn't affected. The check can't use it, though: test by
+  hand (install a small mod, start the game), or pick another Wine with
+  `bethmm check-links <game> --wine PATH`.
 * **"another bethmm process is changing mods right now":** another window or command
   is making a change. Wait for it, then try again.
 * **You want an older `plugins.txt` back:** copy one from
