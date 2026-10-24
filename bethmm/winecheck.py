@@ -11,7 +11,12 @@ unusual runner could still get in the way, so this checks it for real:
    (symlink, or hardlink when *link_mode* is "hardlink");
 3. run ``<wine> cmd /c type <windows path of the link>`` with
    ``WINEPREFIX=<prefix>``, ``WINEDEBUG=-all`` and a timeout, and check that the
-   output contains the random content;
+   output contains the random content. For a game of the Flatpak Lutris, Wine
+   runs inside that Flatpak's sandbox (``flatpak run --command=<wine>
+   net.lutris.Lutris ...``), as the game does: the sandbox decides what Wine can
+   see, and a Proton build needs the Flatpak's runtime (it may not start on the
+   system itself). A Wine outside the home folder, or no ``flatpak`` command,
+   runs on the system, and the result says so;
 4. always (``finally``) remove the link and the test file, and log every
    file operation.
 
@@ -91,6 +96,13 @@ _SYSTEM_WINES = {
 #: Where a Proton build's wine binary sits (older Proton: ``dist``).
 _PROTON_LAYOUTS = ("files/bin/wine", "dist/bin/wine")
 _MAX_OUTPUT = 4000
+#: Output of a Wine that could not start: built for newer system libraries than
+#: there are (a Proton build outside its runtime), or not visible in the sandbox.
+_NO_LIBRARY = re.compile(r"could not load ntdll\.so|version `GLIBC_[\d.]+' not found")
+_GLIBC = re.compile(r"version `(GLIBC_[\d.]+)' not found")
+_NOT_IN_SANDBOX = re.compile(r"bwrap: execvp")
+_BY_HAND = ("To test by hand: install and deploy a small mod (one that adds a single plugin or texture), start "
+            "the game from Lutris and see if the mod shows up.")
 _DIGITS = re.compile(r"(\d+)")
 #: A test file (or one still being written, ``.tmp``) in ``.linktest``.
 _TEST_NAME = re.compile(re.escape(LINK_PREFIX) + r"[0-9a-f]+\.txt(\.tmp)?")
@@ -332,9 +344,9 @@ def check_links(
     if wine is None:
         return LinkCheck(None, "Couldn't find Wine (no Lutris runner for this game, none under "
                                "~/.local/share/lutris/runners and no 'wine' on PATH), so the check can't run. "
-                               "To test by hand: install and deploy a small mod (one that adds a single "
-                               "plugin or texture), start the game from Lutris and see if the mod shows up.")
+                               + _BY_HAND)
     flatpak = (hit is not None and _under(hit[0], _flatpak_root(home))) or _under(wine, _flatpak_root(home))
+    sandbox = _sandbox_command(wine, prefix, home) if flatpak else None
 
     name = f"{LINK_PREFIX}{_random_token(4)}.txt"
     link = data_dir / name
@@ -345,9 +357,7 @@ def check_links(
         # when it has a space), and the check would mean nothing.
         folder = win.rsplit("\\", 2)[0]
         return LinkCheck(None, f"The game's folder ({folder}) has a character the check can't "
-                               f"pass to Wine's cmd ({' '.join(special)}), so it didn't run. To test by hand: "
-                               "install and deploy a small mod (one that adds a single plugin or texture), start "
-                               "the game from Lutris and see if the mod shows up.", wine, win)
+                               f"pass to Wine's cmd ({' '.join(special)}), so it didn't run. {_BY_HAND}", wine, win)
     try:
         if _name_taken(data_dir, name):
             return LinkCheck(None, f"{link} already exists; it was left alone and the check did not run. "
@@ -361,7 +371,7 @@ def check_links(
     state: dict = {}
     try:
         result = _run_check(game, link_mode, wine, timeout, prefix, data_dir, link, win,
-                            test_dir, test_file, token, flatpak, state)
+                            test_dir, test_file, token, flatpak, sandbox, state)
     finally:
         problems = _cleanup(link, test_file, test_dir, link_mode, state)
     if problems:
@@ -369,9 +379,20 @@ def check_links(
     return result
 
 
+def _sandbox_command(wine: str, prefix: Path, home: Path) -> list[str] | None:
+    """The start of a command running *wine* inside the Lutris Flatpak's
+    sandbox; None without a ``flatpak`` command, or for a Wine outside the home
+    folder (a system Wine: the sandbox has its own ``/usr``)."""
+    flatpak = shutil.which("flatpak")
+    if flatpak is None or not _under(wine, home):
+        return None
+    return [flatpak, "run", f"--command={wine}", f"--env=WINEPREFIX={prefix}", "--env=WINEDEBUG=-all", FLATPAK_ID]
+
+
 def _run_check(
     game: DiscoveredGame, link_mode: str, wine: str, timeout: float, prefix: Path, data_dir: Path,
-    link: Path, win: str, test_dir: Path, test_file: Path, token: str, flatpak: bool, state: dict,
+    link: Path, win: str, test_dir: Path, test_file: Path, token: str, flatpak: bool,
+    sandbox: list[str] | None, state: dict,
 ) -> LinkCheck:
     """Steps 1-3; *state* records what was created, for the cleanup."""
     try:
@@ -412,9 +433,10 @@ def _run_check(
     state["link"] = True
     log.info("LINK %s -> %s (%s)", link, test_file, link_mode)
 
-    cmd = [wine, "cmd", "/c", "type", win]
+    cmd = [*(sandbox or [wine]), "cmd", "/c", "type", win]
     env = {**os.environ, "WINEPREFIX": str(prefix), "WINEDEBUG": "-all"}
     log.info("RUN %s (WINEPREFIX=%s)", shlex.join(cmd), prefix)
+    sandboxed = sandbox is not None
     try:
         proc = subprocess.run(cmd, env=env, capture_output=True, timeout=timeout, stdin=subprocess.DEVNULL)
     except subprocess.TimeoutExpired as exc:
@@ -424,11 +446,12 @@ def _run_check(
             # Wine printed the file, but a program it started (one run at session
             # start, a persistent wineserver) kept the output open.
             log.info("Wine read the test file; its output stayed open past %g seconds", timeout)
-            return LinkCheck(True, _success_message(game, link_mode, data_dir, flatpak), wine, win, output)
+            return LinkCheck(True, _success_message(game, link_mode, data_dir, flatpak, sandboxed), wine, win,
+                             output)
         log.warning("Wine did not finish within %g seconds", timeout)
         return LinkCheck(False, f"Wine did not finish within {timeout:g} seconds. The first start in a prefix "
                                 "can be slow (Wine may be updating it), so try again. "
-                                + _failure_advice(game.game_id, link_mode), wine, win, output)
+                                + _failure_advice(game.game_id, link_mode, sandboxed), wine, win, output)
     except OSError as exc:
         log.warning("could not start %s: %s", wine, exc)
         return LinkCheck(None, f"Could not start Wine ({wine}): {exc.strerror or exc}. Pick another one with "
@@ -437,10 +460,31 @@ def _run_check(
     output = _trim(_decode(proc.stdout) + "\n" + _decode(proc.stderr))
     log.info("Wine exited with code %s", proc.returncode)
     if token in _decode(proc.stdout) or token in _decode(proc.stderr):
-        return LinkCheck(True, _success_message(game, link_mode, data_dir, flatpak), wine, win, output)
+        return LinkCheck(True, _success_message(game, link_mode, data_dir, flatpak, sandboxed), wine, win, output)
+    why = _could_not_start(output, wine, sandboxed)
+    if why is not None:
+        log.warning("Wine could not start: %s", why)
+        return LinkCheck(None, why, wine, win, output)
     exit_note = f" (Wine exited with code {proc.returncode})" if proc.returncode else ""
     return LinkCheck(False, f"Wine could not read the test file through the {link_mode} in {data_dir}"
-                            f"{exit_note}. " + _failure_advice(game.game_id, link_mode), wine, win, output)
+                            f"{exit_note}. " + _failure_advice(game.game_id, link_mode, sandboxed), wine, win,
+                     output)
+
+
+def _could_not_start(output: str, wine: str, sandboxed: bool) -> str | None:
+    """Why Wine never got to read the file -- so the links weren't tested --
+    or None when it ran."""
+    if _NOT_IN_SANDBOX.search(output):
+        return (f"The Lutris Flatpak can't see this Wine ({wine}), so the check couldn't run inside it and "
+                f"the links weren't tested. Pick the Wine the game uses with --wine PATH. {_BY_HAND}")
+    if not _NO_LIBRARY.search(output):
+        return None
+    glibc = _GLIBC.search(output)
+    needs = f" ({glibc.group(1)} is missing)" if glibc else ""
+    where = "the Lutris Flatpak's runtime" if sandboxed else "this system"
+    return (f"This Wine ({wine}) couldn't start: it needs newer system libraries than {where} has{needs}, so "
+            "the links weren't tested. Proton builds such as GE-Proton are made to run inside the Steam Linux "
+            f"Runtime or the Lutris Flatpak, not on the system itself. {_BY_HAND}")
 
 
 def _decode(data: bytes | str | None) -> str:
@@ -462,13 +506,15 @@ def _link_error(link_mode: str, link: Path, data_dir: Path, exc: OSError) -> str
     return f"Can't create the test {link_mode} {link}: {reason}"
 
 
-def _success_message(game: DiscoveredGame, link_mode: str, data_dir: Path, flatpak: bool) -> str:
+def _success_message(game: DiscoveredGame, link_mode: str, data_dir: Path, flatpak: bool,
+                     sandboxed: bool = False) -> str:
+    where = " (inside the Lutris Flatpak's sandbox, as the game runs)" if sandboxed else ""
     if link_mode == "hardlink":
-        return (f"Wine read the test file through a hardlink in {data_dir}: {game.name} will see mods "
+        return (f"Wine read the test file through a hardlink in {data_dir}{where}: {game.name} will see mods "
                 "deployed in hardlink mode.")
-    message = (f"Wine read the test file through a symlink in {data_dir}: {game.name} will see mods "
+    message = (f"Wine read the test file through a symlink in {data_dir}{where}: {game.name} will see mods "
                "deployed with symlinks.")
-    if flatpak:
+    if flatpak and not sandboxed:
         message += (f" Note: this game seems to run in the Flatpak version of Lutris, and this check ran Wine "
                     f"outside its sandbox. If mods don't show up in the game, let the sandbox read the mods "
                     f"folder ('flatpak override --user --filesystem={paths.mods_dir()} {FLATPAK_ID}') or "
@@ -476,7 +522,13 @@ def _success_message(game: DiscoveredGame, link_mode: str, data_dir: Path, flatp
     return message
 
 
-def _failure_advice(game_id: str, link_mode: str) -> str:
+def _failure_advice(game_id: str, link_mode: str, sandboxed: bool = False) -> str:
+    if link_mode == "symlink" and sandboxed:
+        return ("Wine ran inside the Lutris Flatpak's sandbox, as the game does, and the sandbox can't reach "
+                f"the app's mods folder ({paths.mods_dir()}) the symlinks point to. Switch this game to "
+                f"hardlinks: 'bethmm override {game_id} --link-mode hardlink' (the mods folder and the game must "
+                "be on the same filesystem), or let the sandbox read the mods folder: "
+                f"'flatpak override --user --filesystem={paths.mods_dir()} {FLATPAK_ID}'.")
     if link_mode == "hardlink":
         return ("A hardlink is an ordinary file to Wine, so the problem is Wine or the prefix rather than the "
                 "links: check the output below and that the game starts from Lutris.")

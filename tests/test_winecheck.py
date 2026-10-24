@@ -63,6 +63,11 @@ elif MODE == "silent":
 elif MODE == "fail":
     sys.stderr.write("wine: could not load kernel32.dll, status c0000135\n")
     sys.exit(1)
+elif MODE == "glibc":
+    # A Proton build run outside the runtime it was made for.
+    sys.stderr.write("wine: could not load ntdll.so: /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.38' not "
+                     "found (required by /x/files/bin/../lib/wine/x86_64-unix/ntdll.so)\n")
+    sys.exit(1)
 elif MODE == "nosymlink" and path is not None and os.path.islink(path):
     print("The system cannot find the file specified.")
     sys.exit(1)
@@ -112,6 +117,44 @@ def make_executable(path: Path, text: str = "#!/bin/sh\nexit 0\n") -> Path:
     path.write_text(text)
     path.chmod(0o755)
     return path
+
+
+FAKE_FLATPAK = r'''#!{python}
+# 'flatpak run --command=CMD --env=K=V ... APP ARGS...': runs CMD ARGS with
+# only the --env values for the Wine variables, as a sandbox would.
+import json, os, sys
+
+MODE = {mode!r}
+RECORD = {record!r}
+
+args = sys.argv[1:]
+calls = json.load(open(RECORD)) if os.path.exists(RECORD) else []
+calls.append(args)
+with open(RECORD + ".tmp", "w") as fh:
+    json.dump(calls, fh)
+os.replace(RECORD + ".tmp", RECORD)
+env = dict(os.environ)
+env.pop("WINEPREFIX", None)
+env.pop("WINEDEBUG", None)
+command, i = None, 1
+while args[i].startswith("--"):
+    if args[i].startswith("--command="):
+        command = args[i].split("=", 1)[1]
+    elif args[i].startswith("--env="):
+        key, value = args[i].split("=", 1)[1].split("=", 1)
+        env[key] = value
+    i += 1
+if MODE == "noexec":
+    sys.stderr.write("bwrap: execvp %s: No such file or directory\\n" % command)
+    sys.exit(1)
+os.execve(command, [command] + args[i + 1:], env)
+'''
+
+
+def fake_flatpak(directory: Path, mode: str = "ok") -> Path:
+    record = directory / "flatpak.calls.json"  # where calls() looks
+    return make_executable(directory / "flatpak", FAKE_FLATPAK.format(python=sys.executable, mode=mode,
+                                                                       record=str(record)))
 
 
 def fake_wine(directory: Path, mode: str = "ok") -> Path:
@@ -1004,3 +1047,86 @@ def test_a_game_folder_with_a_character_cmd_reads_specially_is_not_checked(home,
 
     assert result.ok is None and "(&)" in result.message and "Fallout4&Friends" in result.message
     assert calls(wine) == [] and leftovers(game) == [] and snapshot(game.prefix) == before
+
+
+
+# ---------------------------------------------------------------- the Flatpak Lutris
+
+
+@pytest.fixture
+def flatpak_game(home, tmp_path, monkeypatch):
+    """A game of the Flatpak Lutris, and a 'flatpak' command on PATH."""
+    game = make_game(tmp_path)
+    write_yml(home / FLATPAK_DATA / "games" / "fallout-4-1.yml", lutris_yml(game.prefix, "GE-Proton11-1"))
+    bin_dir = tmp_path / "bin"
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    return game, bin_dir
+
+
+def test_a_flatpak_game_is_checked_inside_the_flatpak(home, flatpak_game):
+    """As the game runs: the sandbox decides what Wine sees, and a Proton build
+    needs the Flatpak's runtime (it may not start on the system itself)."""
+    game, bin_dir = flatpak_game
+    flatpak = fake_flatpak(bin_dir)
+    wine = fake_wine(home / ".steam" / "root" / "compatibilitytools.d" / "GE-Proton11-1" / "files" / "bin")
+
+    result = check_links(game, link_mode="hardlink", wine=str(wine), home=home)
+
+    assert result.ok is True, result.message
+    assert "inside the Lutris Flatpak's sandbox" in result.message
+    (call,) = calls(flatpak)
+    assert call[:2] == ["run", f"--command={wine}"]
+    assert call[-5:] == ["net.lutris.Lutris", "cmd", "/c", "type", result.windows_path]
+    (wine_call,) = calls(wine)
+    assert wine_call["WINEPREFIX"] == str(game.prefix) and wine_call["WINEDEBUG"] == "-all"
+    assert leftovers(game) == []
+
+
+def test_symlinks_the_sandbox_cant_follow_suggest_hardlinks(home, flatpak_game):
+    game, bin_dir = flatpak_game
+    fake_flatpak(bin_dir)
+    wine = fake_wine(home / FLATPAK_DATA / "runners" / "proton" / "GE-Proton11-1" / "files" / "bin", "nosymlink")
+
+    result = check_links(game, wine=str(wine), home=home)
+
+    assert result.ok is False
+    assert "sandbox can't reach" in result.message and "--link-mode hardlink" in result.message
+    assert "outside its sandbox" not in result.message
+
+
+def test_a_wine_that_cannot_start_is_not_a_failed_check(home, tmp_path):
+    """A Proton build run on a system older than it was made for: the links
+    were never tested, so the check says it couldn't run."""
+    game = make_game(tmp_path)
+    wine = fake_wine(tmp_path, "glibc")
+
+    result = check_links(game, link_mode="hardlink", wine=str(wine), home=home)
+
+    assert result.ok is None
+    assert "couldn't start" in result.message and "GLIBC_2.38 is missing" in result.message
+    assert "weren't tested" in result.message and "To test by hand" in result.message
+    assert "GLIBC_2.38" in result.output and leftovers(game) == []
+
+
+def test_a_wine_the_sandbox_cannot_see(home, flatpak_game):
+    game, bin_dir = flatpak_game
+    fake_flatpak(bin_dir, "noexec")
+    wine = fake_wine(home / "odd" / "bin")
+
+    result = check_links(game, wine=str(wine), home=home)
+
+    assert result.ok is None and "can't see this Wine" in result.message
+    assert calls(wine) == [] and leftovers(game) == []
+
+
+def test_a_system_wine_runs_outside_the_flatpak(home, flatpak_game, tmp_path):
+    """The sandbox has its own /usr, so a Wine outside the home folder runs on
+    the system (and the result says the sandbox wasn't part of it)."""
+    game, bin_dir = flatpak_game
+    flatpak = fake_flatpak(bin_dir)
+    wine = fake_wine(tmp_path / "usr-bin")
+
+    result = check_links(game, wine=str(wine), home=home)
+
+    assert result.ok is True and "outside its sandbox" in result.message
+    assert calls(flatpak) == [] and len(calls(wine)) == 1
