@@ -60,31 +60,69 @@ steps as commands.
 
 ### 1. Install the app
 
-On Ubuntu or an Ubuntu-based distro (Linux Mint, Pop!_OS, Zorin, ...), open a
-terminal and run:
+You need Ubuntu 22.04 or newer, or a distro based on it (Linux Mint 21 or newer,
+Pop!_OS, Zorin OS 17, ...). The app isn't in your distro's package manager yet, so
+you install it from a terminal, with a script that does the work. It takes a few
+commands that you copy and paste.
 
-```bash
-sudo apt install git                      # if you don't have it yet
-git clone https://github.com/derikatwork/f4mm-linux.git
-cd f4mm-linux
-./install.sh
-```
+**Using the terminal, briefly:**
 
-Run `install.sh` as your normal user, not with `sudo`. It asks for your password
-if it needs to install something with `apt`:
+* Open it with **Ctrl+Alt+T**, or find **Terminal** in your applications menu.
+* Paste with **Ctrl+Shift+V** (plain Ctrl+V doesn't work in most terminals), or
+  right-click ▸ *Paste*.
+* Run **one command at a time**: paste it, press Enter, and wait until the terminal
+  is ready again (the line ending in `$` comes back) before the next one. If you
+  paste several lines at once and one of them asks for your password, the lines
+  after it are taken as your password.
+* When the terminal asks for your password, type it and press Enter. Nothing
+  appears while you type; that's normal.
 
-1. It checks for Python 3.11+, the `7z` program that unpacks archives (with RAR
-   support), and the libraries the desktop app needs, and offers to install
-   whatever is missing.
-2. It installs the app into its own environment in
-   `~/.local/share/beth-mod-manager/venv`. The first time, this downloads the
-   Qt toolkit (about 100 MB).
-3. It adds a **BETH Mod Manager** entry to your applications menu, plus the
-   `bethmm` and `bethmm-gui` commands in `~/.local/bin`. After the first install,
-   log out and back in so your shell finds them.
+**Install it:**
 
-**Keep the cloned folder:** the app runs from it. To update the app later, run
-`git pull && ./install.sh` in that folder.
+1. Install `git`, the tool that downloads the app. If you already have it, this
+   just says so:
+   ```bash
+   sudo apt install git
+   ```
+   Type your password when asked. If it asks "Do you want to continue? [Y/n]",
+   press Enter.
+2. Go to your home folder:
+   ```bash
+   cd ~
+   ```
+3. Download the app. This creates a folder called `f4mm-linux` in your home folder:
+   ```bash
+   git clone https://github.com/derikatwork/f4mm-linux.git
+   ```
+4. Go into that folder:
+   ```bash
+   cd ~/f4mm-linux
+   ```
+5. Run the install script. Don't put `sudo` in front of it; it asks for your
+   password itself if it needs to:
+   ```bash
+   ./install.sh
+   ```
+   It lists what it found on your system. If something is missing, it asks
+   "Install ... with apt (needs your password)? [Y/n]": press Enter, then type your
+   password. The first install downloads about 100 MB and takes a few minutes. It
+   is finished when it prints **==> Done**.
+
+What the script did:
+
+* It checked for Python, the `7z` program that unpacks mod archives (including
+  `.rar`), and the libraries the app's window needs, and installed whatever was
+  missing with `apt`.
+* It installed the app in its own folder, `~/.local/share/beth-mod-manager/venv`,
+  so your system's own Python isn't changed.
+* It added **BETH Mod Manager** to your applications menu, plus the `bethmm` command
+  for the terminal.
+
+Some desktops only show the new menu entry after you log out and back in. The
+`bethmm` command works in new terminals after you log out and back in once.
+
+**Keep the `f4mm-linux` folder.** The app runs from it, and updates are downloaded
+into it (see [Updating the app](#updating-the-app)).
 
 ### 2. Open it and find your game
 
@@ -118,17 +156,27 @@ Lutris's Flatpak, just as the game does.
 
 ### 4. Fallout 4 only: let the game load mods (once)
 
-Fallout 4 ignores mods unless two INI files say otherwise, and the app doesn't edit
-INI files. They are in the game's Wine prefix, under
-`drive_c/users/<you>/Documents/My Games/Fallout4/` (`My Documents` with older
-Wine). Add these lines, creating `Fallout4Custom.ini` if it isn't there:
+Fallout 4 ignores mods unless two of its settings files say otherwise, and the app
+doesn't change those files for you. You edit them once, with a text editor:
+
+1. Start the game once from Lutris and quit it, so that its settings files exist.
+2. Find the game's Wine prefix: in the app, open *Game ▸ Game settings...*. The
+   line at the top says "Found at ... (prefix ...)"; the folder after *prefix* is it
+   (or the one in the **Wine prefix** box, if you set one yourself).
+3. In your file manager, open that folder, then **drive_c ▸ users ▸** your user name
+   (or **steamuser**, for games that run with Proton) **▸ Documents ▸ My Games ▸
+   Fallout4**. Older Wine versions call it **My Documents** instead of
+   **Documents**.
+4. Open **Fallout4Prefs.ini** with your text editor (right-click ▸ *Open With* ▸
+   *Text Editor*). Find the line `[Launcher]`. If there is a line starting with
+   `bEnableFileSelection=` under it, change it to `bEnableFileSelection=1`;
+   otherwise add that line right under `[Launcher]`. Save.
+5. If there is a **Fallout4Custom.ini** in the same folder, open it. If not, open
+   your text editor and save a new, empty file there with exactly that name. Make
+   sure it contains these lines. If it already has an `[Archive]` line, add the
+   other two lines under it. Save.
 
 ```ini
-; Fallout4Prefs.ini
-[Launcher]
-bEnableFileSelection=1
-
-; Fallout4Custom.ini
 [Archive]
 bInvalidateOlderFiles=1
 sResourceDataDirsFinal=
@@ -289,13 +337,121 @@ file* shows every one of them. See also [Troubleshooting](#troubleshooting).
 
 ---
 
+## Updating the app
+
+New versions are downloaded with `git`, the tool you used to install the app.
+Updating doesn't touch your mods, your settings or your game folders.
+
+1. Close BETH Mod Manager if it's open.
+2. Open a terminal and run these commands, one at a time.
+   - Go to the app's folder:
+     ```bash
+     cd ~/f4mm-linux
+     ```
+   - Download the new version. It prints the files that changed, or "Already up to
+     date.":
+     ```bash
+     git pull
+     ```
+   - Install it. This is the same script as the first install, so it may ask for
+     your password if the new version needs something new:
+     ```bash
+     ./install.sh
+     ```
+3. Open the app again.
+
+If you downloaded the app to a folder other than `~/f4mm-linux`, use that folder
+in the first command.
+
+**If something goes wrong:**
+
+* **"cd: ... No such file or directory":** the app's folder isn't at `~/f4mm-linux`.
+  Look for the `f4mm-linux` folder in your file manager and use its location in
+  the `cd` command. If you deleted it, download it again as in
+  [step 1](#1-install-the-app). Your mods and settings are kept elsewhere and
+  aren't affected.
+* **`git pull` says "Your local changes to the following files would be
+  overwritten":** a file in the app's folder was changed. To undo that change and
+  get the new version, run `git reset --hard`, then `git pull` again. This only
+  affects the app's own files in that folder, not your mods.
+* **You're not getting updates, or `git pull` says "There is no tracking
+  information for the current branch":** run `git status`. Its first line should
+  say `On branch main`. If it doesn't (for example, you tried a test version), run
+  `git checkout main`, then `git pull` again.
+* **The app doesn't start after an update, or after you upgraded your distro to a
+  new release:** run `./install.sh` again in the app's folder. It rebuilds the
+  app's environment.
+
+## Uninstalling the app
+
+Do this in order: first take the mods out of your games, then remove the app.
+
+1. **Take the mods out of every game.** In BETH Mod Manager, pick each game in the
+   list at the top in turn, choose *Game ▸ Purge...* and confirm. This removes the
+   app's links and puts back the game files mods had replaced, so each game is as
+   it was before you used the app.
+
+   You can also do this for all games at once, from a terminal. Answer `y` when it
+   asks:
+   ```bash
+   ~/.local/bin/bethmm purge --all
+   ```
+2. **Remove the app.** Close it, open a terminal, and run these one at a time:
+   ```bash
+   cd ~/f4mm-linux
+   ```
+   ```bash
+   ./install.sh --uninstall
+   ```
+   This removes the app, its menu entry and the `bethmm` command. If a game still
+   has mods in it, the script stops, shows what is left, and changes nothing; go
+   back to step 1.
+3. **Optional: delete your mods and settings.** The uninstall keeps them, in case
+   you install the app again. Only delete them after step 2 has worked, which
+   makes sure no game still uses them:
+   ```bash
+   rm -rf ~/.local/share/beth-mod-manager ~/.config/beth-mod-manager
+   ```
+   This deletes every mod you installed with the app, its records, and its copies
+   of `plugins.txt`. It also deletes any original game files the app kept aside
+   (only ones a game update had replaced, or those of a game that is gone). You can also delete these two folders in your file manager
+   instead. They are hidden folders: press **Ctrl+H** to show them.
+4. **Optional: delete the app's folder.** Do this last, because step 2 needs it:
+   ```bash
+   rm -rf ~/f4mm-linux
+   ```
+
+The install script may also have installed some system packages, such as `7zip`,
+`7zip-rar`, `python3-venv` and a few libraries. They stay installed. Other programs
+can use them too and they do no harm, so you can leave them.
+
+**If something goes wrong:**
+
+* **The uninstall says "the app still has files in a game folder":** a game still
+  has mods in it; do step 1 for it. If that game isn't installed any more (you
+  deleted or moved it), its purge can't run. Run
+  `~/.local/bin/bethmm purge --all --forget-missing` instead. It forgets that game
+  and keeps the original game files the app had backed up for it, in
+  `~/.local/share/beth-mod-manager/backups`.
+* **The uninstall says "no installation found":** the app is already uninstalled,
+  or was installed by another user account.
+
+---
+
 ## Using the command line
 
-Everything the desktop app does can also be done with the `bethmm` command. Both
-use the same mods and records, so you can switch between them at any time. Only
-one change runs at a time: if another window or command is busy, `bethmm` stops
-straight away with "another bethmm process is changing mods right now" and
-changes nothing.
+Everything the desktop app does can also be done with the `bethmm` command in a
+terminal ([step 1](#1-install-the-app) has the basics of using one). Both use the
+same mods and records, so you can switch between them at any time. Only one change
+runs at a time: if another window or command is busy, `bethmm` stops straight away
+with "another bethmm process is changing mods right now" and changes nothing.
+
+If the terminal says `bethmm: command not found`, log out and back in once after
+installing, or type `~/.local/bin/bethmm` instead of `bethmm`.
+
+In the lists of commands below, each line is a separate command, and the text after
+`#` explains what it does (the terminal ignores it). Run the ones you need, one at a
+time.
 
 ### The walkthrough as commands
 
@@ -559,24 +715,41 @@ root's place is detected on its own.
   `bethmm check-links <game> --wine PATH`.
 * **"another bethmm process is changing mods right now":** another window or command
   is making a change. Wait for it, then try again.
-* **You want an older `plugins.txt` back:** copy one from
-  `~/.local/share/beth-mod-manager/plugins-backups/<game>/` over the game's
-  `plugins.txt`, then *Game ▸ Update plugins.txt*. The copies are named by date and
-  time; `plugins-first.txt` is how it was before the app first changed it.
+* **You want an older `plugins.txt` back:** *Help ▸ Open the data folder*, then
+  open **plugins-backups** and the folder of your game. The copies are named by
+  date and time; `plugins-first.txt` is how it was before the app first changed
+  it. Copy the one you want over the game's `plugins.txt`, keeping that name
+  ([step 9](#9-plugins-and-load-order) says where it is), then choose
+  *Game ▸ Update plugins.txt*.
 * **"plugins.txt wasn't updated: the game's Wine prefix (or Wine user) isn't
   known":** set them in *Game ▸ Game settings...*, then *Game ▸ Update plugins.txt*.
-* **`.rar` archives don't open:** RAR support comes from `7zip-rar` (`p7zip-rar`
-  on 22.04-based releases), which is in Ubuntu's multiverse repository. Run
-  `sudo add-apt-repository multiverse`, then `./install.sh` again.
-* **The desktop app doesn't start:** run `bethmm-gui` in a terminal to see why. An
-  error about the `xcb` platform plugin means a system library is missing:
-  `sudo apt install libxcb-cursor0`, or run `./install.sh` again, which checks for
-  the others too.
-* **The app stopped working after a distro upgrade:** run `./install.sh` again; it
-  recreates the app's environment.
+* **`.rar` archives don't open:** RAR support comes from the `7zip-rar` package
+  (`p7zip-rar` on 22.04-based releases), which is in Ubuntu's "multiverse" software
+  source. Turn that source on, then run the install script again. In a terminal,
+  run these one at a time:
+  ```bash
+  sudo add-apt-repository multiverse
+  ```
+  ```bash
+  cd ~/f4mm-linux
+  ```
+  ```bash
+  ./install.sh
+  ```
+  Linux Mint has multiverse on already; there, running the install script again is
+  enough.
+* **The desktop app doesn't start:** open a terminal and start it from there to
+  see the error:
+  ```bash
+  ~/.local/bin/bethmm-gui
+  ```
+  An error about the `xcb` platform plugin means a system library is missing.
+  Install it with `sudo apt install libxcb-cursor0`, or run the install script
+  again (`cd ~/f4mm-linux`, then `./install.sh`), which checks for the others too.
+* **The app stopped working after a distro upgrade:** run the install script again
+  (`cd ~/f4mm-linux`, then `./install.sh`); it rebuilds the app's environment.
 * **What did it do?** The **History** tab (`bethmm history`) lists the latest file
-  operations. The log, `~/.local/share/beth-mod-manager/logs/bethmm.log`, has every
-  one of them.
+  operations. *Help ▸ Open the log file* shows every one of them.
 
 ## Known limitations
 
@@ -662,7 +835,7 @@ installed. You always confirm.
 * `--dev`: also install the test tools and run the tests.
 * `--no-gui`: command line only, without Qt or the menu entry.
 * `--no-system-packages`: never call `apt`; only check what is there.
-* `--uninstall`: see [Uninstalling](#uninstalling).
+* `--uninstall`: see [Uninstalling the app](#uninstalling-the-app).
 * `--force`: install even when run as root, or uninstall even though mods are still
   deployed.
 
@@ -686,18 +859,6 @@ ln -s ~/.local/share/beth-mod-manager/venv/bin/bethmm ~/.local/bin/bethmm
 ln -s ~/.local/share/beth-mod-manager/venv/bin/bethmm-gui ~/.local/bin/bethmm-gui
 ```
 </details>
-
-### Uninstalling
-
-```bash
-bethmm purge --all            # first: take every mod out of every game folder
-./install.sh --uninstall      # then remove the app, its commands and its menu entry
-```
-
-`--uninstall` refuses while the app still has files in a game folder, and shows
-what is left. Your mods, backups, settings and records stay in
-`~/.local/share/beth-mod-manager` and `~/.config/beth-mod-manager`. Delete those
-folders by hand if you no longer want them.
 
 ### Running the tests
 
