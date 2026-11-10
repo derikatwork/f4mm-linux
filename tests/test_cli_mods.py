@@ -49,7 +49,7 @@ def snapshot(root: Path) -> dict:
         for name in dirnames + filenames:
             p = os.path.join(dirpath, name)
             st = os.lstat(p)
-            content = open(p, "rb").read() if os.path.isfile(p) and not os.path.islink(p) else None
+            content = Path(p).read_bytes() if os.path.isfile(p) and not os.path.islink(p) else None
             out[os.path.relpath(p, root)] = (st.st_mode, content, st.st_ino if content is not None else None)
     return out
 
@@ -1132,3 +1132,21 @@ def test_verify_repair_finishes_an_update_stopped_before_its_deploy(home, fo4, t
     assert "deleted" in out  # version 1's folder: nothing uses it any more
     assert sorted(p.name for p in paths.mods_dir("fallout4").iterdir()) == ["Cool (2)"]
     assert main(["verify"]) == 0
+
+
+@pytest.mark.skipif(not shutil.which("bsdtar"), reason="bsdtar not installed")
+def test_a_rar_mod_installs_where_7z_has_no_rar_support(home, fo4, tmp_path, capsys):
+    """As on Fedora, whose 7-Zip is built without RAR: bsdtar reads it."""
+    from helpers import make_rar5
+
+    seven = tmp_path / "bin" / "7z"
+    seven.parent.mkdir()
+    seven.write_text('#!/bin/sh\nfor a; do last=$a; done\necho "ERROR: $last : Cannot open the file as archive"\n'
+                     "exit 2\n")
+    seven.chmod(0o755)
+    assert main(["config", "--7z", str(seven)]) == 0
+    archive = tmp_path / "Rar Mod-4321-1-0-1700000000.rar"
+    archive.write_bytes(make_rar5({"RarMod.esp": esp(), "textures/rar.dds": b"dds"}))
+    assert main(["install", str(archive), "--yes"]) == 0, capsys.readouterr().err
+    assert os.path.realpath(fo4 / "Data" / "RarMod.esp").endswith("/RarMod.esp")
+    assert (fo4 / "Data" / "textures" / "rar.dds").read_bytes() == b"dds"

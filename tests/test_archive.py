@@ -1,12 +1,15 @@
+import logging
 import shutil
 import stat
 import subprocess
 import zipfile
+from pathlib import Path
 
 import pytest
 
 from bethmm import archive
 from bethmm.archive import ArchiveError, SevenZipMissing, extract_archive, find_sevenzip, list_archive
+from helpers import make_rar5
 
 needs_7z = pytest.mark.skipif(not any(shutil.which(n) for n in archive.SEVENZIP_NAMES), reason="7z not installed")
 
@@ -284,3 +287,125 @@ def test_a_link_to_a_folder_outside_cannot_be_written_through(tmp_path, target):
     assert list(outside.iterdir()) == []
     if result is not None:
         assert not (tmp_path / "out" / "Data" / "lnk").is_symlink()
+
+
+# ---------------------------------------------------------------- RAR without RAR support in 7z (Fedora)
+
+
+needs_bsdtar = pytest.mark.skipif(not shutil.which("bsdtar"), reason="bsdtar not installed")
+
+RAR = {"Data": None, "Data/Cool.esp": b"plugin", "Data/textures/cool.dds": b"x" * 1000}
+
+
+def _no_rar_7z(tmp_path):
+    """A 7z built without RAR (as Fedora's is): it can't open a .rar at all.
+    The wording is 7-Zip 23's for a file no format handler accepts."""
+    exe = tmp_path / "bin" / "7z"
+    exe.parent.mkdir(exist_ok=True)
+    exe.write_text('#!/bin/sh\nfor a; do last=$a; done\necho "7-Zip 26.03 (x64)"\n'
+                   'echo "ERROR: $last : Cannot open the file as archive"\necho "Errors: 1"\nexit 2\n')
+    exe.chmod(0o755)
+    return str(exe)
+
+
+def _rar(tmp_path, entries=RAR, name="Cool Mod-1234-1-0.rar"):
+    path = tmp_path / name
+    path.write_bytes(make_rar5(entries))
+    return path
+
+
+@needs_7z
+def test_a_rar_the_7z_can_read_is_read_by_7z(tmp_path):
+    if "Rar5" not in subprocess.run([find_sevenzip(), "i"], capture_output=True, text=True).stdout:
+        pytest.skip("this 7z has no RAR support")
+    result = extract_archive(_rar(tmp_path), tmp_path / "out")
+    assert result.files == ["Data/Cool.esp", "Data/textures/cool.dds"]
+
+
+@needs_bsdtar
+def test_a_rar_the_7z_cannot_read_is_read_with_bsdtar(tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger="bethmm.archive")
+    seven = _no_rar_7z(tmp_path)
+    assert [(e.path, e.is_dir, e.size) for e in list_archive(_rar(tmp_path), seven)] == [
+        ("Data", True, 0), ("Data/Cool.esp", False, 6), ("Data/textures/cool.dds", False, 1000)]
+    result = extract_archive(_rar(tmp_path), tmp_path / "out", seven)
+    assert result.files == ["Data/Cool.esp", "Data/textures/cool.dds"] and result.warnings == []
+    assert (tmp_path / "out" / "Data" / "Cool.esp").read_bytes() == b"plugin"
+    assert "(bsdtar)" in caplog.text
+
+
+@needs_bsdtar
+def test_unsafe_paths_in_a_rar_read_with_bsdtar_are_refused_before_extracting(tmp_path):
+    archive = _rar(tmp_path, {"Data/ok.esp": b"x", "../evil.txt": b"e"})
+    with pytest.raises(ArchiveError, match="unsafe paths"):
+        extract_archive(archive, tmp_path / "w" / "out", _no_rar_7z(tmp_path))
+    assert not (tmp_path / "w" / "evil.txt").exists() and not (tmp_path / "w" / "out").exists()
+
+
+@needs_bsdtar
+def test_a_rar_bigger_than_the_free_space_is_refused_with_bsdtar_too(tmp_path, monkeypatch):
+    real = shutil.disk_usage
+    monkeypatch.setattr(archive.shutil, "disk_usage", lambda p: real(p)._replace(free=500))
+    with pytest.raises(ArchiveError, match="unpacks to"):
+        extract_archive(_rar(tmp_path), tmp_path / "out", _no_rar_7z(tmp_path))
+
+
+@pytest.mark.parametrize("family, hint", [("fedora", "sudo dnf install bsdtar"), ("debian", "sudo apt install 7zip-rar")])
+def test_without_bsdtar_the_error_says_how_to_get_rar_support(tmp_path, monkeypatch, family, hint):
+    from bethmm import distro
+
+    monkeypatch.setattr(distro, "family", lambda: family)
+    real_which = shutil.which
+    monkeypatch.setattr(archive.shutil, "which", lambda name, *a, **k: None if name == "bsdtar" else real_which(name))
+    with pytest.raises(ArchiveError) as exc:
+        list_archive(_rar(tmp_path), _no_rar_7z(tmp_path))
+    assert hint in str(exc.value)
+
+
+def test_a_failing_7z_on_other_archives_never_falls_back(tmp_path, monkeypatch):
+    calls = []
+    real_which = shutil.which
+    monkeypatch.setattr(archive.shutil, "which", lambda name, *a, **k: calls.append(name) or real_which(name))
+    src = _zip(tmp_path / "m.zip", {"a.esp": b"x"})
+    with pytest.raises(ArchiveError, match="Cannot open the file as archive"):
+        archive._list(src, _no_rar_7z(tmp_path))
+    assert "bsdtar" not in calls
+
+
+def test_the_7zip_wording_counts_as_no_rar_support(tmp_path):
+    """7-Zip 22+ says "Cannot open", p7zip "Can not open": both mean no RAR handler."""
+    out = "7-Zip 23.01 (x64)\n\nERROR: /d/m.rar : Cannot open the file as archive\n\nErrors: 1\n"
+    assert "sudo apt install 7zip-rar" in str(archive._failure(tmp_path / "m.rar", _proc(out), "/usr/bin/7z"))
+
+
+def test_fedora_gets_dnf_in_the_missing_7z_hint(monkeypatch):
+    from bethmm import distro
+
+    monkeypatch.setattr(distro, "family", lambda: "fedora")
+    monkeypatch.setattr(archive.shutil, "which", lambda name, *a, **k: None)
+    with pytest.raises(SevenZipMissing, match="sudo dnf install 7zip bsdtar"):
+        find_sevenzip()
+
+
+def test_bsdtar_listing_lines():
+    out = ("drwxr-xr-x  0 0      0           0 Jan  1  1970 Data/\n"
+           "-rw-r--r--  0 user   users      12 Mar 14 12:34 Data/a b.esp\n"
+           "lrwxrwxrwx  0 0      0           0 Jan  1  2020 Data/link -> ../../etc\n"
+           "hrw-r--r--  0 0      0           0 Jan  1  2020 Data/copy.esp link to Data/a b.esp\n"
+           "-rw-r--r--+ 0 0      0           5 Dec 31  1999 Data\\back.esp\n")
+    assert [(e.path, e.is_dir, e.size) for e in archive._parse_bsdtar(out, Path("m.rar"))] == [
+        ("Data", True, 0), ("Data/a b.esp", False, 12), ("Data/link", False, 0), ("Data/copy.esp", False, 0),
+        ("Data/back.esp", False, 5)]
+    with pytest.raises(ArchiveError, match="couldn't read the list of files"):
+        archive._parse_bsdtar("something unexpected\n", Path("m.rar"))
+
+
+def test_bsdtar_errors_are_explained(tmp_path):
+    proc = subprocess.CompletedProcess([], 1, b"", b"bsdtar: Encrypted file is unsupported\n")
+    assert "password-protected" in str(archive._bsdtar_failure(tmp_path / "m.rar", proc))
+    proc = subprocess.CompletedProcess([], 1, b"", b"bsdtar: Truncated RAR file data\n")
+    assert "download it again" in str(archive._bsdtar_failure(tmp_path / "m.rar", proc))
+    proc = subprocess.CompletedProcess([], 1, b"", b"bsdtar: Data/lnk/x: Cannot extract through symlink Data/lnk/x\n")
+    assert "leads outside the mod" in str(archive._bsdtar_failure(tmp_path / "m.rar", proc))
+    proc = subprocess.CompletedProcess([], 1, b"", b"bsdtar: Unsupported compression method\n")
+    assert "Install extracted folder" in str(archive._bsdtar_failure(tmp_path / "m.rar", proc))

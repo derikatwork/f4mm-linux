@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -268,3 +269,78 @@ def test_the_test_tools_install_without_qt():
     assert not any("pytest-qt" in r for r in extras["dev"])
     assert any("pytest-qt" in r for r in extras["gui-dev"])
     assert "EXTRA_NAMES+=(gui-dev)" in SCRIPT.read_text()
+
+
+# ---------------------------------------------------------------- system packages, per distribution
+
+TOOLS = ("dirname", "basename", "id", "grep", "sed", "awk", "readlink", "tr", "sort", "uname")
+
+
+def system_check(tmp_path: Path, os_release: str, *, installed: tuple[str, ...] = ()) -> tuple[
+        subprocess.CompletedProcess, list[list[str]]]:
+    """Run 'install.sh --yes --force' on a stand-in system: *os_release*,
+    *installed* packages, a package manager that records what it is asked
+    to do, and no 7z, so the script stops right after the system packages."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for tool in TOOLS:
+        (bin_dir / tool).symlink_to(shutil.which(tool))
+    (bin_dir / "python3").symlink_to(sys.executable)
+    record = tmp_path / "package-manager.log"
+    listed = " ".join(installed)
+
+    def script(name: str, body: str) -> None:
+        (bin_dir / name).write_text(f"#!/bin/sh\n{body}\n")
+        (bin_dir / name).chmod(0o755)
+
+    script("sudo", 'exec "$@"')
+    script("dnf", f'echo "dnf $*" >> {record}')
+    script("apt-get", f'echo "apt-get $*" >> {record}')
+    script("rpm", f'for p in {listed}; do [ "$p" = "$3" ] && exit 0; done; exit 1')
+    script("dpkg-query", f'for p in {listed}; do [ "$p" = "$4" ] && echo "install ok installed" && exit 0; done; exit 1')
+    script("apt-cache", 'echo "  Installed: (none)"; echo "  Candidate: 1.0-1"')
+    (tmp_path / "os-release").write_text(os_release)
+    home = tmp_path / "home"
+    home.mkdir()
+    env = {"PATH": str(bin_dir), "HOME": str(home), "BETHMM_OS_RELEASE": str(tmp_path / "os-release")}
+    result = run("--yes", "--force", env=env, shell=shutil.which("bash"))
+    calls = [line.split() for line in record.read_text().splitlines()] if record.exists() else []
+    return result, calls
+
+
+FEDORA = 'NAME="Fedora Linux"\nID=fedora\nVERSION_ID=45\nPRETTY_NAME="Fedora Linux 45 (Workstation Edition)"\n'
+UBUNTU = 'NAME="Ubuntu"\nID=ubuntu\nID_LIKE=debian\nVERSION_ID="24.04"\nPRETTY_NAME="Ubuntu 24.04.3 LTS"\n'
+
+
+def test_fedora_gets_its_packages_with_dnf(tmp_path):
+    """7zip, bsdtar (Fedora's 7-Zip has no RAR) and the Qt libraries that are missing."""
+    present = ("libxcb", "libxkbcommon", "libglvnd-egl", "libglvnd-glx", "fontconfig", "dbus-libs",
+               "libwayland-client", "libwayland-cursor", "xcb-util", "xcb-util-image", "xcb-util-keysyms",
+               "xcb-util-renderutil", "libxkbcommon-x11")
+    result, calls = system_check(tmp_path, FEDORA, installed=present)
+    assert "distro: Fedora Linux 45 (Workstation Edition)" in result.stdout
+    assert calls == [["dnf", "install", "-y", "bsdtar", "7zip", "xcb-util-cursor", "xcb-util-wm"]], result.stderr
+    assert "7z is still missing" in result.stderr  # the stand-in dnf installed nothing
+
+
+def test_fedora_derivatives_count_as_fedora(tmp_path):
+    result, calls = system_check(tmp_path, 'ID=nobara\nID_LIKE="rhel centos fedora"\nPRETTY_NAME="Nobara"\n')
+    assert calls and calls[0][:3] == ["dnf", "install", "-y"]
+
+
+def test_ubuntu_keeps_its_apt_packages(tmp_path):
+    result, calls = system_check(tmp_path, UBUNTU)
+    assert "distro: Ubuntu 24.04.3 LTS" in result.stdout
+    assert calls == [
+        ["apt-get", "update"],
+        ["apt-get", "install", "-y", "7zip", "7zip-rar", "libxcb-cursor0", "libxkbcommon-x11-0", "libxcb-icccm4",
+         "libxcb-image0", "libxcb-keysyms1", "libxcb-render-util0", "libxcb-shape0", "libxcb-util1",
+         "libxcb-xinerama0", "libxcb-xkb1", "libegl1", "libgl1", "libfontconfig1", "libdbus-1-3"],
+    ], result.stderr
+
+
+def test_another_distro_installs_nothing_and_says_what_to_do(tmp_path):
+    result, calls = system_check(tmp_path, 'ID=arch\nPRETTY_NAME="Arch Linux"\n')
+    assert calls == []
+    assert "written for Ubuntu-based distros and Fedora" in result.stderr
+    assert "--no-system-packages" in result.stderr

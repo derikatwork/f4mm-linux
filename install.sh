@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Install BETH Mod Manager for the current user on Ubuntu-based distros
-# (Ubuntu, Linux Mint, Pop!_OS, Zorin, elementary, KDE neon ...).
+# (Ubuntu, Linux Mint, Pop!_OS, Zorin, elementary, KDE neon ...) and Fedora.
 #
 #   ./install.sh                 install or update (run again after 'git pull')
 #   ./install.sh --yes           don't ask before installing system packages
@@ -8,7 +8,7 @@
 #   ./install.sh --no-gui        command line only: no Qt, no menu entry (removes
 #                                the menu entry and bethmm-gui of an earlier install)
 #   ./install.sh --no-system-packages
-#                                never call apt; only check what is there
+#                                never call apt or dnf; only check what is there
 #   ./install.sh --uninstall     remove the app (keeps your mods, backups and settings);
 #                                refuses while mods are still deployed in a game folder
 #   ./install.sh --force         install even when run as root / uninstall even
@@ -17,7 +17,8 @@
 # What it does:
 #   1. checks for Python 3.11+, the 7z program and the system libraries Qt needs,
 #      offering to install what is missing with apt (python3-venv, 7zip, 7zip-rar
-#      or the p7zip equivalents, libxcb-cursor0 ...);
+#      or the p7zip equivalents, libxcb-cursor0 ...) or, on Fedora, dnf (7zip,
+#      bsdtar for .rar files, xcb-util-cursor ...);
 #   2. creates a private Python environment in ~/.local/share/beth-mod-manager/venv
 #      with the app (and the Qt toolkit for its GUI) installed from this folder
 #      (keep this folder: updates are a 'git pull' away);
@@ -40,6 +41,7 @@ GUI_LAUNCHER="$BIN_DIR/bethmm-gui"
 DESKTOP_FILE="${XDG_DATA_HOME:-$HOME/.local/share}/applications/$APP_SLUG.desktop"
 DESKTOP_MARKER="X-BethMM-Installed-By=install.sh"  # = bethmm.gui.desktop.MARKER
 ICON="$REPO_DIR/bethmm/gui/icon.svg"
+OS_RELEASE="${BETHMM_OS_RELEASE:-/etc/os-release}"  # the tests point it elsewhere
 
 ASSUME_YES=0
 DEV=0
@@ -168,18 +170,29 @@ fi
 
 step "Checking your system"
 
-if [ -r /etc/os-release ]; then
-    # shellcheck disable=SC1091
-    . /etc/os-release
+# "debian": Ubuntu and the distros based on it (apt); "fedora": Fedora and
+# the distros based on it (dnf).
+FAMILY=""
+if [ -r "$OS_RELEASE" ]; then
+    # shellcheck disable=SC1090,SC1091
+    . "$OS_RELEASE"
     case " ${ID:-} ${ID_LIKE:-} " in
-        *" ubuntu "*|*" debian "*) say "distro: ${PRETTY_NAME:-$ID}" ;;
-        *) warn "this script is written for Ubuntu-based distros; found ${PRETTY_NAME:-unknown}."
+        *" ubuntu "*|*" debian "*) FAMILY=debian; say "distro: ${PRETTY_NAME:-$ID}" ;;
+        *" fedora "*) FAMILY=fedora; say "distro: ${PRETTY_NAME:-$ID}" ;;
+        *) warn "this script is written for Ubuntu-based distros and Fedora; found ${PRETTY_NAME:-unknown}."
            warn "install Python 3.11+, its venv module and 7z yourself, then re-run with --no-system-packages"
            SYSTEM_PACKAGES=0 ;;
     esac
 fi
 
-pkg_installed() { dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q "install ok installed"; }
+pkg_installed() {
+    if [ "$FAMILY" = fedora ]; then
+        rpm -q --quiet "$1" 2>/dev/null
+    else
+        dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q "install ok installed"
+    fi
+}
+# Ubuntu only: everything this script installs on Fedora is in Fedora's own repository.
 pkg_available() {
     local candidate
     candidate="$(apt-cache policy "$1" 2>/dev/null | sed -n 's/^ *Candidate: //p')"
@@ -192,12 +205,18 @@ NOTES=()
 
 if [ -z "$PY" ]; then
     say "Python 3.11 or newer: not found ($(python3 --version 2>/dev/null || echo 'no python3'))"
-    PACKAGES+=(python3.11 python3.11-venv)
+    if [ "$FAMILY" = fedora ]; then PACKAGES+=(python3); else PACKAGES+=(python3.11 python3.11-venv); fi
 else
     say "python: $PY ($("$PY" --version))"
     if ! "$PY" -c 'import ensurepip, venv' 2>/dev/null; then
         version="$("$PY" -c 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}")')"
-        if [ "$(basename "$PY")" = "python3" ]; then PACKAGES+=(python3-venv); else PACKAGES+=("python${version}-venv"); fi
+        if [ "$FAMILY" = fedora ]; then
+            PACKAGES+=(python-pip-wheel)  # what Fedora's venv module installs pip from
+        elif [ "$(basename "$PY")" = "python3" ]; then
+            PACKAGES+=(python3-venv)
+        else
+            PACKAGES+=("python${version}-venv")
+        fi
     fi
 fi
 
@@ -210,7 +229,18 @@ else
     SEVEN_ZIP_PKG=""
 fi
 
-if [ "$SYSTEM_PACKAGES" -eq 1 ]; then
+if [ "$FAMILY" = fedora ]; then
+    # Fedora's 7-Zip is built without RAR support: the app reads .rar files with bsdtar.
+    if command -v bsdtar >/dev/null 2>&1; then
+        say "bsdtar (for .rar files): $(command -v bsdtar)"
+    else
+        say "bsdtar (for .rar files): not found"
+        [ "$SYSTEM_PACKAGES" -eq 1 ] && PACKAGES+=(bsdtar)
+    fi
+    if [ "$SYSTEM_PACKAGES" -eq 1 ] && ! command -v 7z >/dev/null 2>&1 && ! command -v 7zz >/dev/null 2>&1; then
+        PACKAGES+=(7zip)
+    fi
+elif [ "$SYSTEM_PACKAGES" -eq 1 ]; then
     if [ -z "$SEVEN_ZIP_PKG" ] && ! command -v 7z >/dev/null 2>&1 && ! command -v 7zz >/dev/null 2>&1; then
         if pkg_available 7zip; then SEVEN_ZIP_PKG=7zip; else SEVEN_ZIP_PKG=p7zip-full; fi
         PACKAGES+=("$SEVEN_ZIP_PKG")
@@ -236,10 +266,16 @@ fi
 GUI_LIBS=(libxcb-cursor0 libxkbcommon-x11-0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1
           libxcb-render-util0 libxcb-shape0 libxcb-util1 libxcb-xinerama0 libxcb-xkb1 libegl1 libgl1
           libfontconfig1 libdbus-1-3)
+if [ "$FAMILY" = fedora ]; then
+    # The packages of the libraries PySide6's X11 and Wayland plugins link to.
+    GUI_LIBS=(xcb-util-cursor libxkbcommon-x11 xcb-util-wm xcb-util-image xcb-util-keysyms
+              xcb-util-renderutil xcb-util libxcb libxkbcommon libglvnd-egl libglvnd-glx fontconfig
+              dbus-libs libwayland-client libwayland-cursor)
+fi
 if [ "$GUI" -eq 1 ] && [ "$SYSTEM_PACKAGES" -eq 1 ]; then
     missing_libs=()
     for lib in "${GUI_LIBS[@]}"; do
-        if ! pkg_installed "$lib" && pkg_available "$lib"; then missing_libs+=("$lib"); fi
+        if ! pkg_installed "$lib" && { [ "$FAMILY" = fedora ] || pkg_available "$lib"; }; then missing_libs+=("$lib"); fi
     done
     if [ "${#missing_libs[@]}" -gt 0 ]; then
         say "libraries for the GUI: missing ${missing_libs[*]}"
@@ -259,9 +295,14 @@ if [ "${#PACKAGES[@]}" -gt 0 ]; then
         command -v sudo >/dev/null 2>&1 || die "sudo is not available; install ${PACKAGES[*]} as root and run this again"
         SUDO=sudo
     fi
-    confirm "Install ${PACKAGES[*]} with apt (needs your password)?" || die "cancelled; install ${PACKAGES[*]} yourself and run this again"
-    $SUDO apt-get update
-    $SUDO apt-get install -y "${PACKAGES[@]}"
+    if [ "$FAMILY" = fedora ]; then
+        confirm "Install ${PACKAGES[*]} with dnf (needs your password)?" || die "cancelled; install ${PACKAGES[*]} yourself and run this again"
+        $SUDO dnf install -y "${PACKAGES[@]}"
+    else
+        confirm "Install ${PACKAGES[*]} with apt (needs your password)?" || die "cancelled; install ${PACKAGES[*]} yourself and run this again"
+        $SUDO apt-get update
+        $SUDO apt-get install -y "${PACKAGES[@]}"
+    fi
     PY="${PY:-$(find_python || true)}"
     [ -n "$PY" ] || die "Python 3.11+ still not found after installing packages"
     "$PY" -c 'import ensurepip, venv' 2>/dev/null || die "the Python venv module is still missing for $PY"
@@ -328,7 +369,11 @@ if [ "$GUI" -eq 1 ]; then
         xcb_missing="$(ldd "$qt_dir/plugins/platforms/libqxcb.so" 2>/dev/null | awk '/not found/ { print $1 }' | sort -u | tr '\n' ' ')"
         if [ -n "$xcb_missing" ]; then
             warn "the GUI may not start in an X11 session: missing ${xcb_missing% }"
-            warn "on Ubuntu:  sudo apt install ${GUI_LIBS[*]}"
+            if [ "$FAMILY" = fedora ]; then
+                warn "on Fedora:  sudo dnf install ${GUI_LIBS[*]}"
+            else
+                warn "on Ubuntu:  sudo apt install ${GUI_LIBS[*]}"
+            fi
         fi
     fi
 else
