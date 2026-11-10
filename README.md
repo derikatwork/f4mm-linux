@@ -60,14 +60,21 @@ steps as commands.
 
 ### 1. Install the app
 
-You need Ubuntu 22.04 or newer, or a distro based on it (Linux Mint 21 or newer,
-Pop!_OS, Zorin OS 17, ...). The app isn't in your distro's package manager yet, so
-you install it from a terminal, with a script that does the work. It takes a few
-commands that you copy and paste.
+You need one of these:
+
+* **Ubuntu** 22.04 or newer, or a distro based on it (Linux Mint 21 or newer,
+  Pop!_OS, Zorin OS 17, ...);
+* **Fedora** 45 or newer.
+
+The app isn't in your distro's package manager yet, so you install it from a
+terminal, with a script that does the work. It takes a few commands that you copy
+and paste. Where Ubuntu and Fedora need different commands, both are shown.
 
 **Using the terminal, briefly:**
 
-* Open it with **Ctrl+Alt+T**, or find **Terminal** in your applications menu.
+* Open it with **Ctrl+Alt+T**, or find **Terminal** in your applications menu. On
+  Fedora, press the **Super** key (the one with the Windows logo), type `Terminal`
+  and press Enter.
 * Paste with **Ctrl+Shift+V** (plain Ctrl+V doesn't work in most terminals), or
   right-click ▸ *Paste*.
 * Run **one command at a time**: paste it, press Enter, and wait until the terminal
@@ -80,12 +87,21 @@ commands that you copy and paste.
 **Install it:**
 
 1. Install `git`, the tool that downloads the app. If you already have it, this
-   just says so:
+   just says so.
+
+   On Ubuntu, Linux Mint and the like:
    ```bash
    sudo apt install git
    ```
    Type your password when asked. If it asks "Do you want to continue? [Y/n]",
    press Enter.
+
+   On Fedora:
+   ```bash
+   sudo dnf install git
+   ```
+   Type your password when asked. If it asks "Is this ok [y/N]:", type `y` and
+   press Enter. On Fedora, just pressing Enter means **no**.
 2. Go to your home folder:
    ```bash
    cd ~
@@ -104,15 +120,16 @@ commands that you copy and paste.
    ./install.sh
    ```
    It lists what it found on your system. If something is missing, it asks
-   "Install ... with apt (needs your password)? [Y/n]": press Enter, then type your
-   password. The first install downloads about 100 MB and takes a few minutes. It
-   is finished when it prints **==> Done**.
+   "Install ... with apt (needs your password)? [Y/n]" (on Fedora: "with dnf"):
+   press Enter, then type your password. The first install downloads about 100 MB
+   and takes a few minutes. It is finished when it prints **==> Done**.
 
 What the script did:
 
 * It checked for Python, the `7z` program that unpacks mod archives (including
   `.rar`), and the libraries the app's window needs, and installed whatever was
-  missing with `apt`.
+  missing with `apt` (on Fedora, `dnf`). On Fedora it also installs `bsdtar`: Fedora's
+  7-Zip can't open `.rar` files, so the app uses `bsdtar` for those.
 * It installed the app in its own folder, `~/.local/share/beth-mod-manager/venv`,
   so your system's own Python isn't changed.
 * It added **BETH Mod Manager** to your applications menu, plus the `bethmm` command
@@ -123,6 +140,11 @@ Some desktops only show the new menu entry after you log out and back in. The
 
 **Keep the `f4mm-linux` folder.** The app runs from it, and updates are downloaded
 into it (see [Updating the app](#updating-the-app)).
+
+**Moved to another distro and kept your home folder** (from Ubuntu to Fedora, for
+example)? Install `git` as in step 1, then follow [Updating the app](#updating-the-app):
+it downloads the latest version, and the install script rebuilds the app for the
+new system. Your mods, settings and records carry over.
 
 ### 2. Open it and find your game
 
@@ -422,8 +444,9 @@ Do this in order: first take the mods out of your games, then remove the app.
    ```
 
 The install script may also have installed some system packages, such as `7zip`,
-`7zip-rar`, `python3-venv` and a few libraries. They stay installed. Other programs
-can use them too and they do no harm, so you can leave them.
+`7zip-rar`, `python3-venv` and a few libraries on Ubuntu, or `7zip`, `bsdtar` and a
+few libraries on Fedora. They stay installed. Other programs can use them too and
+they do no harm, so you can leave them.
 
 **If something goes wrong:**
 
@@ -723,9 +746,9 @@ root's place is detected on its own.
   *Game ▸ Update plugins.txt*.
 * **"plugins.txt wasn't updated: the game's Wine prefix (or Wine user) isn't
   known":** set them in *Game ▸ Game settings...*, then *Game ▸ Update plugins.txt*.
-* **`.rar` archives don't open:** RAR support comes from the `7zip-rar` package
-  (`p7zip-rar` on 22.04-based releases), which is in Ubuntu's "multiverse" software
-  source. Turn that source on, then run the install script again. In a terminal,
+* **`.rar` archives don't open, on Ubuntu:** RAR support comes from the `7zip-rar`
+  package (`p7zip-rar` on 22.04-based releases), which is in Ubuntu's "multiverse"
+  software source. Turn that source on, then run the install script again. In a terminal,
   run these one at a time:
   ```bash
   sudo add-apt-repository multiverse
@@ -738,14 +761,22 @@ root's place is detected on its own.
   ```
   Linux Mint has multiverse on already; there, running the install script again is
   enough.
+* **`.rar` archives don't open, on Fedora:** Fedora's 7-Zip can't open `.rar` files,
+  so the app uses `bsdtar` for them. If the error says to install it, run
+  `sudo dnf install bsdtar` (type `y` when it asks), or run the install script
+  again. A few old RAR archives use features `bsdtar` can't unpack. For those,
+  unpack the archive with another tool, such as `unrar` from RPM Fusion's
+  non-free repository, then install the unpacked folder with
+  *File ▸ Install extracted folder...*.
 * **The desktop app doesn't start:** open a terminal and start it from there to
   see the error:
   ```bash
   ~/.local/bin/bethmm-gui
   ```
   An error about the `xcb` platform plugin means a system library is missing.
-  Install it with `sudo apt install libxcb-cursor0`, or run the install script
-  again (`cd ~/f4mm-linux`, then `./install.sh`), which checks for the others too.
+  Install it with `sudo apt install libxcb-cursor0` (on Fedora,
+  `sudo dnf install xcb-util-cursor`), or run the install script again
+  (`cd ~/f4mm-linux`, then `./install.sh`), which checks for the others too.
 * **The app stopped working after a distro upgrade:** run the install script again
   (`cd ~/f4mm-linux`, then `./install.sh`); it rebuilds the app's environment.
 * **What did it do?** The **History** tab (`bethmm history`) lists the latest file
@@ -771,6 +802,8 @@ root's place is detected on its own.
 * **Very large mods** (tens of thousands of files) take a while: every file is its
   own link, and the install dialog takes a few seconds to show such an archive.
 * **Hardlinks** need the game and `~/.local/share` on the same disk.
+* **`.rar` files on Fedora** are unpacked with `bsdtar`, which can't unpack a few old
+  RAR archives (see [Troubleshooting](#troubleshooting)).
 
 ---
 
@@ -834,16 +867,20 @@ installed. You always confirm.
 * `--yes`: don't ask before installing system packages.
 * `--dev`: also install the test tools and run the tests.
 * `--no-gui`: command line only, without Qt or the menu entry.
-* `--no-system-packages`: never call `apt`; only check what is there.
+* `--no-system-packages`: never call `apt` or `dnf`; only check what is there.
 * `--uninstall`: see [Uninstalling the app](#uninstalling-the-app).
 * `--force`: install even when run as root, or uninstall even though mods are still
   deployed.
 
-What the script installs with `apt`, if missing:
+What the script installs with `apt` on Ubuntu, if missing:
 * the Python venv module;
 * `7zip` and `7zip-rar` (`p7zip-full` and `p7zip-rar` on 22.04-based releases, plus
   `python3.11`, because those ship Python 3.10);
 * the libraries Qt needs, usually just `libxcb-cursor0`.
+
+What it installs with `dnf` on Fedora, if missing:
+* `7zip`, and `bsdtar` for `.rar` files;
+* the libraries Qt needs, usually `xcb-util-cursor` and `xcb-util-wm`.
 
 <details>
 <summary>Manual install (what the script does)</summary>
@@ -851,6 +888,7 @@ What the script installs with `apt`, if missing:
 ```bash
 sudo apt install python3-venv 7zip 7zip-rar          # 22.04-based: python3.11 python3.11-venv p7zip-full p7zip-rar
 sudo apt install libxcb-cursor0                      # for the desktop app
+#   Fedora instead: sudo dnf install 7zip bsdtar xcb-util-cursor xcb-util-wm
 python3 -m venv ~/.local/share/beth-mod-manager/venv  # 22.04-based: python3.11 -m venv ...
 ~/.local/share/beth-mod-manager/venv/bin/pip install -e '.[gui]'   # '.' alone: command line only
 #   (tests: '.[gui,dev,gui-dev]', or '.[dev]' without the desktop app)

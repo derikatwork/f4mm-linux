@@ -13,7 +13,13 @@ dependencies = ["PyYAML>=5.4"]
 [project.optional-dependencies]
 # 6.12.0 drops a reference to True on every signal emitted from Python; on
 # Python 3.11 that crashes the app after a few thousand (bethmm.gui checks).
-gui = ["PySide6-Essentials>=6.5,!=6.12.0"]
+# From Python 3.12 True is immortal and the bug harmless, and Python 3.15
+# (Fedora 45) has no other version: there it is allowed, elsewhere the
+# versions the app was tested with are kept.
+gui = [
+    "PySide6-Essentials>=6.5,!=6.12.0; python_version < '3.15'",
+    "PySide6-Essentials>=6.5; python_version >= '3.15'",
+]
 dev = ["pytest>=7"]
 # The GUI tests (pytest-qt refuses to start without a Qt binding).
 gui-dev = ["pytest-qt>=4"]
