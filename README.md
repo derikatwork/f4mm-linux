@@ -4,6 +4,8 @@ A mod manager for Bethesda games on Linux: **Fallout 4, Skyrim Special Edition,
 Fallout: New Vegas, Fallout 3, Oblivion, Starfield and Skyrim LE**, installed
 through **Lutris** (GOG or any other store) and run with Wine.
 
+![The main window: the mods in priority order, which files one of them wins, and what the last action did](docs/screenshots/main-window.png)
+
 ## What it's for
 
 Modding these games on Linux usually means one of two things: running a Windows
@@ -232,6 +234,8 @@ Drag the archive from your file manager onto the app's window, or use
 * The **Changes in the game folder** tab: exactly what will be linked and backed up.
 * The **Notes** tab: anything worth knowing, such as files skipped or odd layouts.
 
+![The install dialog: the mod's name and game, where its files go, and which file overrides another mod's](docs/screenshots/install-dialog.png)
+
 Click **Install**. The mod goes to the bottom of your list, its files are linked
 into the game folder, and its plugins are switched on in `plugins.txt`. The
 **Messages** tab at the bottom says what was done.
@@ -259,6 +263,8 @@ or patches for other mods you have. The app opens it first:
 
 When you update the mod later, the choices you made last time are already picked.
 
+![A mod's own installer: a step with its options, and the picture and description of the option pointed at](docs/screenshots/fomod-installer.png)
+
 ### 8. More mods: order and conflicts
 
 Install more mods the same way. The **Mods** list is in priority order: **the lower
@@ -281,6 +287,8 @@ and says so in **Messages**.
 The **Plugins** tab shows the load order the game uses (later plugins win), which mod
 each plugin came from, and, in red, plugins whose masters are missing or load
 after them.
+
+![The Plugins tab: the load order, which mod each plugin comes from, and a plugin whose master is missing, in red](docs/screenshots/plugins-tab.png)
 
 * Tick or untick a plugin to switch it on or off. A plugin you switched off stays
   off, even when its mod is updated.
@@ -908,3 +916,10 @@ ln -s ~/.local/share/beth-mod-manager/venv/bin/bethmm-gui ~/.local/bin/bethmm-gu
 
 The tests build fake game folders, fake Lutris configs and fake mods in temporary
 folders; they never touch your real home folder or games.
+
+The screenshots in this README come from the real app, with a made-up game and mods
+in a demo home folder. To make them again:
+
+```bash
+QT_QPA_PLATFORM=offscreen ~/.local/share/beth-mod-manager/venv/bin/python tools/make_screenshots.py docs/screenshots
+```
